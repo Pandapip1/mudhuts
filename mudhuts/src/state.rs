@@ -4,6 +4,7 @@ use std::sync::Arc;
 use smithay::desktop::{PopupManager, Space, Window};
 use smithay::input::{Seat, SeatState};
 use smithay::reexports::calloop::generic::Generic;
+use smithay::reexports::calloop::ping::Ping;
 use smithay::reexports::calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction};
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::{Display, DisplayHandle};
@@ -73,6 +74,16 @@ pub struct State {
     /// purposes (mutually exclusive with `text_selecting` — reporting mode
     /// and our own selection are never both active at once).
     pub mouse_report_button_held: Option<u32>,
+
+    /// Wakes up the winit backend's redraw handler (see `winit_backend.rs`,
+    /// the only place that owns the actual window handle needed to call
+    /// its `request_redraw()`) from anywhere else that changes something
+    /// visible — Wayland protocol handlers, the PTY event channel — via
+    /// [`Self::request_redraw`]. The render loop only redraws in response
+    /// to one of these pings (or input/resize, handled directly in
+    /// `winit_backend.rs`) rather than continuously, so an idle compositor
+    /// does no per-frame work at all.
+    redraw_ping: Ping,
 }
 
 impl State {
@@ -86,6 +97,7 @@ impl State {
         display: Display<Self>,
         hut: Hut,
         socket: (ListeningSocketSource, OsString),
+        redraw_ping: Ping,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let start_time = std::time::Instant::now();
         let dh = display.handle();
@@ -127,7 +139,15 @@ impl State {
             text_selecting: false,
             text_selection_dragged: false,
             mouse_report_button_held: None,
+            redraw_ping,
         })
+    }
+
+    /// Ask the render loop to redraw soon. Safe and cheap to call from
+    /// anywhere — Wayland protocol handlers, the PTY event channel — see
+    /// [`Self::redraw_ping`].
+    pub fn request_redraw(&self) {
+        self.redraw_ping.ping();
     }
 
     fn init_wayland_listener(

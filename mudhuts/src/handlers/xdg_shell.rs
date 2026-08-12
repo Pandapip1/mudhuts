@@ -64,6 +64,7 @@ impl XdgShellHandler for State {
                 smithay::utils::SERIAL_COUNTER.next_serial(),
             );
         }
+        self.request_redraw();
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {

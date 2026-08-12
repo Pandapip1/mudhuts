@@ -28,21 +28,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socket_name = socket.1.to_string_lossy().into_owned();
     let (hut, term_events) = hut::Hut::spawn([("WAYLAND_DISPLAY".to_string(), socket_name)])?;
 
-    let mut state = State::new(&mut event_loop, display, hut, socket)?;
+    let (redraw_ping, redraw_ping_source) = smithay::reexports::calloop::ping::make_ping()?;
+    let mut state = State::new(&mut event_loop, display, hut, socket, redraw_ping)?;
 
     event_loop
         .handle()
-        .insert_source(term_events, |event, _, _state| {
+        .insert_source(term_events, |event, _, state| {
             if let smithay::reexports::calloop::channel::Event::Msg(event) = event {
                 match event {
                     mudhuts_term::TermEvent::Title(title) => tracing::debug!("hut title: {title}"),
                     mudhuts_term::TermEvent::Exited => tracing::info!("hut shell exited"),
-                    mudhuts_term::TermEvent::Wakeup => {}
+                    mudhuts_term::TermEvent::Wakeup => state.request_redraw(),
                 }
             }
         })?;
 
-    winit_backend::init_winit(&mut event_loop, &mut state)?;
+    winit_backend::init_winit(&mut event_loop, &mut state, redraw_ping_source)?;
 
     event_loop.run(None, &mut state, |_| {})?;
 

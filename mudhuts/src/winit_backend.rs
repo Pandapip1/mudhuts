@@ -1,3 +1,6 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use smithay::backend::renderer::Renderer;
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::Kind;
@@ -8,6 +11,7 @@ use smithay::backend::winit::{self, WinitEvent};
 use smithay::desktop::space::space_render_elements;
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::EventLoop;
+use smithay::reexports::calloop::ping::PingSource;
 use smithay::utils::Transform;
 
 use crate::State;
@@ -16,11 +20,17 @@ use crate::render::OutputRenderElements;
 pub fn init_winit(
     event_loop: &mut EventLoop<State>,
     state: &mut State,
+    redraw_ping_source: PingSource,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (mut backend, winit) = winit::init::<GlesRenderer>()?;
+    let (backend, winit) = winit::init::<GlesRenderer>()?;
+    // Shared between this closure and the redraw-ping closure below — both
+    // need to reach the actual window handle to call `request_redraw()`,
+    // but only one of them can own it outright. calloop is single-threaded
+    // here, so `Rc<RefCell<_>>` (not `Arc<Mutex<_>>`) is enough.
+    let backend = Rc::new(RefCell::new(backend));
 
     let mode = Mode {
-        size: backend.window_size(),
+        size: backend.borrow().window_size(),
         refresh: 60_000,
     };
 
@@ -46,6 +56,23 @@ pub fn init_winit(
 
     let mut damage_tracker = OutputDamageTracker::from_output(&output);
 
+    // Redraws are demand-driven, not continuous: nothing here calls
+    // `request_redraw()` unconditionally on every frame. Instead, each
+    // place that actually changes something visible (input, resize, PTY
+    // output via `State::request_redraw`, a client surface commit) asks
+    // for exactly one redraw. An idle compositor therefore does no
+    // per-frame work at all rather than re-binding/re-compositing/
+    // submitting a buffer 50-100+ times a second for an unchanged screen.
+    {
+        let backend = backend.clone();
+        event_loop
+            .handle()
+            .insert_source(redraw_ping_source, move |(), _, _state| {
+                backend.borrow().window().request_redraw();
+            })?;
+    }
+
+    let initial_redraw_backend = backend.clone();
     event_loop
         .handle()
         .insert_source(winit, move |event, _, state| {
@@ -60,9 +87,14 @@ pub fn init_winit(
                         None,
                         None,
                     );
+                    backend.borrow().window().request_redraw();
                 }
-                WinitEvent::Input(event) => state.process_input_event(event),
+                WinitEvent::Input(event) => {
+                    state.process_input_event(event);
+                    backend.borrow().window().request_redraw();
+                }
                 WinitEvent::Redraw => {
+                    let mut backend = backend.borrow_mut();
                     let size = backend.window_size();
                     state.hut.resize_to_pixels(size.w, size.h);
 
@@ -179,8 +211,6 @@ pub fn init_winit(
                     state.space.refresh();
                     state.popups.cleanup();
                     let _ = state.display_handle.flush_clients();
-
-                    backend.window().request_redraw();
                 }
                 WinitEvent::CloseRequested => {
                     state.loop_signal.stop();
@@ -188,6 +218,10 @@ pub fn init_winit(
                 _ => (),
             };
         })?;
+
+    // Nothing has been drawn yet — ask for the first frame explicitly
+    // rather than relying on the backend to paint one unprompted.
+    initial_redraw_backend.borrow().window().request_redraw();
 
     Ok(())
 }
