@@ -101,13 +101,23 @@ impl State {
                     toplevel.send_close();
                 }
             }
-            // Depend on later phases — see the plan
-            // (multi-Hut Stack: Phase 3; Main Windows/tab cycling: Phase
-            // 4; Village tiling/tabbing: Phase 6). Recognized and
-            // intercepted now so rebinding them already works even
-            // though they don't do anything yet.
-            Action::ToggleTerminal
-            | Action::StackNext
+            Action::ToggleTerminal => {
+                // No-op with nothing to toggle to (matches the original
+                // "except when there are no windows open" rule) — checked
+                // via the un-forced `showing_terminal` field, not
+                // `showing_terminal_effective()`, since that would always
+                // report true here and this toggle would never do
+                // anything.
+                if self.space.elements().next().is_some() {
+                    self.showing_terminal = !self.showing_terminal;
+                }
+            }
+            // Depend on later phases — see the plan (multi-Hut Stack:
+            // Phase 3; Main Window tab cycling: Phase 4; Village
+            // tiling/tabbing: Phase 6). Recognized and intercepted now so
+            // rebinding them already works even though they don't do
+            // anything yet.
+            Action::StackNext
             | Action::StackPrev
             | Action::TabNext
             | Action::TabPrev
@@ -136,18 +146,32 @@ impl State {
                     serial,
                     time,
                     |data, mods, keysym| {
+                        // Global keybindings always win, regardless of
+                        // whether the terminal or a client window is the
+                        // active view — otherwise there'd be no way to
+                        // toggle back to the terminal once a client
+                        // window takes over the screen.
                         if key_state == KeyState::Pressed {
                             let base_keysym = keysym
                                 .raw_latin_sym_or_raw_current_sym()
                                 .unwrap_or(keysym.modified_sym());
-                            match data.keymap.lookup(mods, base_keysym) {
-                                Some(action) => data.handle_action(action),
-                                None => {
-                                    let mode = data.hut.terminal.mode();
-                                    if let Some(bytes) = encode(&keysym, mods, mode) {
-                                        data.hut.terminal.write_input(bytes);
-                                    }
-                                }
+                            if let Some(action) = data.keymap.lookup(mods, base_keysym) {
+                                data.handle_action(action);
+                                return FilterResult::Intercept(());
+                            }
+                        }
+
+                        if !data.showing_terminal_effective() {
+                            // A client window is the active view; let it
+                            // receive the key via its own wl_keyboard
+                            // (focus was set on click).
+                            return FilterResult::Forward;
+                        }
+
+                        if key_state == KeyState::Pressed {
+                            let mode = data.hut.terminal.mode();
+                            if let Some(bytes) = encode(&keysym, mods, mode) {
+                                data.hut.terminal.write_input(bytes);
                             }
                         }
                         FilterResult::Intercept(())

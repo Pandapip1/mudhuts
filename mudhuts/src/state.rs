@@ -52,6 +52,17 @@ pub struct State {
     pub hut: Hut,
     pub keymap: Keymap,
 
+    /// Whether the Hut's terminal (vs. its client window(s)) is the
+    /// active view, toggled by `Action::ToggleTerminal` (Ctrl+`).
+    ///
+    /// Interim placeholder for the real Main Window tab system (Phase 4):
+    /// for now a Hut's client windows are shown centered over a blacked-out
+    /// background, entirely replacing the terminal view rather than
+    /// compositing on top of it, so a toggle is needed to get back to the
+    /// terminal at all. Ignored (forced true) when there are no client
+    /// windows to toggle to.
+    pub showing_terminal: bool,
+
     /// A visible mouse pointer. Smithay tracks pointer position/focus for
     /// input purposes regardless, but nothing renders it unless we do.
     pub cursor_buffer: SolidColorBuffer,
@@ -105,6 +116,7 @@ impl State {
             seat,
             hut,
             keymap: Keymap::load(),
+            showing_terminal: true,
             cursor_buffer: SolidColorBuffer::new((10, 10), [1.0, 1.0, 1.0, 1.0]),
         })
     }
@@ -137,6 +149,13 @@ impl State {
         )?;
 
         Ok(())
+    }
+
+    /// Whether the terminal (vs. a client window) should currently be the
+    /// visible/focused view — [`Self::showing_terminal`], but forced true
+    /// when there's nothing to toggle to.
+    pub fn showing_terminal_effective(&self) -> bool {
+        self.showing_terminal || self.space.elements().next().is_none()
     }
 
     pub fn surface_under(

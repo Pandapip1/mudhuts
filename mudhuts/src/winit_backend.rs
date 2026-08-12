@@ -67,6 +67,26 @@ pub fn init_winit(
                     state.hut.resize_to_pixels(size.w, size.h);
                     state.hut.redraw();
 
+                    let show_terminal = state.showing_terminal_effective();
+
+                    // Interim placeholder for the real Main Window layout
+                    // (Phase 4): a client window doesn't share the screen
+                    // with the terminal, it replaces it entirely — shown
+                    // centered at its own size over a blacked-out
+                    // background, not stretched/anchored at the origin.
+                    if !show_terminal {
+                        let scale = output.current_scale().fractional_scale();
+                        let output_size: smithay::utils::Size<i32, smithay::utils::Logical> =
+                            size.to_f64().to_logical(scale).to_i32_round();
+                        let windows: Vec<_> = state.space.elements().cloned().collect();
+                        for window in windows {
+                            let win_size = window.geometry().size;
+                            let x = ((output_size.w - win_size.w) / 2).max(0);
+                            let y = ((output_size.h - win_size.h) / 2).max(0);
+                            state.space.map_element(window, (x, y), false);
+                        }
+                    }
+
                     // Scoped so the mutable borrow of `backend` from `bind()`
                     // ends before we need `backend` again below (`submit`,
                     // `window()`) — `render_result` itself borrows only from
@@ -95,34 +115,36 @@ pub fn init_winit(
                                 ));
                             }
 
-                            match space_render_elements::<_, smithay::desktop::Window, _>(
-                                renderer,
-                                [&state.space],
-                                &output,
-                                1.0,
-                            ) {
-                                Ok(space_elements) => elements.extend(
-                                    space_elements.into_iter().map(OutputRenderElements::from),
-                                ),
-                                Err(err) => {
-                                    tracing::warn!("failed to collect space elements: {err}")
+                            if show_terminal {
+                                match MemoryRenderBufferRenderElement::from_buffer(
+                                    renderer,
+                                    (0.0, 0.0),
+                                    &state.hut.buffer,
+                                    None,
+                                    None,
+                                    None,
+                                    Kind::Unspecified,
+                                ) {
+                                    Ok(term_element) => {
+                                        elements.push(OutputRenderElements::from(term_element))
+                                    }
+                                    Err(err) => {
+                                        tracing::warn!("failed to upload terminal buffer: {err}")
+                                    }
                                 }
-                            }
-
-                            match MemoryRenderBufferRenderElement::from_buffer(
-                                renderer,
-                                (0.0, 0.0),
-                                &state.hut.buffer,
-                                None,
-                                None,
-                                None,
-                                Kind::Unspecified,
-                            ) {
-                                Ok(term_element) => {
-                                    elements.push(OutputRenderElements::from(term_element))
-                                }
-                                Err(err) => {
-                                    tracing::warn!("failed to upload terminal buffer: {err}")
+                            } else {
+                                match space_render_elements::<_, smithay::desktop::Window, _>(
+                                    renderer,
+                                    [&state.space],
+                                    &output,
+                                    1.0,
+                                ) {
+                                    Ok(space_elements) => elements.extend(
+                                        space_elements.into_iter().map(OutputRenderElements::from),
+                                    ),
+                                    Err(err) => {
+                                        tracing::warn!("failed to collect space elements: {err}")
+                                    }
                                 }
                             }
 
@@ -131,7 +153,7 @@ pub fn init_winit(
                                 &mut framebuffer,
                                 0,
                                 &elements,
-                                [0.1, 0.1, 0.1, 1.0],
+                                [0.0, 0.0, 0.0, 1.0],
                             ) {
                                 Ok(result) => Some(result),
                                 Err(err) => {
