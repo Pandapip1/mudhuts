@@ -163,17 +163,27 @@ impl State {
                     }
                 }
             }
-            // Depend on later phases — see the plan (multi-Hut Stack:
-            // Phase 3; Main Window tab cycling: Phase 4; Village
-            // tiling/tabbing: Phase 6). Recognized and intercepted now so
-            // rebinding them already works even though they don't do
-            // anything yet.
-            Action::StackNext
-            | Action::StackPrev
-            | Action::TabNext
-            | Action::TabPrev
-            | Action::WrapTab
-            | Action::WrapTile => {
+            Action::StackNext => {
+                if let Err(err) = self.stack.next() {
+                    tracing::error!("failed to advance the Hut stack: {err}");
+                }
+                // The newly-focused Hut gets resized to the real output
+                // size as part of the redraw this triggers (see
+                // `winit_backend.rs`'s `resize_all` call, which runs
+                // before that frame's texture is generated) — a
+                // freshly-spawned one starts at the placeholder default
+                // grid size otherwise.
+                self.request_redraw();
+            }
+            Action::StackPrev => {
+                self.stack.prev();
+                self.request_redraw();
+            }
+            // Depend on later phases — see the plan (Main Window tab
+            // cycling: Phase 4; Village tiling/tabbing: Phase 6).
+            // Recognized and intercepted now so rebinding them already
+            // works even though they don't do anything yet.
+            Action::TabNext | Action::TabPrev | Action::WrapTab | Action::WrapTile => {
                 tracing::debug!("{action:?} triggered (not implemented yet)");
             }
         }
@@ -220,9 +230,11 @@ impl State {
                         }
 
                         if key_state == KeyState::Pressed {
-                            let mode = data.hut.terminal.mode();
+                            let hut = data.stack.focused_mut();
+                            let mode = hut.terminal.mode();
                             if let Some(bytes) = encode(&keysym, mods, mode) {
-                                data.hut.terminal.write_input(bytes);
+                                hut.terminal.write_input(bytes);
+                                hut.mark_touched();
                             }
                         }
                         FilterResult::Intercept(())
@@ -242,18 +254,22 @@ impl State {
                 let serial = SERIAL_COUNTER.next_serial();
 
                 if self.showing_terminal_effective() {
-                    let (col, row, left_half) = self.hut.pixel_to_cell(pos.x, pos.y);
+                    let (col, row, left_half) = self.stack.focused().pixel_to_cell(pos.x, pos.y);
                     if let Some(held) = self.mouse_report_button_held {
-                        if self.hut.terminal.wants_drag_reports()
+                        if self.stack.focused().terminal.wants_drag_reports()
                             && let Some(xbutton) = xterm_button(held)
                         {
                             let mods = self.current_mods();
-                            self.hut
+                            self.stack
+                                .focused()
                                 .terminal
                                 .report_mouse_drag(xbutton, mods, col + 1, row + 1);
                         }
                     } else if self.text_selecting {
-                        self.hut.terminal.extend_selection(col, row, left_half);
+                        self.stack
+                            .focused()
+                            .terminal
+                            .extend_selection(col, row, left_half);
                         self.text_selection_dragged = true;
                     }
                 }
@@ -285,12 +301,12 @@ impl State {
 
                 if self.showing_terminal_effective() {
                     let pos = pointer.current_location();
-                    let (col, row, left_half) = self.hut.pixel_to_cell(pos.x, pos.y);
+                    let (col, row, left_half) = self.stack.focused().pixel_to_cell(pos.x, pos.y);
                     let mods = self.current_mods();
 
-                    if self.hut.terminal.wants_mouse_reports() {
+                    if self.stack.focused().terminal.wants_mouse_reports() {
                         if let Some(xbutton) = xterm_button(button) {
-                            self.hut.terminal.report_mouse_button(
+                            self.stack.focused().terminal.report_mouse_button(
                                 xbutton,
                                 mods,
                                 pressed,
@@ -301,13 +317,16 @@ impl State {
                         self.mouse_report_button_held = pressed.then_some(button);
                     } else if button == BTN_LEFT {
                         if pressed {
-                            self.hut.terminal.start_selection(col, row, left_half);
+                            self.stack
+                                .focused()
+                                .terminal
+                                .start_selection(col, row, left_half);
                             self.text_selecting = true;
                             self.text_selection_dragged = false;
                         } else if self.text_selecting {
                             self.text_selecting = false;
                             if !self.text_selection_dragged {
-                                self.hut.terminal.clear_selection();
+                                self.stack.focused().terminal.clear_selection();
                             }
                         }
                     }
@@ -386,17 +405,17 @@ impl State {
                 if self.showing_terminal_effective()
                     && vertical_amount != 0.0
                     && let Some(pointer) = self.seat.get_pointer()
-                    && self.hut.terminal.wants_mouse_reports()
+                    && self.stack.focused().terminal.wants_mouse_reports()
                 {
                     let pos = pointer.current_location();
-                    let (col, row, _) = self.hut.pixel_to_cell(pos.x, pos.y);
+                    let (col, row, _) = self.stack.focused().pixel_to_cell(pos.x, pos.y);
                     let mods = self.current_mods();
                     let wheel_button = if vertical_amount > 0.0 {
                         mudhuts_term::mouse::BUTTON_WHEEL_DOWN
                     } else {
                         mudhuts_term::mouse::BUTTON_WHEEL_UP
                     };
-                    self.hut.terminal.report_mouse_button(
+                    self.stack.focused().terminal.report_mouse_button(
                         wheel_button,
                         mods,
                         true,

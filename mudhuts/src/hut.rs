@@ -2,6 +2,8 @@
 //! only has a single Hut and doesn't yet organize client windows into it —
 //! see the plan at `/home/gavin/.claude/plans/cryptic-honking-lamport.md`.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 
@@ -13,9 +15,24 @@ use crate::gpu_term::GpuTermRenderer;
 const INITIAL_COLS: usize = 80;
 const INITIAL_LINES: usize = 24;
 
+fn next_hut_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 pub struct Hut {
+    /// Stable identity for this Hut, independent of its position in [The
+    /// Stack](crate::stack::HutStack) (which shifts as entries are added
+    /// and discarded) — used to route its `TermEvent` channel to the right
+    /// entry once there are several.
+    pub id: u64,
     pub terminal: Terminal,
     pub glyphs: GlyphCache,
+    /// Whether this Hut has ever been interacted with (a keystroke sent to
+    /// its terminal) since it was spawned. A freshly-spawned, never-touched
+    /// Hut is discarded rather than kept around once The Stack moves away
+    /// from it — see the plan's Phase 3 notes.
+    touched: bool,
     /// Lazily created on first [`Hut::redraw`] call, once a renderer is
     /// actually available (Phase 1 spawns Huts before the winit backend
     /// exists).
@@ -60,8 +77,10 @@ impl Hut {
 
         Ok((
             Hut {
+                id: next_hut_id(),
                 terminal,
                 glyphs,
+                touched: false,
                 gpu: None,
                 last_texture: None,
                 pixel_size,
@@ -69,6 +88,16 @@ impl Hut {
             },
             events,
         ))
+    }
+
+    /// Whether this Hut has ever received a keystroke since it was
+    /// spawned — see the `touched` field doc.
+    pub fn touched(&self) -> bool {
+        self.touched
+    }
+
+    pub fn mark_touched(&mut self) {
+        self.touched = true;
     }
 
     /// Resize the Hut's terminal grid to fill an output of `width`x`height`

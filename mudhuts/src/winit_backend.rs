@@ -96,7 +96,8 @@ pub fn init_winit(
                 WinitEvent::Redraw => {
                     let mut backend = backend.borrow_mut();
                     let size = backend.window_size();
-                    state.hut.resize_to_pixels(size.w, size.h);
+                    state.output_size = (size.w, size.h);
+                    state.stack.resize_all(size.w, size.h);
 
                     let show_terminal = state.showing_terminal_effective();
 
@@ -140,9 +141,10 @@ pub fn init_winit(
                             // actually owning the seat.
 
                             if show_terminal {
-                                if let Some(texture) = state.hut.redraw(renderer) {
+                                let hut = state.stack.focused_mut();
+                                if let Some(texture) = hut.redraw(renderer) {
                                     let element = TextureRenderElement::from_static_texture(
-                                        state.hut.element_id.clone(),
+                                        hut.element_id.clone(),
                                         renderer.context_id(),
                                         (0.0, 0.0),
                                         texture,

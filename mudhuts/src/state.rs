@@ -16,8 +16,8 @@ use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::socket::ListeningSocketSource;
 
-use crate::hut::Hut;
 use crate::keybindings::Keymap;
+use crate::stack::HutStack;
 
 /// Open mudhuts' listening Wayland socket without yet wiring it into an
 /// event loop. Split out from [`State::new`] so callers can learn the
@@ -49,8 +49,13 @@ pub struct State {
 
     pub seat: Seat<Self>,
 
-    pub hut: Hut,
+    pub stack: HutStack,
     pub keymap: Keymap,
+    /// The output's current pixel size, tracked here (not just read inside
+    /// `winit_backend.rs`'s redraw handler) so newly-focused Huts can be
+    /// resized immediately on switch rather than showing a stale grid
+    /// until the next real resize.
+    pub output_size: (i32, i32),
 
     /// Whether the Hut's terminal (vs. its client window(s)) is the
     /// active view, toggled by `Action::ToggleTerminal` (Ctrl+`).
@@ -95,7 +100,7 @@ impl State {
     pub fn new(
         event_loop: &mut EventLoop<Self>,
         display: Display<Self>,
-        hut: Hut,
+        stack: HutStack,
         socket: (ListeningSocketSource, OsString),
         redraw_ping: Ping,
     ) -> Result<Self, Box<dyn std::error::Error>> {
@@ -133,8 +138,9 @@ impl State {
             data_device_state,
             popups,
             seat,
-            hut,
+            stack,
             keymap: Keymap::load(),
+            output_size: (0, 0),
             showing_terminal: true,
             text_selecting: false,
             text_selection_dragged: false,
@@ -148,6 +154,33 @@ impl State {
     /// [`Self::redraw_ping`].
     pub fn request_redraw(&self) {
         self.redraw_ping.ping();
+    }
+
+    /// Route a `TermEvent` from one of The Stack's Huts (identified by
+    /// `id`, stable across the Stack's own reordering/discarding) to the
+    /// right place.
+    pub fn handle_term_event(&mut self, id: u64, event: mudhuts_term::TermEvent) {
+        match event {
+            mudhuts_term::TermEvent::Title(title) => {
+                tracing::debug!("hut {id} title: {title}");
+            }
+            mudhuts_term::TermEvent::Exited => {
+                tracing::info!("hut {id} shell exited");
+                if let Err(err) = self.stack.remove_exited(id) {
+                    tracing::error!("failed to respawn after shell exit: {err}");
+                }
+                self.request_redraw();
+            }
+            mudhuts_term::TermEvent::Wakeup => {
+                // Only the focused Hut's content is currently visible;
+                // a background Hut changing doesn't need a redraw yet
+                // (there's no activity indicator to update either, in
+                // this phase).
+                if self.stack.focused().id == id {
+                    self.request_redraw();
+                }
+            }
+        }
     }
 
     fn init_wayland_listener(
