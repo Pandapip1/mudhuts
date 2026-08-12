@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["mudhuts", "mudhuts-term", "mudhuts-protocols"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+
+[workspace.dependencies]
+smithay = { git = "https://github.com/Smithay/smithay.git", rev = "4cf0b62028039661477d482ec4758b687d8f4392", default-features = false }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

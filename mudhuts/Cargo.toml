@@ -1,0 +1,15 @@
+[package]
+name = "mudhuts"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+mudhuts-term = { path = "../mudhuts-term" }
+mudhuts-protocols = { path = "../mudhuts-protocols" }
+alacritty_terminal = "0.26"
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dependencies.smithay]
+workspace = true
+features = ["backend_winit", "wayland_frontend", "desktop"]

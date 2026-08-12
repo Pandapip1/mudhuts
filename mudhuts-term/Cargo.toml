@@ -1,0 +1,11 @@
+[package]
+name = "mudhuts-term"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+alacritty_terminal = "0.26"
+fontdue = "0.9"
+fontconfig = "0.11"
+calloop = "0.14"
+tracing.workspace = true
