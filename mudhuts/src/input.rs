@@ -9,6 +9,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::SERIAL_COUNTER;
 
 use crate::State;
+use crate::keybindings::Action;
 
 /// Translate a raw xkb keysym into mudhuts-term's neutral [`Key`], or
 /// `None` for keys that don't map to a PTY-input action on their own
@@ -82,6 +83,41 @@ fn encode(
 }
 
 impl State {
+    fn handle_action(&mut self, action: Action) {
+        match action {
+            Action::CloseFocused => {
+                let Some(keyboard) = self.seat.get_keyboard() else {
+                    return;
+                };
+                let Some(focused) = keyboard.current_focus() else {
+                    return;
+                };
+                let window = self
+                    .space
+                    .elements()
+                    .find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == &focused))
+                    .cloned();
+                if let Some(toplevel) = window.and_then(|w| w.toplevel().cloned()) {
+                    toplevel.send_close();
+                }
+            }
+            // Depend on later phases — see the plan
+            // (multi-Hut Stack: Phase 3; Main Windows/tab cycling: Phase
+            // 4; Village tiling/tabbing: Phase 6). Recognized and
+            // intercepted now so rebinding them already works even
+            // though they don't do anything yet.
+            Action::ToggleTerminal
+            | Action::StackNext
+            | Action::StackPrev
+            | Action::TabNext
+            | Action::TabPrev
+            | Action::WrapTab
+            | Action::WrapTile => {
+                tracing::debug!("{action:?} triggered (not implemented yet)");
+            }
+        }
+    }
+
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
         match event {
             InputEvent::Keyboard { event } => {
@@ -101,9 +137,17 @@ impl State {
                     time,
                     |data, mods, keysym| {
                         if key_state == KeyState::Pressed {
-                            let mode = data.hut.terminal.mode();
-                            if let Some(bytes) = encode(&keysym, mods, mode) {
-                                data.hut.terminal.write_input(bytes);
+                            let base_keysym = keysym
+                                .raw_latin_sym_or_raw_current_sym()
+                                .unwrap_or(keysym.modified_sym());
+                            match data.keymap.lookup(mods, base_keysym) {
+                                Some(action) => data.handle_action(action),
+                                None => {
+                                    let mode = data.hut.terminal.mode();
+                                    if let Some(bytes) = encode(&keysym, mods, mode) {
+                                        data.hut.terminal.write_input(bytes);
+                                    }
+                                }
                             }
                         }
                         FilterResult::Intercept(())

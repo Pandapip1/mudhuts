@@ -16,8 +16,18 @@ use crate::palette::{self, Rgb};
 const FONT_SIZE: f32 = 16.0;
 
 pub struct GlyphCache {
+    fc: fontconfig::Fontconfig,
     regular: fontdue::Font,
     bold: fontdue::Font,
+    /// Fonts loaded on demand to cover characters the primary/bold fonts
+    /// lack a glyph for (e.g. Nerd Font/Powerline symbols in a prompt,
+    /// when the default monospace font doesn't include them) — otherwise
+    /// those show up as tofu boxes.
+    fallback_fonts: HashMap<std::path::PathBuf, fontdue::Font>,
+    /// Memoizes the fontconfig charset query per character, including
+    /// negative results, so an uncovered character isn't re-queried every
+    /// frame it's drawn.
+    fallback_for_char: HashMap<char, Option<std::path::PathBuf>>,
     cache: HashMap<(char, bool), (fontdue::Metrics, Vec<u8>)>,
     cell_width: usize,
     cell_height: usize,
@@ -51,8 +61,11 @@ impl GlyphCache {
         let baseline = line_metrics.ascent.round() as usize;
 
         Ok(Self {
+            fc,
             regular,
             bold,
+            fallback_fonts: HashMap::new(),
+            fallback_for_char: HashMap::new(),
             cache: HashMap::new(),
             cell_width,
             cell_height,
@@ -68,14 +81,78 @@ impl GlyphCache {
         self.cell_height
     }
 
-    fn glyph(&mut self, c: char, bold: bool) -> &(fontdue::Metrics, Vec<u8>) {
-        self.cache
-            .entry((c, bold))
-            .or_insert_with_key(|&(c, bold)| {
-                let font = if bold { &self.bold } else { &self.regular };
-                font.rasterize(c, FONT_SIZE)
-            })
+    /// The primary/bold font if it covers `c`, otherwise a fontconfig-found
+    /// fallback that does (loaded and cached on first use), otherwise the
+    /// primary/bold font anyway (nothing on the system covers `c`).
+    fn font_for_char(&mut self, c: char, bold: bool) -> &fontdue::Font {
+        let primary_has_it = if bold {
+            self.bold.has_glyph(c)
+        } else {
+            self.regular.has_glyph(c)
+        };
+        if primary_has_it {
+            return if bold { &self.bold } else { &self.regular };
+        }
+
+        let fallback_path = match self.fallback_for_char.get(&c) {
+            Some(cached) => cached.clone(),
+            None => {
+                let found = find_fallback_font_path(&self.fc, c);
+                self.fallback_for_char.insert(c, found.clone());
+                found
+            }
+        };
+
+        if let Some(path) = &fallback_path
+            && !self.fallback_fonts.contains_key(path)
+        {
+            let loaded = std::fs::read(path).ok().and_then(|bytes| {
+                fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()).ok()
+            });
+            if let Some(font) = loaded {
+                self.fallback_fonts.insert(path.clone(), font);
+            }
+        }
+
+        match fallback_path
+            .as_ref()
+            .and_then(|p| self.fallback_fonts.get(p))
+        {
+            Some(font) if font.has_glyph(c) => font,
+            _ => {
+                if bold {
+                    &self.bold
+                } else {
+                    &self.regular
+                }
+            }
+        }
     }
+
+    fn glyph(&mut self, c: char, bold: bool) -> &(fontdue::Metrics, Vec<u8>) {
+        if !self.cache.contains_key(&(c, bold)) {
+            let rasterized = self.font_for_char(c, bold).rasterize(c, FONT_SIZE);
+            self.cache.insert((c, bold), rasterized);
+        }
+        // Unreachable in practice (just inserted above if missing), but
+        // avoid any panic path: render blank rather than unwrap/expect.
+        static EMPTY: std::sync::OnceLock<(fontdue::Metrics, Vec<u8>)> = std::sync::OnceLock::new();
+        self.cache
+            .get(&(c, bold))
+            .unwrap_or_else(|| EMPTY.get_or_init(|| (fontdue::Metrics::default(), Vec::new())))
+    }
+}
+
+/// Ask fontconfig (via `FcFontMatch` with a charset requirement, which
+/// applies the system's normal font-substitution/fallback rules) for a font
+/// that actually contains `c`.
+fn find_fallback_font_path(fc: &fontconfig::Fontconfig, c: char) -> Option<std::path::PathBuf> {
+    let mut pattern = fontconfig::Pattern::new(fc).ok()?;
+    let mut charset = fontconfig::CharSet::new(fc).ok()?;
+    charset.add_char(c).ok()?;
+    pattern.add_charset(charset).ok()?;
+    let matched = pattern.font_match().ok()?;
+    Some(std::path::PathBuf::from(matched.filename().ok()?))
 }
 
 fn put_pixel(buf: &mut [u8], width: usize, height: usize, x: i64, y: i64, rgb: Rgb) {

@@ -1,6 +1,7 @@
 mod handlers;
 mod hut;
 mod input;
+mod keybindings;
 mod render;
 mod state;
 mod winit_backend;
@@ -16,9 +17,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut event_loop: EventLoop<State> = EventLoop::try_new()?;
     let display: Display<State> = Display::new()?;
 
+    let socket = state::create_socket()?;
+
+    // Must happen before spawning the Hut's shell: children inherit the
+    // environment at fork time, so setting this any later would leave the
+    // shell (and anything launched from it) connected to whatever
+    // compositor mudhuts itself is nested in, not mudhuts' own socket.
+    unsafe { std::env::set_var("WAYLAND_DISPLAY", &socket.1) };
+
     let (hut, term_events) = hut::Hut::spawn()?;
 
-    let mut state = State::new(&mut event_loop, display, hut)?;
+    let mut state = State::new(&mut event_loop, display, hut, socket)?;
 
     event_loop
         .handle()
@@ -33,10 +42,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?;
 
     winit_backend::init_winit(&mut event_loop, &mut state)?;
-
-    // So client processes launched from the built-in terminal connect to
-    // mudhuts rather than whatever compositor mudhuts itself is nested in.
-    unsafe { std::env::set_var("WAYLAND_DISPLAY", &state.socket_name) };
 
     event_loop.run(None, &mut state, |_| {})?;
 

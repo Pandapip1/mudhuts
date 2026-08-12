@@ -1,6 +1,7 @@
 use std::ffi::OsString;
 use std::sync::Arc;
 
+use smithay::backend::renderer::element::solid::SolidColorBuffer;
 use smithay::desktop::{PopupManager, Space, Window};
 use smithay::input::{Seat, SeatState};
 use smithay::reexports::calloop::generic::Generic;
@@ -16,6 +17,17 @@ use smithay::wayland::shm::ShmState;
 use smithay::wayland::socket::ListeningSocketSource;
 
 use crate::hut::Hut;
+use crate::keybindings::Keymap;
+
+/// Open mudhuts' listening Wayland socket without yet wiring it into an
+/// event loop. Split out from [`State::new`] so callers can learn the
+/// socket name (to export `WAYLAND_DISPLAY`) before spawning anything that
+/// should connect to *this* compositor rather than whatever it's nested in.
+pub fn create_socket() -> Result<(ListeningSocketSource, OsString), Box<dyn std::error::Error>> {
+    let listening_socket = ListeningSocketSource::new_auto()?;
+    let socket_name = listening_socket.socket_name().to_os_string();
+    Ok((listening_socket, socket_name))
+}
 
 pub struct State {
     pub start_time: std::time::Instant,
@@ -38,13 +50,24 @@ pub struct State {
     pub seat: Seat<Self>,
 
     pub hut: Hut,
+    pub keymap: Keymap,
+
+    /// A visible mouse pointer. Smithay tracks pointer position/focus for
+    /// input purposes regardless, but nothing renders it unless we do.
+    pub cursor_buffer: SolidColorBuffer,
 }
 
 impl State {
+    /// `socket` must already be listening (see [`create_socket`]) — created
+    /// separately so `main` can export `WAYLAND_DISPLAY` for the Hut's
+    /// shell (and anything it launches) *before* that shell is spawned,
+    /// rather than after, which would leave it pointed at whatever
+    /// compositor mudhuts itself is nested in.
     pub fn new(
         event_loop: &mut EventLoop<Self>,
         display: Display<Self>,
         hut: Hut,
+        socket: (ListeningSocketSource, OsString),
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let start_time = std::time::Instant::now();
         let dh = display.handle();
@@ -62,7 +85,8 @@ impl State {
         seat.add_pointer();
 
         let space = Space::default();
-        let socket_name = Self::init_wayland_listener(display, event_loop)?;
+        let (listening_socket, socket_name) = socket;
+        Self::init_wayland_listener(display, event_loop, listening_socket)?;
         let loop_signal = event_loop.get_signal();
 
         Ok(Self {
@@ -80,15 +104,16 @@ impl State {
             popups,
             seat,
             hut,
+            keymap: Keymap::load(),
+            cursor_buffer: SolidColorBuffer::new((10, 10), [1.0, 1.0, 1.0, 1.0]),
         })
     }
 
     fn init_wayland_listener(
         display: Display<Self>,
         event_loop: &mut EventLoop<Self>,
-    ) -> Result<OsString, Box<dyn std::error::Error>> {
-        let listening_socket = ListeningSocketSource::new_auto()?;
-        let socket_name = listening_socket.socket_name().to_os_string();
+        listening_socket: ListeningSocketSource,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let loop_handle = event_loop.handle();
 
         loop_handle.insert_source(listening_socket, move |client_stream, _, state| {
@@ -111,7 +136,7 @@ impl State {
             },
         )?;
 
-        Ok(socket_name)
+        Ok(())
     }
 
     pub fn surface_under(
