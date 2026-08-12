@@ -81,29 +81,61 @@ pub fn init_udev(
         LibSeatSession::new().map_err(|err| format!("failed to initialize a session: {err}"))?;
     let seat_name = session.seat();
 
-    let primary_gpu_path: PathBuf = std::env::var_os("MUDHUTS_DRM_DEVICE")
-        .map(PathBuf::from)
-        .or_else(|| udev::primary_gpu(&seat_name).ok().flatten())
-        .or_else(|| {
-            udev::all_gpus(&seat_name)
-                .ok()
-                .and_then(|gpus| gpus.into_iter().next())
-        })
-        .ok_or("no GPU found for this seat")?;
+    // Candidates to try, in order. `smithay::backend::udev::primary_gpu`'s
+    // own heuristic deliberately isn't used here: its 2nd-priority rule
+    // ("prefer whichever GPU has an associated render node") is aimed at
+    // typical PC dGPU/iGPU splits, but backfires on hardware where the
+    // display controller and the GPU core are altogether separate DRM
+    // nodes (e.g. Apple Silicon: the display controller has real
+    // connectors but *no* render node, while the GPU core has a render
+    // node but no modesetting/connector capability at all — exactly
+    // backwards from what that heuristic assumes). Since this backend
+    // doesn't split "render GPU" from "display GPU" in the first place
+    // (single plain `GlesRenderer`, see the module doc), what actually
+    // matters is which node can do real modesetting — so each candidate
+    // is tried for real (open + `DrmDevice::new`, which itself fails if
+    // resource-handle enumeration isn't supported) rather than guessed.
+    let candidates: Vec<PathBuf> = match std::env::var_os("MUDHUTS_DRM_DEVICE") {
+        Some(path) => vec![PathBuf::from(path)],
+        None => udev::all_gpus(&seat_name).map_err(|err| format!("failed to list GPUs: {err}"))?,
+    };
+    if candidates.is_empty() {
+        return Err("no GPU found for this seat".into());
+    }
+
+    let mut last_err = None;
+    let mut opened = None;
+    for path in &candidates {
+        let result = session
+            .open(
+                path,
+                OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK,
+            )
+            .map_err(|err| format!("failed to open {path:?}: {err}"))
+            .and_then(|fd| {
+                let fd = DrmDeviceFd::new(DeviceFd::from(fd));
+                DrmDevice::new(fd.clone(), true)
+                    .map(|(drm_device, drm_notifier)| (fd, drm_device, drm_notifier))
+                    .map_err(|err| format!("{path:?} can't do modesetting: {err}"))
+            });
+        match result {
+            Ok(triple) => {
+                opened = Some((path.clone(), triple));
+                break;
+            }
+            Err(err) => {
+                tracing::debug!("{err}");
+                last_err = Some(err);
+            }
+        }
+    }
+    let Some((primary_gpu_path, (fd, drm_device, drm_notifier))) = opened else {
+        return Err(last_err.unwrap_or_else(|| "no usable DRM device found".to_string()).into());
+    };
     let node = DrmNode::from_path(&primary_gpu_path)
         .map_err(|err| format!("{primary_gpu_path:?} is not a DRM node: {err}"))?;
     tracing::info!("using {primary_gpu_path:?} as the DRM device");
 
-    let fd = session
-        .open(
-            &primary_gpu_path,
-            OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK,
-        )
-        .map_err(|err| format!("failed to open {primary_gpu_path:?}: {err}"))?;
-    let fd = DrmDeviceFd::new(DeviceFd::from(fd));
-
-    let (drm_device, drm_notifier) =
-        DrmDevice::new(fd.clone(), true).map_err(|err| format!("failed to initialize DRM: {err}"))?;
     let gbm = GbmDevice::new(fd).map_err(|err| format!("failed to initialize GBM: {err}"))?;
 
     // Same EGL/GBM recipe the winit backend already uses internally —
