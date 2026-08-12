@@ -14,6 +14,7 @@
 //! core instancing, not the GLES2 + extensions fallback path.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture, ffi};
 
@@ -21,6 +22,47 @@ use mudhuts_term::GlyphCache;
 use mudhuts_term::render::CellInfo;
 
 const ATLAS_SIZE: u32 = 1024;
+
+/// The glyph atlas is looked up once per on-screen cell every redraw, so its
+/// hash cost is on the hot path. `HashMap`'s default hasher (SipHash) is
+/// built for DoS resistance against attacker-controlled keys, which this
+/// tiny internal `(char, bool)` cache doesn't need — profiling a live
+/// instance under `perf` showed SipHash mixing alone (`Sip13Rounds`,
+/// `rotate_left`, `u8to64_le`) accounting for a large chunk of total CPU
+/// time. This is the well-known FxHash multiply-mix (from Firefox/rustc),
+/// reimplemented here rather than pulling in a dependency for ~10 lines.
+#[derive(Default)]
+struct FxHasher(u64);
+
+const FX_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+
+impl Hasher for FxHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut word = [0u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.write_u64(u64::from_ne_bytes(word));
+        }
+    }
+
+    fn write_u8(&mut self, i: u8) {
+        self.write_u64(i as u64);
+    }
+
+    fn write_u32(&mut self, i: u32) {
+        self.write_u64(i as u64);
+    }
+
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0.rotate_left(5) ^ i).wrapping_mul(FX_SEED);
+    }
+}
+
+type FxBuildHasher = BuildHasherDefault<FxHasher>;
 
 const VERTEX_SHADER: &str = r#"#version 300 es
 layout(location=0) in vec2 a_corner;
@@ -213,7 +255,7 @@ pub struct GpuTermRenderer {
     instance_capacity: usize,
     atlas_tex: ffi::types::GLuint,
     packer: ShelfPacker,
-    glyphs: HashMap<(char, bool), AtlasEntry>,
+    glyphs: HashMap<(char, bool), AtlasEntry, FxBuildHasher>,
     white: AtlasEntry,
     fbo: ffi::types::GLuint,
     /// The current offscreen color target, wrapped once per (re)allocation
@@ -325,7 +367,7 @@ impl GpuTermRenderer {
                     instance_capacity: 0,
                     atlas_tex,
                     packer,
-                    glyphs: HashMap::new(),
+                    glyphs: HashMap::default(),
                     white,
                     fbo,
                     color_texture: None,

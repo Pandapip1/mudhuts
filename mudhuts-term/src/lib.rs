@@ -234,9 +234,24 @@ impl Terminal {
     /// the caller can skip re-rendering entirely.
     pub fn take_dirty_cells(&self) -> Option<Vec<render::CellInfo>> {
         let mut term = self.term.lock();
+        // `Term::damage()` unconditionally marks the cursor's current cell
+        // damaged on *every* call (`damage_cursor()` in alacritty_terminal,
+        // called regardless of whether the cursor moved), as a single
+        // `LineDamageBounds` covering just that one column. Since we call
+        // `damage()` once per attempted redraw rather than once per actual
+        // terminal event, that single-cell entry is present even on a
+        // fully idle terminal — without filtering it out, every frame
+        // looks "damaged" and we'd redraw the whole grid continuously at
+        // whatever rate the compositor tries to redraw, regardless of
+        // whether anything is actually happening.
+        let cursor_point = term.grid().cursor.point;
         let has_content_damage = match term.damage() {
             alacritty_terminal::term::TermDamage::Full => true,
-            alacritty_terminal::term::TermDamage::Partial(mut lines) => lines.next().is_some(),
+            alacritty_terminal::term::TermDamage::Partial(lines) => lines.into_iter().any(|l| {
+                !(l.line == cursor_point.line.0 as usize
+                    && l.left == cursor_point.column.0
+                    && l.right == cursor_point.column.0)
+            }),
         };
         let changed = has_content_damage || term.selection.is_some();
         term.reset_damage();
