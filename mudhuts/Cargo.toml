@@ -11,7 +11,17 @@ serde = { version = "1", features = ["derive"] }
 toml = "1"
 tracing.workspace = true
 tracing-subscriber.workspace = true
+smithay-drm-extras = { git = "https://github.com/Smithay/smithay.git", rev = "4cf0b62028039661477d482ec4758b687d8f4392", default-features = false }
 
 [dependencies.smithay]
 workspace = true
-features = ["backend_winit", "wayland_frontend", "desktop"]
+features = [
+    "backend_winit",
+    "wayland_frontend",
+    "desktop",
+    "backend_session_libseat",
+    "backend_udev",
+    "backend_drm",
+    "backend_gbm",
+    "backend_libinput",
+]

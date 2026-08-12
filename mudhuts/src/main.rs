@@ -12,6 +12,7 @@ mod render;
 mod stack;
 mod state;
 mod switcher;
+mod udev_backend;
 mod winit_backend;
 
 use smithay::reexports::calloop::EventLoop;
@@ -41,7 +42,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stack = stack::HutStack::new(hut, term_events, loop_handle, extra_env)?;
     let mut state = State::new(&mut event_loop, display, stack, socket, redraw_ping)?;
 
-    winit_backend::init_winit(&mut event_loop, &mut state, redraw_ping_source)?;
+    // Explicit opt-in only — no auto-detection from absent
+    // `WAYLAND_DISPLAY`/`DISPLAY`. `--tty` is a real seat/DRM-owning
+    // backend with real safety stakes (it can seize DRM master / switch
+    // VTs), so it should never activate by surprise.
+    if std::env::args().nth(1).as_deref() == Some("--tty") {
+        udev_backend::init_udev(&mut event_loop, &mut state, redraw_ping_source)?;
+    } else {
+        winit_backend::init_winit(&mut event_loop, &mut state, redraw_ping_source)?;
+    }
 
     event_loop.run(None, &mut state, |_| {})?;
 

@@ -1,7 +1,7 @@
 use mudhuts_term::keys::{Key, Mods, NamedKey};
 use smithay::backend::input::{
     AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
-    KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
+    KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
 };
 use smithay::input::keyboard::{FilterResult, KeysymHandle, ModifiersState, keysyms};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
@@ -111,6 +111,61 @@ impl State {
             .map(|kb| kb.modifier_state())
             .unwrap_or_default();
         mods_from(&raw)
+    }
+
+    /// Shared tail of pointer-motion handling, called from both
+    /// `InputEvent::PointerMotionAbsolute` (winit: the host already gives
+    /// an absolute position) and `InputEvent::PointerMotion` (real
+    /// hardware under the udev/libinput backend: relative deltas,
+    /// accumulated and clamped by the caller before reaching here) —
+    /// everything past "here's the new absolute position" is identical
+    /// either way.
+    fn handle_pointer_motion(&mut self, pos: smithay::utils::Point<f64, smithay::utils::Logical>, time: u32) {
+        self.pointer_location = pos;
+        let serial = SERIAL_COUNTER.next_serial();
+
+        if self.dock_drag.is_some() {
+            docks::advance_drag(self, pos);
+        }
+
+        if self.showing_terminal_effective() {
+            let (col, row, left_half) = self.stack.focused().pixel_to_cell(pos.x, pos.y);
+            if let Some(held) = self.mouse_report_button_held {
+                if self.stack.focused().terminal.wants_drag_reports()
+                    && let Some(xbutton) = xterm_button(held)
+                {
+                    let mods = self.current_mods();
+                    self.stack.focused().terminal.report_mouse_drag(
+                        xbutton,
+                        mods,
+                        col + 1,
+                        row + 1,
+                    );
+                }
+            } else if self.text_selecting {
+                self.stack
+                    .focused()
+                    .terminal
+                    .extend_selection(col, row, left_half);
+                self.text_selection_dragged = true;
+            }
+        }
+
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        let under = self.surface_under(pos);
+
+        pointer.motion(
+            self,
+            under,
+            &MotionEvent {
+                location: pos,
+                serial,
+                time,
+            },
+        );
+        pointer.frame(self);
     }
 
     fn handle_action(&mut self, action: Action) {
@@ -290,7 +345,21 @@ impl State {
                     },
                 );
             }
-            InputEvent::PointerMotion { .. } => {}
+            InputEvent::PointerMotion { event } => {
+                // Real mice/touchpads (under the udev/libinput backend)
+                // report relative deltas, not an absolute position the
+                // way a nested winit window's host compositor does for
+                // `PointerMotionAbsolute` below — accumulate into the
+                // persisted `pointer_location` and clamp to the output's
+                // bounds (mirrors `.smithay-ref/anvil/src/
+                // input_handler.rs`'s `clamp_coords`, simplified since
+                // mudhuts is single-output).
+                let (max_x, max_y) = self.output_size;
+                let mut new_location = self.pointer_location + event.delta();
+                new_location.x = new_location.x.clamp(0.0, max_x.max(0) as f64);
+                new_location.y = new_location.y.clamp(0.0, max_y.max(0) as f64);
+                self.handle_pointer_motion(new_location, event.time_msec());
+            }
             InputEvent::PointerMotionAbsolute { event, .. } => {
                 let Some(output) = self.space.outputs().next() else {
                     return;
@@ -300,50 +369,7 @@ impl State {
                 };
 
                 let pos = event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
-                let serial = SERIAL_COUNTER.next_serial();
-
-                if self.dock_drag.is_some() {
-                    docks::advance_drag(self, pos);
-                }
-
-                if self.showing_terminal_effective() {
-                    let (col, row, left_half) = self.stack.focused().pixel_to_cell(pos.x, pos.y);
-                    if let Some(held) = self.mouse_report_button_held {
-                        if self.stack.focused().terminal.wants_drag_reports()
-                            && let Some(xbutton) = xterm_button(held)
-                        {
-                            let mods = self.current_mods();
-                            self.stack.focused().terminal.report_mouse_drag(
-                                xbutton,
-                                mods,
-                                col + 1,
-                                row + 1,
-                            );
-                        }
-                    } else if self.text_selecting {
-                        self.stack
-                            .focused()
-                            .terminal
-                            .extend_selection(col, row, left_half);
-                        self.text_selection_dragged = true;
-                    }
-                }
-
-                let Some(pointer) = self.seat.get_pointer() else {
-                    return;
-                };
-                let under = self.surface_under(pos);
-
-                pointer.motion(
-                    self,
-                    under,
-                    &MotionEvent {
-                        location: pos,
-                        serial,
-                        time: event.time_msec(),
-                    },
-                );
-                pointer.frame(self);
+                self.handle_pointer_motion(pos, event.time_msec());
             }
             InputEvent::PointerButton { event, .. } => {
                 let Some(pointer) = self.seat.get_pointer() else {

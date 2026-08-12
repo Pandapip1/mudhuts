@@ -74,6 +74,15 @@ pub struct State {
     /// see `docks.rs`.
     pub dock_drag: Option<crate::docks::DockDrag>,
 
+    /// The pointer's current position, tracked here explicitly for the
+    /// udev/libinput backend's relative-motion events (real mice/
+    /// touchpads report deltas, not an absolute position the way a
+    /// nested winit window's host compositor does) — see
+    /// `input.rs`'s `InputEvent::PointerMotion` handling. Unused under
+    /// the winit backend, which computes an absolute position fresh
+    /// from each event instead.
+    pub pointer_location: Point<f64, Logical>,
+
     /// Wakes up the winit backend's redraw handler (see `winit_backend.rs`,
     /// the only place that owns the actual window handle needed to call
     /// its `request_redraw()`) from anywhere else that changes something
@@ -143,6 +152,7 @@ impl State {
             text_selection_dragged: false,
             mouse_report_button_held: None,
             dock_drag: None,
+            pointer_location: Point::from((0.0, 0.0)),
             redraw_ping,
         })
     }
