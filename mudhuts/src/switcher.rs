@@ -6,11 +6,11 @@
 //! pipeline: `TextureRenderElement` composites a texture at whatever
 //! size/location it's given regardless of the texture's native size.
 
+use smithay::backend::renderer::Renderer;
 use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
-use smithay::backend::renderer::Renderer;
 use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Physical, Point, Rectangle, Size, Transform};
@@ -85,7 +85,10 @@ pub fn build(stack: &HutStack, output_size: (i32, i32), renderer: &GlesRenderer)
 
     let panel = SolidColorRenderElement::new(
         Id::new(),
-        Rectangle::<i32, Physical>::new(Point::from((panel_x, panel_y)), Size::from((panel_w, panel_h))),
+        Rectangle::<i32, Physical>::new(
+            Point::from((panel_x, panel_y)),
+            Size::from((panel_w, panel_h)),
+        ),
         smithay::backend::renderer::utils::CommitCounter::default(),
         [0.05, 0.05, 0.05, 0.85],
         Kind::Unspecified,

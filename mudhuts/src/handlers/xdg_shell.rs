@@ -1,7 +1,8 @@
 use smithay::desktop::{
-    PopupKind, PopupManager, Space, Window, find_popup_root_surface, get_popup_toplevel_coords,
+    PopupKind, PopupManager, Window, find_popup_root_surface, get_popup_toplevel_coords,
 };
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
+use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::{wl_seat, wl_surface::WlSurface};
 use smithay::utils::Serial;
 use smithay::wayland::compositor::with_states;
@@ -11,6 +12,7 @@ use smithay::wayland::shell::xdg::{
 };
 
 use crate::State;
+use crate::ownership;
 
 impl XdgShellHandler for State {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
@@ -41,28 +43,71 @@ impl XdgShellHandler for State {
             });
         }
 
-        // Phase 1: no Main Window / role organization yet (Phase 4+); just
-        // composite it on top of the terminal.
-        let was_empty = self.space.elements().next().is_none();
+        // Default Hut assignment needs no protocol: walk the connecting
+        // client's process ancestry back to a known Hut's shell PID (see
+        // the plan's Phase 4 notes). Falls back to the focused Hut if the
+        // client's credentials aren't available or no ancestor matches
+        // (e.g. it wasn't actually launched from one of our shells).
+        let owning_hut_id = surface
+            .wl_surface()
+            .client()
+            .and_then(|client| client.get_credentials(&self.display_handle).ok())
+            .and_then(|creds| ownership::find_owning_hut(creds.pid as u32, &self.stack))
+            .unwrap_or_else(|| self.stack.focused().id);
+
         let window = Window::new_wayland_window(surface);
         let wl_surface = window.toplevel().map(|t| t.wl_surface().clone());
-        self.space.map_element(window, (0, 0), false);
-        if was_empty {
-            // Nothing else to show yet, so a newly launched window should
-            // become visible immediately rather than staying hidden behind
-            // the terminal until the user manually hits Ctrl+`.
-            self.showing_terminal = false;
+
+        let is_focused_hut = owning_hut_id == self.stack.focused().id;
+        let was_empty = self
+            .stack
+            .find_mut(owning_hut_id)
+            .is_some_and(|hut| hut.main_window_count() == 0);
+        if let Some(hut) = self.stack.find_mut(owning_hut_id) {
+            hut.push_main_window(window);
         }
+
+        // Nothing else was showing yet for this Hut specifically, so the
+        // newly launched window becomes visible immediately rather than
+        // staying hidden behind the terminal until a manual Ctrl+` — but
+        // only when it's the focused Hut; a window launched from a
+        // background Hut's shell just joins that Hut's own tab strip
+        // without stealing focus (generalizes the original Phase 2.5
+        // "was empty" rule to be per-Hut).
+        let should_show_now = is_focused_hut && was_empty;
+        if should_show_now {
+            self.stack.focused_mut().showing_terminal = false;
+        }
+        self.sync_visible_main_window();
+
         // A new window should be able to receive keyboard input as soon as
         // it's visible, not only after the user clicks it — matters
-        // especially for the was_empty case above, where there was never
+        // especially for the should_show_now case, where there was never
         // an existing window to click away from focus in the first place.
-        if let Some(keyboard) = self.seat.get_keyboard() {
+        if should_show_now && let Some(keyboard) = self.seat.get_keyboard() {
             keyboard.set_focus(
                 self,
                 wl_surface,
                 smithay::utils::SERIAL_COUNTER.next_serial(),
             );
+        }
+        self.request_redraw();
+    }
+
+    fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        let wl_surface = surface.wl_surface();
+        let was_focused_hut_visible_window = self
+            .stack
+            .focused()
+            .active_window()
+            .is_some_and(|w| w.toplevel().is_some_and(|t| t.wl_surface() == wl_surface));
+        for hut in self.stack.huts_mut() {
+            if hut.remove_main_window(wl_surface) {
+                break;
+            }
+        }
+        if was_focused_hut_visible_window {
+            self.sync_visible_main_window();
         }
         self.request_redraw();
     }
@@ -107,12 +152,8 @@ impl XdgShellHandler for State {
 }
 
 /// Should be called on `WlSurface::commit`.
-pub fn handle_commit(popups: &mut PopupManager, space: &Space<Window>, surface: &WlSurface) {
-    if let Some(window) = space
-        .elements()
-        .find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == surface))
-        .cloned()
-    {
+pub fn handle_commit(popups: &mut PopupManager, window: Option<Window>, surface: &WlSurface) {
+    if let Some(window) = window {
         let Some(toplevel) = window.toplevel() else {
             return;
         };
@@ -145,11 +186,13 @@ impl State {
         let Ok(root) = find_popup_root_surface(&PopupKind::Xdg(popup.clone())) else {
             return;
         };
-        let Some(window) = self
-            .space
-            .elements()
-            .find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == &root))
-        else {
+        // Looked up across every Hut (not just `self.space`, which now
+        // only ever holds whichever single Main Window is currently
+        // visible) — a popup's parent window doesn't have to be the
+        // visible one. Every Main Window is fullscreen at the output's
+        // origin by construction, mapped or not, so its geometry is
+        // always just the output's — no per-window geometry lookup needed.
+        if self.find_window_by_surface(&root).is_none() {
             return;
         };
 
@@ -159,13 +202,9 @@ impl State {
         let Some(output_geo) = self.space.output_geometry(output) else {
             return;
         };
-        let Some(window_geo) = self.space.element_geometry(window) else {
-            return;
-        };
 
         let mut target = output_geo;
         target.loc -= get_popup_toplevel_coords(&PopupKind::Xdg(popup.clone()));
-        target.loc -= window_geo.loc;
 
         popup.with_pending_state(|state| {
             state.geometry = state.positioner.get_unconstrained_geometry(target);

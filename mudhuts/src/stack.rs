@@ -295,7 +295,11 @@ mod tests {
         let mut stack = new_stack();
         let original_id = stack.focused().id;
         stack.next().unwrap();
-        assert_eq!(stack.len(), 1, "untouched Hut should be replaced, not kept alongside a new one");
+        assert_eq!(
+            stack.len(),
+            1,
+            "untouched Hut should be replaced, not kept alongside a new one"
+        );
         assert_ne!(stack.focused().id, original_id, "should be a fresh Hut");
     }
 
@@ -306,7 +310,11 @@ mod tests {
         stack.focused_mut().mark_touched();
         stack.next().unwrap();
         assert_eq!(stack.len(), 2);
-        assert_ne!(stack.focused().id, first_id, "should have moved on to a new Hut");
+        assert_ne!(
+            stack.focused().id,
+            first_id,
+            "should have moved on to a new Hut"
+        );
         assert!(!stack.focused().touched());
     }
 
@@ -320,7 +328,11 @@ mod tests {
         stack.focused_mut().mark_touched(); // touch the 3rd entry too, so leaving it doesn't discard it
         let third_id = stack.focused().id;
         stack.prev(); // back to current = 1 (2nd entry, touched, kept — as is the 3rd, since it's touched)
-        assert_eq!(stack.len(), 3, "moving back shouldn't discard a touched Hut");
+        assert_eq!(
+            stack.len(),
+            3,
+            "moving back shouldn't discard a touched Hut"
+        );
         stack.next().unwrap(); // should move forward onto the existing 3rd entry, not spawn a 4th
         assert_eq!(stack.len(), 3);
         assert_eq!(stack.focused().id, third_id);
@@ -342,7 +354,11 @@ mod tests {
         stack.focused_mut().mark_touched();
         stack.next().unwrap(); // now at a fresh, untouched 2nd Hut
         stack.prev();
-        assert_eq!(stack.len(), 1, "the never-touched 2nd Hut should be discarded, not kept");
+        assert_eq!(
+            stack.len(),
+            1,
+            "the never-touched 2nd Hut should be discarded, not kept"
+        );
         assert_eq!(stack.focused().id, first_id);
     }
 
@@ -355,7 +371,11 @@ mod tests {
         let second_id = stack.focused().id;
         stack.next().unwrap(); // now at a fresh, untouched 3rd Hut
         stack.prev();
-        assert_eq!(stack.len(), 2, "the touched 2nd Hut should survive being left");
+        assert_eq!(
+            stack.len(),
+            2,
+            "the touched 2nd Hut should survive being left"
+        );
         assert_eq!(stack.focused().id, second_id);
     }
 
@@ -380,7 +400,11 @@ mod tests {
         stack.remove_exited(first_id).unwrap();
 
         assert_eq!(stack.len(), 1);
-        assert_eq!(stack.focused().id, second_id, "focus shouldn't move for an unrelated exit");
+        assert_eq!(
+            stack.focused().id,
+            second_id,
+            "focus shouldn't move for an unrelated exit"
+        );
     }
 
     #[test]
@@ -400,7 +424,10 @@ mod tests {
         assert!(stack.is_previewing());
         assert_eq!(stack.len(), 2, "peeking forward should spawn a 2nd Hut");
         assert_eq!(stack.focused().id, first_id, "background must stay frozen");
-        assert_ne!(stack.huts().nth(stack.preview_index()).unwrap().id, first_id);
+        assert_ne!(
+            stack.huts().nth(stack.preview_index()).unwrap().id,
+            first_id
+        );
     }
 
     #[test]
@@ -421,7 +448,11 @@ mod tests {
         // correctly — it's being left behind — so length drops to 1.)
         stack.preview_prev();
         assert_eq!(stack.preview_index(), 0);
-        assert_eq!(stack.len(), 1, "current wasn't discarded by landing back on it");
+        assert_eq!(
+            stack.len(),
+            1,
+            "current wasn't discarded by landing back on it"
+        );
         assert_eq!(stack.focused().id, first_id);
     }
 
@@ -431,7 +462,11 @@ mod tests {
         stack.focused_mut().mark_touched();
         stack.preview_next().unwrap(); // spawn #2, preview = 1 (untouched)
         stack.preview_next().unwrap(); // leaving #2 untouched -> discarded, spawn #3 in its place
-        assert_eq!(stack.len(), 2, "the untouched 2nd entry should be discarded, not accumulated");
+        assert_eq!(
+            stack.len(),
+            2,
+            "the untouched 2nd entry should be discarded, not accumulated"
+        );
     }
 
     #[test]
@@ -455,7 +490,10 @@ mod tests {
 
         stack.preview_prev();
         assert_eq!(stack.preview_index(), 1, "wraps to the oldest entry");
-        assert_eq!(stack.huts().nth(stack.preview_index()).unwrap().id, first_id);
+        assert_eq!(
+            stack.huts().nth(stack.preview_index()).unwrap().id,
+            first_id
+        );
     }
 
     #[test]
@@ -469,9 +507,17 @@ mod tests {
         stack.commit_preview();
 
         assert!(!stack.is_previewing());
-        assert_eq!(stack.focused().id, second_id, "committed selection becomes focused");
+        assert_eq!(
+            stack.focused().id,
+            second_id,
+            "committed selection becomes focused"
+        );
         assert!(stack.focused().touched(), "committing counts as using it");
-        assert_eq!(stack.len(), 2, "the Hut left behind (first_id) is kept, not discarded");
+        assert_eq!(
+            stack.len(),
+            2,
+            "the Hut left behind (first_id) is kept, not discarded"
+        );
     }
 
     #[test]

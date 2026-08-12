@@ -7,6 +7,7 @@ use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::ping::Ping;
 use smithay::reexports::calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction};
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Display, DisplayHandle};
 use smithay::utils::{Logical, Point};
 use smithay::wayland::compositor::{CompositorClientState, CompositorState};
@@ -56,17 +57,6 @@ pub struct State {
     /// resized immediately on switch rather than showing a stale grid
     /// until the next real resize.
     pub output_size: (i32, i32),
-
-    /// Whether the Hut's terminal (vs. its client window(s)) is the
-    /// active view, toggled by `Action::ToggleTerminal` (Ctrl+`).
-    ///
-    /// Interim placeholder for the real Main Window tab system (Phase 4):
-    /// for now a Hut's client windows are shown centered over a blacked-out
-    /// background, entirely replacing the terminal view rather than
-    /// compositing on top of it, so a toggle is needed to get back to the
-    /// terminal at all. Ignored (forced true) when there are no client
-    /// windows to toggle to.
-    pub showing_terminal: bool,
 
     /// Set while dragging out a text selection in the terminal (left
     /// button held, no mouse reporting active).
@@ -141,7 +131,6 @@ impl State {
             stack,
             keymap: Keymap::load(),
             output_size: (0, 0),
-            showing_terminal: true,
             text_selecting: false,
             text_selection_dragged: false,
             mouse_report_button_held: None,
@@ -213,11 +202,44 @@ impl State {
         Ok(())
     }
 
-    /// Whether the terminal (vs. a client window) should currently be the
-    /// visible/focused view — [`Self::showing_terminal`], but forced true
-    /// when there's nothing to toggle to.
+    /// Whether the focused Hut's terminal (vs. its active Main Window)
+    /// should currently be the visible view — `Hut::showing_terminal`,
+    /// but forced true when that Hut has no Main Windows to toggle to.
     pub fn showing_terminal_effective(&self) -> bool {
-        self.showing_terminal || self.space.elements().next().is_none()
+        let hut = self.stack.focused();
+        hut.showing_terminal || hut.main_window_count() == 0
+    }
+
+    /// Make `self.space` match what the focused Hut should currently be
+    /// showing: unmap whatever's mapped (harmless if nothing was), then
+    /// map the focused Hut's active Main Window if it isn't showing its
+    /// terminal. Call after anything that could change which Hut/tab is
+    /// focused or which view a Hut is showing (Alt-Tab commit,
+    /// `ToggleTerminal`, `TabNext`/`TabPrev`, a new toplevel auto-switching
+    /// in, a toplevel closing).
+    pub fn sync_visible_main_window(&mut self) {
+        let mapped: Vec<_> = self.space.elements().cloned().collect();
+        for window in mapped {
+            self.space.unmap_elem(&window);
+        }
+        let hut = self.stack.focused();
+        if !hut.showing_terminal
+            && let Some(window) = hut.active_window()
+        {
+            self.space.map_element(window.clone(), (0, 0), false);
+        }
+    }
+
+    /// Find a Main Window by its surface across *every* Hut, not just
+    /// whatever's currently visible in `self.space` — a background Hut's
+    /// windows still need commit/configure handling while hidden.
+    pub fn find_window_by_surface(&self, surface: &WlSurface) -> Option<Window> {
+        self.stack.huts().find_map(|h| {
+            h.main_windows()
+                .iter()
+                .find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == surface))
+                .cloned()
+        })
     }
 
     pub fn surface_under(

@@ -81,6 +81,11 @@ pub struct Terminal {
     notifier: Notifier,
     size: GridSize,
     cell_size: (u16, u16),
+    /// The shell's own PID (not this process's) — used to recognize a new
+    /// Wayland client as belonging to this Hut by walking its process
+    /// ancestry back to this PID (see the plan's Phase 4 notes; no
+    /// protocol needed for the default case).
+    pub shell_pid: u32,
     /// Set once the shell has exited; kept around so callers can decide
     /// whether to respawn or tear down the owning Hut.
     pub exited: bool,
@@ -124,6 +129,10 @@ impl Terminal {
             ..Default::default()
         };
         let pty = tty::new(&pty_options, window_size(size, cell_size), 0)?;
+        // Captured before `pty` moves into `PtyEventLoop::new` below — the
+        // event loop takes ownership of the `Pty` (and so the `Child`)
+        // from here on.
+        let shell_pid = pty.child().id();
 
         let pty_event_loop = PtyEventLoop::new(term.clone(), event_proxy, pty, false, false)?;
         let notifier = Notifier(pty_event_loop.channel());
@@ -135,6 +144,7 @@ impl Terminal {
                 notifier,
                 size,
                 cell_size,
+                shell_pid,
                 exited: false,
             },
             rx,

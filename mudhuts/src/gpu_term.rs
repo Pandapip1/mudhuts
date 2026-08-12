@@ -12,13 +12,23 @@
 //! GLES 3.x core features (confirmed present in this environment: logged
 //! "OpenGL ES 3.2 Mesa" at startup) — single-channel `RED` textures and
 //! core instancing, not the GLES2 + extensions fallback path.
+//!
+//! [`GlyphAtlas`] (the shader program + atlas texture + rasterization
+//! cache) is shared between [`GpuTermRenderer`] (one Hut's full terminal
+//! grid) and [`LabelRenderer`] (Phase 4's tab-strip chrome — short
+//! standalone strings like window titles) via `Rc<RefCell<_>>`, so a
+//! glyph seen by one is cached for the other too rather than rasterized
+//! and uploaded twice into two separate atlases.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
+use std::rc::Rc;
 
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture, ffi};
 
 use mudhuts_term::GlyphCache;
+use mudhuts_term::palette::Rgb;
 use mudhuts_term::render::CellInfo;
 
 const ATLAS_SIZE: u32 = 1024;
@@ -247,29 +257,21 @@ fn link_program(
     }
 }
 
-pub struct GpuTermRenderer {
+/// The shader program, glyph-coverage atlas texture, and rasterization
+/// cache shared by every renderer that draws text (currently
+/// [`GpuTermRenderer`] and [`LabelRenderer`]) — see the module doc for why
+/// this is split out and shared rather than duplicated per renderer.
+pub struct GlyphAtlas {
     program: ffi::types::GLuint,
     u_target_size: ffi::types::GLint,
     quad_vbo: ffi::types::GLuint,
-    instance_vbo: ffi::types::GLuint,
-    instance_capacity: usize,
     atlas_tex: ffi::types::GLuint,
     packer: ShelfPacker,
     glyphs: HashMap<(char, bool), AtlasEntry, FxBuildHasher>,
     white: AtlasEntry,
-    fbo: ffi::types::GLuint,
-    /// The current offscreen color target, wrapped once per (re)allocation
-    /// — *not* re-wrapped every frame. `GlesTexture::from_raw` takes
-    /// ownership semantics (it's `Arc`-backed and frees the underlying GL
-    /// texture once the last clone drops); re-wrapping the same GL texture
-    /// id fresh each frame would let one frame's wrapper free the texture
-    /// out from under the next frame's. Cloning this (cheap: an `Arc`
-    /// clone) is the correct way to hand it to a render element each frame.
-    color_texture: Option<GlesTexture>,
-    tex_size: (i32, i32),
 }
 
-impl GpuTermRenderer {
+impl GlyphAtlas {
     pub fn new(renderer: &mut GlesRenderer) -> Result<Self, String> {
         renderer
             .with_context(|gl| unsafe {
@@ -290,9 +292,6 @@ impl GpuTermRenderer {
                     corners.as_ptr() as *const _,
                     ffi::STATIC_DRAW,
                 );
-
-                let mut instance_vbo = 0;
-                gl.GenBuffers(1, &mut instance_vbo);
 
                 let mut atlas_tex = 0;
                 gl.GenTextures(1, &mut atlas_tex);
@@ -356,107 +355,17 @@ impl GpuTermRenderer {
                     height: 1,
                 };
 
-                let mut fbo = 0;
-                gl.GenFramebuffers(1, &mut fbo);
-
-                Ok(GpuTermRenderer {
+                Ok(GlyphAtlas {
                     program,
                     u_target_size,
                     quad_vbo,
-                    instance_vbo,
-                    instance_capacity: 0,
                     atlas_tex,
                     packer,
                     glyphs: HashMap::default(),
                     white,
-                    fbo,
-                    color_texture: None,
-                    tex_size: (0, 0),
                 })
             })
             .map_err(|e| e.to_string())?
-    }
-
-    /// (Re)create the offscreen color target if `width`x`height` changed —
-    /// always as a *new* GL texture id (never reusing the previous one),
-    /// so the previous frame's still-in-flight `GlesTexture` wrapper (if
-    /// any) safely owns cleanup of the old id on its own schedule instead
-    /// of racing with this one. Returns `true` if it was (re)created,
-    /// meaning the whole thing needs redrawing this frame.
-    fn ensure_size(
-        &mut self,
-        renderer: &mut GlesRenderer,
-        width: i32,
-        height: i32,
-    ) -> Result<bool, String> {
-        if (width, height) == self.tex_size || width <= 0 || height <= 0 {
-            return Ok(false);
-        }
-        let fbo = self.fbo;
-        let color_tex = renderer
-            .with_context(|gl| unsafe {
-                let mut color_tex = 0;
-                gl.GenTextures(1, &mut color_tex);
-                gl.BindTexture(ffi::TEXTURE_2D, color_tex);
-                gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
-                gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
-                gl.TexParameteri(
-                    ffi::TEXTURE_2D,
-                    ffi::TEXTURE_WRAP_S,
-                    ffi::CLAMP_TO_EDGE as i32,
-                );
-                gl.TexParameteri(
-                    ffi::TEXTURE_2D,
-                    ffi::TEXTURE_WRAP_T,
-                    ffi::CLAMP_TO_EDGE as i32,
-                );
-                gl.TexImage2D(
-                    ffi::TEXTURE_2D,
-                    0,
-                    ffi::RGBA as i32,
-                    width,
-                    height,
-                    0,
-                    ffi::RGBA,
-                    ffi::UNSIGNED_BYTE,
-                    std::ptr::null(),
-                );
-
-                gl.BindFramebuffer(ffi::FRAMEBUFFER, fbo);
-                gl.FramebufferTexture2D(
-                    ffi::FRAMEBUFFER,
-                    ffi::COLOR_ATTACHMENT0,
-                    ffi::TEXTURE_2D,
-                    color_tex,
-                    0,
-                );
-                let status = gl.CheckFramebufferStatus(ffi::FRAMEBUFFER);
-                gl.BindFramebuffer(ffi::FRAMEBUFFER, 0);
-                if status != ffi::FRAMEBUFFER_COMPLETE {
-                    return Err(format!("incomplete framebuffer: 0x{status:x}"));
-                }
-                Ok(color_tex)
-            })
-            .map_err(|e| e.to_string())??;
-
-        // Safety: `color_tex` was just created by us above, is a valid 2D
-        // RGBA8 texture of exactly `width`x`height`, and we're handing
-        // ownership to this wrapper (never calling `glDeleteTextures` on
-        // it ourselves — ownership semantics, not the actual bytes, are
-        // what's being transferred here; ownership *cloning* it every
-        // frame below is just a cheap `Arc` refcount bump).
-        let texture = unsafe {
-            GlesTexture::from_raw(
-                renderer,
-                Some(ffi::RGBA),
-                true,
-                color_tex,
-                (width, height).into(),
-            )
-        };
-        self.color_texture = Some(texture);
-        self.tex_size = (width, height);
-        Ok(true)
     }
 
     /// Look up (or rasterize + upload) the atlas entry for `(c, bold)`.
@@ -513,6 +422,243 @@ impl GpuTermRenderer {
         self.glyphs.insert((c, bold), entry);
         Some(entry)
     }
+}
+
+/// Shared draw sequence: upload `instances` and draw them as two
+/// instanced batches (backgrounds — `instances[..bg_count]` — then
+/// glyphs) into `fbo`'s `tex_size`-sized target, sampling `atlas_tex`
+/// through `program`. Used by both [`GpuTermRenderer::redraw`] (a whole
+/// terminal grid) and [`LabelRenderer::render`] (one short string) — same
+/// shader/vertex layout, different content and target.
+#[allow(clippy::too_many_arguments)]
+fn draw_instances(
+    gl: &ffi::Gles2,
+    program: ffi::types::GLuint,
+    u_target_size: ffi::types::GLint,
+    quad_vbo: ffi::types::GLuint,
+    atlas_tex: ffi::types::GLuint,
+    instance_vbo: ffi::types::GLuint,
+    instance_capacity: &mut usize,
+    fbo: ffi::types::GLuint,
+    tex_size: (i32, i32),
+    instances: &[Instance],
+    bg_count: usize,
+) {
+    unsafe {
+        gl.BindBuffer(ffi::ARRAY_BUFFER, instance_vbo);
+        let needed = instances.len().max(1);
+        let byte_len = (needed * std::mem::size_of::<Instance>()) as ffi::types::GLsizeiptr;
+        if needed > *instance_capacity {
+            gl.BufferData(
+                ffi::ARRAY_BUFFER,
+                byte_len,
+                std::ptr::null(),
+                ffi::DYNAMIC_DRAW,
+            );
+            *instance_capacity = needed;
+        }
+        if !instances.is_empty() {
+            gl.BufferSubData(
+                ffi::ARRAY_BUFFER,
+                0,
+                std::mem::size_of_val(instances) as ffi::types::GLsizeiptr,
+                instances.as_ptr() as *const _,
+            );
+        }
+
+        gl.BindFramebuffer(ffi::FRAMEBUFFER, fbo);
+        gl.Viewport(0, 0, tex_size.0, tex_size.1);
+        gl.ClearColor(0.0, 0.0, 0.0, 1.0);
+        gl.Clear(ffi::COLOR_BUFFER_BIT);
+
+        gl.Enable(ffi::BLEND);
+        gl.BlendFunc(ffi::SRC_ALPHA, ffi::ONE_MINUS_SRC_ALPHA);
+
+        gl.UseProgram(program);
+        gl.Uniform2f(u_target_size, tex_size.0 as f32, tex_size.1 as f32);
+        gl.ActiveTexture(ffi::TEXTURE0);
+        gl.BindTexture(ffi::TEXTURE_2D, atlas_tex);
+
+        gl.BindBuffer(ffi::ARRAY_BUFFER, quad_vbo);
+        gl.EnableVertexAttribArray(0);
+        gl.VertexAttribPointer(0, 2, ffi::FLOAT, ffi::FALSE, 0, std::ptr::null());
+
+        let stride = std::mem::size_of::<Instance>() as ffi::types::GLsizei;
+        let attrib = |index: u32, size: i32, offset: usize, divisor: u32| {
+            gl.BindBuffer(ffi::ARRAY_BUFFER, instance_vbo);
+            gl.EnableVertexAttribArray(index);
+            gl.VertexAttribPointer(
+                index,
+                size,
+                ffi::FLOAT,
+                ffi::FALSE,
+                stride,
+                offset as *const _,
+            );
+            gl.VertexAttribDivisor(index, divisor);
+        };
+
+        let draw = |base: usize, count: usize| {
+            if count == 0 {
+                return;
+            }
+            let base_bytes = base * std::mem::size_of::<Instance>();
+            attrib(1, 2, base_bytes, 1);
+            attrib(2, 2, base_bytes + 8, 1);
+            attrib(3, 2, base_bytes + 16, 1);
+            attrib(4, 2, base_bytes + 24, 1);
+            attrib(5, 3, base_bytes + 32, 1);
+            gl.DrawArraysInstanced(ffi::TRIANGLE_STRIP, 0, 4, count as ffi::types::GLsizei);
+        };
+        draw(0, bg_count);
+        draw(bg_count, instances.len() - bg_count);
+
+        gl.BindFramebuffer(ffi::FRAMEBUFFER, 0);
+    }
+}
+
+/// Allocate a fresh `width`x`height` RGBA8 texture bound as `fbo`'s color
+/// attachment — always a *new* GL texture id (never reusing a previous
+/// one), so a still-in-flight `GlesTexture` wrapper from a previous call
+/// safely owns cleanup of its old id on its own schedule instead of
+/// racing with this one. Shared by `GpuTermRenderer::ensure_size` and
+/// `LabelRenderer::render`.
+fn alloc_color_target(
+    renderer: &mut GlesRenderer,
+    fbo: ffi::types::GLuint,
+    width: i32,
+    height: i32,
+) -> Result<GlesTexture, String> {
+    let color_tex = renderer
+        .with_context(|gl| unsafe {
+            let mut color_tex = 0;
+            gl.GenTextures(1, &mut color_tex);
+            gl.BindTexture(ffi::TEXTURE_2D, color_tex);
+            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
+            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
+            gl.TexParameteri(
+                ffi::TEXTURE_2D,
+                ffi::TEXTURE_WRAP_S,
+                ffi::CLAMP_TO_EDGE as i32,
+            );
+            gl.TexParameteri(
+                ffi::TEXTURE_2D,
+                ffi::TEXTURE_WRAP_T,
+                ffi::CLAMP_TO_EDGE as i32,
+            );
+            gl.TexImage2D(
+                ffi::TEXTURE_2D,
+                0,
+                ffi::RGBA as i32,
+                width,
+                height,
+                0,
+                ffi::RGBA,
+                ffi::UNSIGNED_BYTE,
+                std::ptr::null(),
+            );
+
+            gl.BindFramebuffer(ffi::FRAMEBUFFER, fbo);
+            gl.FramebufferTexture2D(
+                ffi::FRAMEBUFFER,
+                ffi::COLOR_ATTACHMENT0,
+                ffi::TEXTURE_2D,
+                color_tex,
+                0,
+            );
+            let status = gl.CheckFramebufferStatus(ffi::FRAMEBUFFER);
+            gl.BindFramebuffer(ffi::FRAMEBUFFER, 0);
+            if status != ffi::FRAMEBUFFER_COMPLETE {
+                return Err(format!("incomplete framebuffer: 0x{status:x}"));
+            }
+            Ok(color_tex)
+        })
+        .map_err(|e| e.to_string())??;
+
+    // Safety: `color_tex` was just created by us above, is a valid 2D
+    // RGBA8 texture of exactly `width`x`height`, and we're handing
+    // ownership to this wrapper (never calling `glDeleteTextures` on it
+    // ourselves).
+    Ok(unsafe {
+        GlesTexture::from_raw(
+            renderer,
+            Some(ffi::RGBA),
+            true,
+            color_tex,
+            (width, height).into(),
+        )
+    })
+}
+
+pub struct GpuTermRenderer {
+    atlas: Rc<RefCell<GlyphAtlas>>,
+    instance_vbo: ffi::types::GLuint,
+    instance_capacity: usize,
+    fbo: ffi::types::GLuint,
+    /// The current offscreen color target, wrapped once per (re)allocation
+    /// — *not* re-wrapped every frame. `GlesTexture::from_raw` takes
+    /// ownership semantics (it's `Arc`-backed and frees the underlying GL
+    /// texture once the last clone drops); re-wrapping the same GL texture
+    /// id fresh each frame would let one frame's wrapper free the texture
+    /// out from under the next frame's. Cloning this (cheap: an `Arc`
+    /// clone) is the correct way to hand it to a render element each frame.
+    color_texture: Option<GlesTexture>,
+    tex_size: (i32, i32),
+}
+
+impl GpuTermRenderer {
+    /// Creates its own atlas. Most callers want [`Self::with_atlas`]
+    /// instead, sharing one with the same Hut's [`LabelRenderer`] (if any)
+    /// so glyphs aren't rasterized/uploaded twice.
+    pub fn new(renderer: &mut GlesRenderer) -> Result<Self, String> {
+        let atlas = Rc::new(RefCell::new(GlyphAtlas::new(renderer)?));
+        Self::with_atlas(renderer, atlas)
+    }
+
+    pub fn with_atlas(
+        renderer: &mut GlesRenderer,
+        atlas: Rc<RefCell<GlyphAtlas>>,
+    ) -> Result<Self, String> {
+        renderer
+            .with_context(|gl| unsafe {
+                let mut instance_vbo = 0;
+                gl.GenBuffers(1, &mut instance_vbo);
+                let mut fbo = 0;
+                gl.GenFramebuffers(1, &mut fbo);
+                GpuTermRenderer {
+                    atlas,
+                    instance_vbo,
+                    instance_capacity: 0,
+                    fbo,
+                    color_texture: None,
+                    tex_size: (0, 0),
+                }
+            })
+            .map_err(|e| e.to_string())
+    }
+
+    /// This renderer's glyph atlas, to share with a [`LabelRenderer`] for
+    /// the same Hut.
+    pub fn atlas(&self) -> Rc<RefCell<GlyphAtlas>> {
+        self.atlas.clone()
+    }
+
+    /// (Re)create the offscreen color target if `width`x`height` changed.
+    /// Returns `true` if it was (re)created, meaning the whole thing needs
+    /// redrawing this frame.
+    fn ensure_size(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        width: i32,
+        height: i32,
+    ) -> Result<bool, String> {
+        if (width, height) == self.tex_size || width <= 0 || height <= 0 {
+            return Ok(false);
+        }
+        self.color_texture = Some(alloc_color_target(renderer, self.fbo, width, height)?);
+        self.tex_size = (width, height);
+        Ok(true)
+    }
 
     /// Redraw `cells` into the offscreen target (resized to `width`x
     /// `height` if needed), returning the up-to-date `GlesTexture`.
@@ -530,13 +676,14 @@ impl GpuTermRenderer {
     ) -> Result<GlesTexture, String> {
         self.ensure_size(renderer, width, height)?;
 
+        let white = self.atlas.borrow().white;
         let mut instances = Vec::with_capacity(cells.len() * 2);
         for cell in cells {
             instances.push(Instance {
                 dst_pos: [(cell.col * cell_w) as f32, (cell.row * cell_h) as f32],
                 dst_size: [cell_w as f32, cell_h as f32],
-                uv_pos: self.white.uv_pos,
-                uv_size: self.white.uv_size,
+                uv_pos: white.uv_pos,
+                uv_size: white.uv_size,
                 color: rgb_f32(cell.bg),
             });
         }
@@ -557,14 +704,6 @@ impl GpuTermRenderer {
             });
         }
 
-        let (program, u_target_size, quad_vbo, instance_vbo, atlas_tex, fbo) = (
-            self.program,
-            self.u_target_size,
-            self.quad_vbo,
-            self.instance_vbo,
-            self.atlas_tex,
-            self.fbo,
-        );
         let bg_count = glyph_start;
         let tex_size = self.tex_size;
 
@@ -577,7 +716,11 @@ impl GpuTermRenderer {
             let cells_with_glyphs = cells.iter().filter(|c| c.c != ' ' && c.c != '\0');
             for (cell, instance) in cells_with_glyphs.zip(&instances[glyph_start..]) {
                 let entry = renderer
-                    .with_context(|gl| self.atlas_entry(gl, glyph_cache, cell.c, cell.bold))
+                    .with_context(|gl| {
+                        self.atlas
+                            .borrow_mut()
+                            .atlas_entry(gl, glyph_cache, cell.c, cell.bold)
+                    })
                     .map_err(|e| e.to_string())?;
                 let Some(entry) = entry else { continue };
                 let glyph_x = (cell.col * cell_w) as i32 + entry.xmin;
@@ -594,80 +737,31 @@ impl GpuTermRenderer {
         }
         instances.truncate(bg_count);
         instances.extend(glyph_instances);
-        let glyph_count = instances.len() - bg_count;
 
+        let (instance_vbo, fbo) = (self.instance_vbo, self.fbo);
+        let atlas = self.atlas.borrow();
+        let (program, u_target_size, quad_vbo, atlas_tex) = (
+            atlas.program,
+            atlas.u_target_size,
+            atlas.quad_vbo,
+            atlas.atlas_tex,
+        );
+        drop(atlas);
         renderer
-            .with_context(|gl| unsafe {
-                gl.BindBuffer(ffi::ARRAY_BUFFER, instance_vbo);
-                let needed = instances.len().max(1);
-                let byte_len = (needed * std::mem::size_of::<Instance>()) as ffi::types::GLsizeiptr;
-                if needed > self.instance_capacity {
-                    gl.BufferData(
-                        ffi::ARRAY_BUFFER,
-                        byte_len,
-                        std::ptr::null(),
-                        ffi::DYNAMIC_DRAW,
-                    );
-                    self.instance_capacity = needed;
-                }
-                if !instances.is_empty() {
-                    gl.BufferSubData(
-                        ffi::ARRAY_BUFFER,
-                        0,
-                        (instances.len() * std::mem::size_of::<Instance>())
-                            as ffi::types::GLsizeiptr,
-                        instances.as_ptr() as *const _,
-                    );
-                }
-
-                gl.BindFramebuffer(ffi::FRAMEBUFFER, fbo);
-                gl.Viewport(0, 0, tex_size.0, tex_size.1);
-                gl.ClearColor(0.0, 0.0, 0.0, 1.0);
-                gl.Clear(ffi::COLOR_BUFFER_BIT);
-
-                gl.Enable(ffi::BLEND);
-                gl.BlendFunc(ffi::SRC_ALPHA, ffi::ONE_MINUS_SRC_ALPHA);
-
-                gl.UseProgram(program);
-                gl.Uniform2f(u_target_size, tex_size.0 as f32, tex_size.1 as f32);
-                gl.ActiveTexture(ffi::TEXTURE0);
-                gl.BindTexture(ffi::TEXTURE_2D, atlas_tex);
-
-                gl.BindBuffer(ffi::ARRAY_BUFFER, quad_vbo);
-                gl.EnableVertexAttribArray(0);
-                gl.VertexAttribPointer(0, 2, ffi::FLOAT, ffi::FALSE, 0, std::ptr::null());
-
-                let stride = std::mem::size_of::<Instance>() as ffi::types::GLsizei;
-                let attrib = |index: u32, size: i32, offset: usize, divisor: u32| {
-                    gl.BindBuffer(ffi::ARRAY_BUFFER, instance_vbo);
-                    gl.EnableVertexAttribArray(index);
-                    gl.VertexAttribPointer(
-                        index,
-                        size,
-                        ffi::FLOAT,
-                        ffi::FALSE,
-                        stride,
-                        offset as *const _,
-                    );
-                    gl.VertexAttribDivisor(index, divisor);
-                };
-
-                let draw = |base: usize, count: usize| {
-                    if count == 0 {
-                        return;
-                    }
-                    let base_bytes = base * std::mem::size_of::<Instance>();
-                    attrib(1, 2, base_bytes, 1);
-                    attrib(2, 2, base_bytes + 8, 1);
-                    attrib(3, 2, base_bytes + 16, 1);
-                    attrib(4, 2, base_bytes + 24, 1);
-                    attrib(5, 3, base_bytes + 32, 1);
-                    gl.DrawArraysInstanced(ffi::TRIANGLE_STRIP, 0, 4, count as ffi::types::GLsizei);
-                };
-                draw(0, bg_count);
-                draw(bg_count, glyph_count);
-
-                gl.BindFramebuffer(ffi::FRAMEBUFFER, 0);
+            .with_context(|gl| {
+                draw_instances(
+                    gl,
+                    program,
+                    u_target_size,
+                    quad_vbo,
+                    atlas_tex,
+                    instance_vbo,
+                    &mut self.instance_capacity,
+                    fbo,
+                    tex_size,
+                    &instances,
+                    bg_count,
+                )
             })
             .map_err(|e| e.to_string())?;
 
@@ -680,7 +774,129 @@ impl GpuTermRenderer {
     }
 }
 
-fn rgb_f32(rgb: mudhuts_term::palette::Rgb) -> [f32; 3] {
+/// Renders one short standalone string (no wrapping, single line) into its
+/// own texture sized to fit it exactly — used for Phase 4's tab-strip
+/// chrome (window titles), not the terminal grid. Unlike
+/// [`GpuTermRenderer`], always allocates a fresh target texture per call
+/// rather than reusing one when the size matches: labels are small,
+/// low-frequency (only rebuilt when the tab strip's contents change), so
+/// the reuse optimization that matters for the full-screen terminal path
+/// isn't worth the complexity here.
+pub struct LabelRenderer {
+    atlas: Rc<RefCell<GlyphAtlas>>,
+    instance_vbo: ffi::types::GLuint,
+    instance_capacity: usize,
+    fbo: ffi::types::GLuint,
+}
+
+impl LabelRenderer {
+    pub fn new(
+        renderer: &mut GlesRenderer,
+        atlas: Rc<RefCell<GlyphAtlas>>,
+    ) -> Result<Self, String> {
+        renderer
+            .with_context(|gl| unsafe {
+                let mut instance_vbo = 0;
+                gl.GenBuffers(1, &mut instance_vbo);
+                let mut fbo = 0;
+                gl.GenFramebuffers(1, &mut fbo);
+                LabelRenderer {
+                    atlas,
+                    instance_vbo,
+                    instance_capacity: 0,
+                    fbo,
+                }
+            })
+            .map_err(|e| e.to_string())
+    }
+
+    /// Render `text` (single line; caller should pre-truncate to whatever
+    /// fits its layout) with `fg`-colored glyphs over a `bg`-colored
+    /// background, `cell_w`/`cell_h`/`baseline` matching the compositor's
+    /// glyph metrics so labels visually match the terminal's own type.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        glyph_cache: &mut GlyphCache,
+        text: &str,
+        cell_w: usize,
+        cell_h: usize,
+        baseline: usize,
+        fg: Rgb,
+        bg: Rgb,
+    ) -> Result<GlesTexture, String> {
+        let chars: Vec<char> = text.chars().collect();
+        let width = (chars.len().max(1) * cell_w) as i32;
+        let height = cell_h.max(1) as i32;
+
+        let texture = alloc_color_target(renderer, self.fbo, width, height)?;
+
+        let white = self.atlas.borrow().white;
+        let mut instances = vec![Instance {
+            dst_pos: [0.0, 0.0],
+            dst_size: [width as f32, height as f32],
+            uv_pos: white.uv_pos,
+            uv_size: white.uv_size,
+            color: rgb_f32(bg),
+        }];
+        let bg_count = instances.len();
+
+        for (i, &c) in chars.iter().enumerate() {
+            if c == ' ' {
+                continue;
+            }
+            let entry = renderer
+                .with_context(|gl| {
+                    self.atlas
+                        .borrow_mut()
+                        .atlas_entry(gl, glyph_cache, c, false)
+                })
+                .map_err(|e| e.to_string())?;
+            let Some(entry) = entry else { continue };
+            let glyph_x = (i * cell_w) as i32 + entry.xmin;
+            let glyph_y = baseline as i32 - entry.height as i32 - entry.ymin;
+            instances.push(Instance {
+                dst_pos: [glyph_x as f32, glyph_y as f32],
+                dst_size: [entry.width as f32, entry.height as f32],
+                uv_pos: entry.uv_pos,
+                uv_size: entry.uv_size,
+                color: rgb_f32(fg),
+            });
+        }
+
+        let (instance_vbo, fbo) = (self.instance_vbo, self.fbo);
+        let atlas = self.atlas.borrow();
+        let (program, u_target_size, quad_vbo, atlas_tex) = (
+            atlas.program,
+            atlas.u_target_size,
+            atlas.quad_vbo,
+            atlas.atlas_tex,
+        );
+        drop(atlas);
+        renderer
+            .with_context(|gl| {
+                draw_instances(
+                    gl,
+                    program,
+                    u_target_size,
+                    quad_vbo,
+                    atlas_tex,
+                    instance_vbo,
+                    &mut self.instance_capacity,
+                    fbo,
+                    (width, height),
+                    &instances,
+                    bg_count,
+                )
+            })
+            .map_err(|e| e.to_string())?;
+
+        Ok(texture)
+    }
+}
+
+fn rgb_f32(rgb: Rgb) -> [f32; 3] {
     [
         rgb[0] as f32 / 255.0,
         rgb[1] as f32 / 255.0,

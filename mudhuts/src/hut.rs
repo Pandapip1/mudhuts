@@ -6,10 +6,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
+use smithay::desktop::Window;
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 
 use mudhuts_term::{GlyphCache, TermEvent, Terminal};
 
-use crate::gpu_term::GpuTermRenderer;
+use crate::gpu_term::{GpuTermRenderer, LabelRenderer};
 
 /// Initial grid size used before the real output size is known.
 const INITIAL_COLS: usize = 80;
@@ -37,6 +39,10 @@ pub struct Hut {
     /// actually available (Phase 1 spawns Huts before the winit backend
     /// exists).
     gpu: Option<GpuTermRenderer>,
+    /// Lazily created on first [`Hut::render_label`] call (Phase 4's
+    /// tab-strip chrome) — shares `gpu`'s glyph atlas rather than
+    /// rasterizing the same glyphs into a second one.
+    label_renderer: Option<LabelRenderer>,
     /// What `redraw` returned last time, reused when nothing changed
     /// (cheap: an `Arc` clone, not a re-render).
     last_texture: Option<GlesTexture>,
@@ -45,6 +51,21 @@ pub struct Hut {
     /// frames (matters for the compositor's outer damage tracking, which
     /// compares elements by id between frames).
     pub element_id: Id,
+
+    /// Client toplevels belonging to this Hut (see the plan's Phase 4
+    /// notes on PID-ancestry assignment), tab-ordered. At most one is
+    /// ever visible/mapped at a time — see `active_main_window` and
+    /// `State::sync_visible_main_window`.
+    main_windows: Vec<Window>,
+    /// Index into `main_windows` of the tab that's active — meaningless
+    /// while `main_windows` is empty.
+    active_main_window: usize,
+    /// Whether *this Hut's* terminal (vs. its active Main Window) is the
+    /// visible view when this Hut is focused. Per-Hut so switching Huts
+    /// (or Main Window tabs) doesn't disturb what each one was last
+    /// showing. Ignored (treated as `true`) while `main_windows` is
+    /// empty — see `State::showing_terminal_effective`.
+    pub showing_terminal: bool,
 }
 
 impl Hut {
@@ -85,9 +106,83 @@ impl Hut {
                 last_texture: None,
                 pixel_size,
                 element_id: Id::new(),
+                label_renderer: None,
+                main_windows: Vec::new(),
+                active_main_window: 0,
+                showing_terminal: true,
             },
             events,
         ))
+    }
+
+    pub fn shell_pid(&self) -> u32 {
+        self.terminal.shell_pid
+    }
+
+    /// The Main Window whose tab is currently active, if any.
+    pub fn active_window(&self) -> Option<&Window> {
+        self.main_windows.get(self.active_main_window)
+    }
+
+    /// Index into `main_windows()` of the active tab — meaningless while
+    /// `main_windows()` is empty.
+    pub fn active_main_window_index(&self) -> usize {
+        self.active_main_window
+    }
+
+    pub fn main_windows(&self) -> &[Window] {
+        &self.main_windows
+    }
+
+    pub fn main_window_count(&self) -> usize {
+        self.main_windows.len()
+    }
+
+    /// A new client toplevel was assigned to this Hut — appended as a new
+    /// tab and made the active one (matches the existing auto-switch
+    /// spirit from Phase 2.5, now per-Hut and per-tab rather than global).
+    pub fn push_main_window(&mut self, window: Window) {
+        self.main_windows.push(window);
+        self.active_main_window = self.main_windows.len() - 1;
+    }
+
+    /// A client toplevel belonging to this Hut was destroyed. Returns
+    /// whether it was actually found here (callers check every Hut).
+    /// Falls back to showing the terminal if that was the last tab.
+    pub fn remove_main_window(&mut self, surface: &WlSurface) -> bool {
+        let Some(idx) = self
+            .main_windows
+            .iter()
+            .position(|w| w.toplevel().is_some_and(|t| t.wl_surface() == surface))
+        else {
+            return false;
+        };
+        self.main_windows.remove(idx);
+        if idx < self.active_main_window {
+            self.active_main_window -= 1;
+        }
+        self.active_main_window = self
+            .active_main_window
+            .min(self.main_windows.len().saturating_sub(1));
+        if self.main_windows.is_empty() {
+            self.showing_terminal = true;
+        }
+        true
+    }
+
+    /// Meta+Right/Left within this Hut: cycle the active Main Window tab.
+    /// No-op with fewer than 2 — there's no Tab/Tile-Village to bubble up
+    /// to yet (Phase 6).
+    pub fn cycle_tab(&mut self, forward: bool) {
+        let len = self.main_windows.len();
+        if len < 2 {
+            return;
+        }
+        self.active_main_window = if forward {
+            (self.active_main_window + 1) % len
+        } else {
+            (self.active_main_window + len - 1) % len
+        };
     }
 
     /// Whether this Hut has ever received a keystroke since it was
@@ -192,5 +287,44 @@ impl Hut {
                 self.last_texture.clone()
             }
         }
+    }
+
+    /// Render `text` as a small standalone label texture (Phase 4's
+    /// tab-strip chrome — window titles, not the terminal grid), sharing
+    /// this Hut's own glyph atlas with its terminal renderer rather than
+    /// rasterizing the same glyphs into a second, separate one. Lazily
+    /// initializes both if needed.
+    pub fn render_label(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        text: &str,
+        fg: mudhuts_term::palette::Rgb,
+        bg: mudhuts_term::palette::Rgb,
+    ) -> Result<GlesTexture, String> {
+        if self.gpu.is_none() {
+            self.gpu = Some(GpuTermRenderer::new(renderer)?);
+        }
+        let Some(gpu) = self.gpu.as_ref() else {
+            return Err("terminal GPU renderer unavailable".to_string());
+        };
+        if self.label_renderer.is_none() {
+            self.label_renderer = Some(LabelRenderer::new(renderer, gpu.atlas())?);
+        }
+        let Some(label_renderer) = self.label_renderer.as_mut() else {
+            return Err("label renderer unavailable".to_string());
+        };
+        let cell_w = self.glyphs.cell_width();
+        let cell_h = self.glyphs.cell_height();
+        let baseline = self.glyphs.baseline();
+        label_renderer.render(
+            renderer,
+            &mut self.glyphs,
+            text,
+            cell_w,
+            cell_h,
+            baseline,
+            fg,
+            bg,
+        )
     }
 }

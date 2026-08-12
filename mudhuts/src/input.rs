@@ -136,21 +136,24 @@ impl State {
                 // via the un-forced `showing_terminal` field, not
                 // `showing_terminal_effective()`, since that would always
                 // report true here and this toggle would never do
-                // anything.
-                if self.space.elements().next().is_some() {
-                    self.showing_terminal = !self.showing_terminal;
+                // anything. Per-Hut now (Phase 4): toggling in one Hut
+                // doesn't disturb what any other Hut was last showing.
+                let hut = self.stack.focused_mut();
+                if hut.main_window_count() > 0 {
+                    hut.showing_terminal = !hut.showing_terminal;
+                    self.sync_visible_main_window();
                     // Keyboard focus has to follow the visible view:
                     // clients only get key events via `set_focus`, and the
                     // terminal only gets them via `showing_terminal`
                     // itself (see `process_input_event`), so the window
                     // needs *no* stale focus lingering while it's hidden,
                     // and *does* need focus the moment it's shown.
-                    let target = if self.showing_terminal {
+                    let target = if self.stack.focused().showing_terminal {
                         None
                     } else {
-                        self.space
-                            .elements()
-                            .last()
+                        self.stack
+                            .focused()
+                            .active_window()
                             .and_then(|w| w.toplevel())
                             .map(|t| t.wl_surface().clone())
                     };
@@ -166,18 +169,23 @@ impl State {
             Action::StackNext => {
                 // With no `stack-hold` configured, there's nothing to
                 // preview-and-commit-on-release with, so this commits
-                // immediately (Phase 3's original behavior). Otherwise it
-                // opens/advances a preview session instead — see
+                // immediately (Phase 3's original behavior) — synced right
+                // away. Otherwise it opens/advances a preview session
+                // instead (background/frozen until release — see
                 // `Keymap::stack_hold`'s doc and the keyboard-input
-                // closure below, which watches for that modifier's
-                // release to commit.
-                let result = if self.keymap.stack_hold().is_empty() {
+                // closure below, which watches for that modifier's release
+                // to commit and sync there instead).
+                let instant = self.keymap.stack_hold().is_empty();
+                let result = if instant {
                     self.stack.next()
                 } else {
                     self.stack.preview_next()
                 };
                 if let Err(err) = result {
                     tracing::error!("failed to advance the Hut stack: {err}");
+                }
+                if instant {
+                    self.sync_visible_main_window();
                 }
                 // The newly-focused (or newly-previewed) Hut gets resized
                 // to the real output size as part of the redraw this
@@ -188,18 +196,29 @@ impl State {
                 self.request_redraw();
             }
             Action::StackPrev => {
-                if self.keymap.stack_hold().is_empty() {
+                let instant = self.keymap.stack_hold().is_empty();
+                if instant {
                     self.stack.prev();
+                    self.sync_visible_main_window();
                 } else {
                     self.stack.preview_prev();
                 }
                 self.request_redraw();
             }
-            // Depend on later phases — see the plan (Main Window tab
-            // cycling: Phase 4; Village tiling/tabbing: Phase 6).
-            // Recognized and intercepted now so rebinding them already
-            // works even though they don't do anything yet.
-            Action::TabNext | Action::TabPrev | Action::WrapTab | Action::WrapTile => {
+            Action::TabNext => {
+                self.stack.focused_mut().cycle_tab(true);
+                self.sync_visible_main_window();
+                self.request_redraw();
+            }
+            Action::TabPrev => {
+                self.stack.focused_mut().cycle_tab(false);
+                self.sync_visible_main_window();
+                self.request_redraw();
+            }
+            // Depends on the Village management layer (Phase 6).
+            // Recognized and intercepted now so rebinding it already
+            // works even though it doesn't do anything yet.
+            Action::WrapTab | Action::WrapTile => {
                 tracing::debug!("{action:?} triggered (not implemented yet)");
             }
         }
@@ -232,6 +251,7 @@ impl State {
                             && !data.keymap.stack_hold().satisfied_by(mods)
                         {
                             data.stack.commit_preview();
+                            data.sync_visible_main_window();
                             data.request_redraw();
                         }
 
@@ -288,10 +308,12 @@ impl State {
                             && let Some(xbutton) = xterm_button(held)
                         {
                             let mods = self.current_mods();
-                            self.stack
-                                .focused()
-                                .terminal
-                                .report_mouse_drag(xbutton, mods, col + 1, row + 1);
+                            self.stack.focused().terminal.report_mouse_drag(
+                                xbutton,
+                                mods,
+                                col + 1,
+                                row + 1,
+                            );
                         }
                     } else if self.text_selecting {
                         self.stack

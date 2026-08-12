@@ -15,6 +15,7 @@ use smithay::reexports::calloop::ping::PingSource;
 use smithay::utils::Transform;
 
 use crate::State;
+use crate::chrome;
 use crate::render::OutputRenderElements;
 use crate::switcher;
 
@@ -102,24 +103,6 @@ pub fn init_winit(
 
                     let show_terminal = state.showing_terminal_effective();
 
-                    // Interim placeholder for the real Main Window layout
-                    // (Phase 4): a client window doesn't share the screen
-                    // with the terminal, it replaces it entirely — shown
-                    // centered at its own size over a blacked-out
-                    // background, not stretched/anchored at the origin.
-                    if !show_terminal {
-                        let scale = output.current_scale().fractional_scale();
-                        let output_size: smithay::utils::Size<i32, smithay::utils::Logical> =
-                            size.to_f64().to_logical(scale).to_i32_round();
-                        let windows: Vec<_> = state.space.elements().cloned().collect();
-                        for window in windows {
-                            let win_size = window.geometry().size;
-                            let x = ((output_size.w - win_size.w) / 2).max(0);
-                            let y = ((output_size.h - win_size.h) / 2).max(0);
-                            state.space.map_element(window, (x, y), false);
-                        }
-                    }
-
                     // Scoped so the mutable borrow of `backend` from `bind()`
                     // ends before we need `backend` again below (`submit`,
                     // `window()`) — `render_result` itself borrows only from
@@ -159,6 +142,12 @@ pub fn init_winit(
                                 (size.w, size.h),
                                 renderer,
                             ));
+
+                            // Tab-strip chrome (Phase 4) — on top of the
+                            // terminal/window content but still below the
+                            // Alt-Tab popup above. Empty when the focused
+                            // Hut has no Main Windows.
+                            elements.extend(chrome::build(state.stack.focused_mut(), renderer));
 
                             // No compositor-drawn cursor here: under the
                             // winit backend, the host compositor already

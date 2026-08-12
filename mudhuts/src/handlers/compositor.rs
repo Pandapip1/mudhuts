@@ -38,16 +38,16 @@ impl CompositorHandler for State {
             while let Some(parent) = get_parent(&root) {
                 root = parent;
             }
-            if let Some(window) = self
-                .space
-                .elements()
-                .find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == &root))
-            {
+            // Looked up across every Hut, not just `self.space` — a
+            // background Hut's window still needs its commit bookkeeping
+            // even while it isn't the visible one.
+            if let Some(window) = self.find_window_by_surface(&root) {
                 window.on_commit();
             }
         }
 
-        xdg_shell::handle_commit(&mut self.popups, &self.space, surface);
+        let window = self.find_window_by_surface(surface);
+        xdg_shell::handle_commit(&mut self.popups, window, surface);
     }
 }
 

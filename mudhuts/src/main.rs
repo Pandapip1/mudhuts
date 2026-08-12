@@ -1,8 +1,10 @@
+mod chrome;
 mod gpu_term;
 mod handlers;
 mod hut;
 mod input;
 mod keybindings;
+mod ownership;
 mod render;
 mod stack;
 mod state;
