@@ -77,6 +77,26 @@ impl Hut {
         self.buffer.render().resize((width.max(0), height.max(0)));
     }
 
+    /// Convert a pixel position (relative to the Hut's own buffer, i.e.
+    /// output-space when the terminal is the visible view) into a 0-based
+    /// `(column, row)` grid cell, clamped to the current grid size, plus
+    /// which half of that cell the position falls in (`true` = left half)
+    /// — matters for selection boundary precision when starting/extending
+    /// a drag from partway into a cell. Note this is 0-based (matching
+    /// `alacritty_terminal`'s own grid coordinates, used for selection),
+    /// *not* the 1-based coordinates SGR mouse-reporting escape sequences
+    /// use — callers doing mouse reporting need to add 1.
+    pub fn pixel_to_cell(&self, x: f64, y: f64) -> (usize, usize, bool) {
+        let cell_w = self.glyphs.cell_width().max(1);
+        let cell_h = self.glyphs.cell_height().max(1);
+        let px_x = x.max(0.0) as usize;
+        let px_y = y.max(0.0) as usize;
+        let col = (px_x / cell_w).min(self.terminal.cols().saturating_sub(1));
+        let row = (px_y / cell_h).min(self.terminal.lines().saturating_sub(1));
+        let left_half = (px_x % cell_w) < cell_w / 2;
+        (col, row, left_half)
+    }
+
     /// Re-rasterize the terminal grid into the backing buffer.
     pub fn redraw(&mut self) {
         let (width, height) = self.pixel_size;

@@ -276,7 +276,9 @@ pub fn render(
     let baseline = glyphs.baseline;
     let colors: &Colors = content.colors;
     let cursor_point = content.cursor.point;
-    let cursor_visible = !matches!(content.cursor.shape, CursorShape::Hidden);
+    let cursor_shape = content.cursor.shape;
+    let cursor_visible = !matches!(cursor_shape, CursorShape::Hidden);
+    let selection = content.selection;
 
     for indexed in content.display_iter {
         let line = indexed.point.line.0;
@@ -296,10 +298,12 @@ pub fn render(
         let cell = indexed.cell;
 
         let is_cursor_cell = cursor_visible && indexed.point == cursor_point;
+        let is_selected =
+            selection.is_some_and(|sel| sel.contains_cell(&indexed, cursor_point, cursor_shape));
 
         let mut fg = palette::resolve_fg(cell.fg, cell.flags, colors);
         let mut bg = palette::resolve_bg(cell.bg, colors);
-        if cell.flags.contains(Flags::INVERSE) || is_cursor_cell {
+        if cell.flags.contains(Flags::INVERSE) || is_selected || is_cursor_cell {
             std::mem::swap(&mut fg, &mut bg);
         }
 

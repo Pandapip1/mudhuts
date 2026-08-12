@@ -57,6 +57,23 @@ fn mods_from(m: &ModifiersState) -> Mods {
     }
 }
 
+// Standard Linux evdev button codes (linux/input-event-codes.h), what
+// `PointerButtonEvent::button_code()` reports.
+const BTN_LEFT: u32 = 0x110;
+const BTN_RIGHT: u32 = 0x111;
+const BTN_MIDDLE: u32 = 0x112;
+
+/// Map an evdev button code to the xterm mouse-reporting button number, or
+/// `None` for buttons that don't have one (reporting is just skipped then).
+fn xterm_button(code: u32) -> Option<u32> {
+    match code {
+        BTN_LEFT => Some(mudhuts_term::mouse::BUTTON_LEFT),
+        BTN_MIDDLE => Some(mudhuts_term::mouse::BUTTON_MIDDLE),
+        BTN_RIGHT => Some(mudhuts_term::mouse::BUTTON_RIGHT),
+        _ => None,
+    }
+}
+
 /// Resolve a key press into terminal input bytes, using the live xkb state
 /// for UTF-8 text (never the stateless `keysym_to_utf8`, which can panic on
 /// pathological input — see `xkbcommon::xkb::State::key_get_utf8`).
@@ -83,6 +100,18 @@ fn encode(
 }
 
 impl State {
+    /// Current keyboard modifier state, for pointer-driven actions (mouse
+    /// reporting, wheel reporting) that don't get it for free the way
+    /// keyboard events do.
+    fn current_mods(&self) -> Mods {
+        let raw = self
+            .seat
+            .get_keyboard()
+            .map(|kb| kb.modifier_state())
+            .unwrap_or_default();
+        mods_from(&raw)
+    }
+
     fn handle_action(&mut self, action: Action) {
         match action {
             Action::CloseFocused => {
@@ -110,6 +139,28 @@ impl State {
                 // anything.
                 if self.space.elements().next().is_some() {
                     self.showing_terminal = !self.showing_terminal;
+                    // Keyboard focus has to follow the visible view:
+                    // clients only get key events via `set_focus`, and the
+                    // terminal only gets them via `showing_terminal`
+                    // itself (see `process_input_event`), so the window
+                    // needs *no* stale focus lingering while it's hidden,
+                    // and *does* need focus the moment it's shown.
+                    let target = if self.showing_terminal {
+                        None
+                    } else {
+                        self.space
+                            .elements()
+                            .last()
+                            .and_then(|w| w.toplevel())
+                            .map(|t| t.wl_surface().clone())
+                    };
+                    if let Some(keyboard) = self.seat.get_keyboard() {
+                        keyboard.set_focus(
+                            self,
+                            target,
+                            smithay::utils::SERIAL_COUNTER.next_serial(),
+                        );
+                    }
                 }
             }
             // Depend on later phases — see the plan (multi-Hut Stack:
@@ -189,6 +240,24 @@ impl State {
 
                 let pos = event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
                 let serial = SERIAL_COUNTER.next_serial();
+
+                if self.showing_terminal_effective() {
+                    let (col, row, left_half) = self.hut.pixel_to_cell(pos.x, pos.y);
+                    if let Some(held) = self.mouse_report_button_held {
+                        if self.hut.terminal.wants_drag_reports()
+                            && let Some(xbutton) = xterm_button(held)
+                        {
+                            let mods = self.current_mods();
+                            self.hut
+                                .terminal
+                                .report_mouse_drag(xbutton, mods, col + 1, row + 1);
+                        }
+                    } else if self.text_selecting {
+                        self.hut.terminal.extend_selection(col, row, left_half);
+                        self.text_selection_dragged = true;
+                    }
+                }
+
                 let Some(pointer) = self.seat.get_pointer() else {
                     return;
                 };
@@ -212,8 +281,37 @@ impl State {
                 let serial = SERIAL_COUNTER.next_serial();
                 let button = event.button_code();
                 let button_state = event.state();
+                let pressed = button_state == ButtonState::Pressed;
 
-                if ButtonState::Pressed == button_state && !pointer.is_grabbed() {
+                if self.showing_terminal_effective() {
+                    let pos = pointer.current_location();
+                    let (col, row, left_half) = self.hut.pixel_to_cell(pos.x, pos.y);
+                    let mods = self.current_mods();
+
+                    if self.hut.terminal.wants_mouse_reports() {
+                        if let Some(xbutton) = xterm_button(button) {
+                            self.hut.terminal.report_mouse_button(
+                                xbutton,
+                                mods,
+                                pressed,
+                                col + 1,
+                                row + 1,
+                            );
+                        }
+                        self.mouse_report_button_held = pressed.then_some(button);
+                    } else if button == BTN_LEFT {
+                        if pressed {
+                            self.hut.terminal.start_selection(col, row, left_half);
+                            self.text_selecting = true;
+                            self.text_selection_dragged = false;
+                        } else if self.text_selecting {
+                            self.text_selecting = false;
+                            if !self.text_selection_dragged {
+                                self.hut.terminal.clear_selection();
+                            }
+                        }
+                    }
+                } else if pressed && !pointer.is_grabbed() {
                     if let Some((window, _loc)) = self
                         .space
                         .element_under(pointer.current_location())
@@ -225,21 +323,16 @@ impl State {
                         {
                             keyboard.set_focus(self, Some(toplevel.wl_surface().clone()), serial);
                         }
-                        for w in self.space.elements() {
-                            if let Some(toplevel) = w.toplevel() {
-                                toplevel.send_pending_configure();
-                            }
-                        }
-                    } else {
-                        for w in self.space.elements() {
-                            w.set_activated(false);
-                            if let Some(toplevel) = w.toplevel() {
-                                toplevel.send_pending_configure();
-                            }
-                        }
-                        if let Some(keyboard) = self.seat.get_keyboard() {
-                            keyboard.set_focus(self, Option::<WlSurface>::None, serial);
-                        }
+                        // No `send_pending_configure()` sweep here: until
+                        // the floating Sub-Window/Alert system (Phase 5)
+                        // adds real per-window focus, every window is
+                        // permanently hinted `Activated` (set once in
+                        // `new_toplevel`) and nothing else in this handler
+                        // changes a window's pending state — resending
+                        // configures on every click would just be
+                        // unnecessary client-side redraws.
+                    } else if let Some(keyboard) = self.seat.get_keyboard() {
+                        keyboard.set_focus(self, Option::<WlSurface>::None, serial);
                     }
                 }
 
@@ -288,6 +381,28 @@ impl State {
                     if event.amount(Axis::Vertical) == Some(0.0) {
                         frame = frame.stop(Axis::Vertical);
                     }
+                }
+
+                if self.showing_terminal_effective()
+                    && vertical_amount != 0.0
+                    && let Some(pointer) = self.seat.get_pointer()
+                    && self.hut.terminal.wants_mouse_reports()
+                {
+                    let pos = pointer.current_location();
+                    let (col, row, _) = self.hut.pixel_to_cell(pos.x, pos.y);
+                    let mods = self.current_mods();
+                    let wheel_button = if vertical_amount > 0.0 {
+                        mudhuts_term::mouse::BUTTON_WHEEL_DOWN
+                    } else {
+                        mudhuts_term::mouse::BUTTON_WHEEL_UP
+                    };
+                    self.hut.terminal.report_mouse_button(
+                        wheel_button,
+                        mods,
+                        true,
+                        col + 1,
+                        row + 1,
+                    );
                 }
 
                 let Some(pointer) = self.seat.get_pointer() else {

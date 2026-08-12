@@ -1,7 +1,6 @@
 use std::ffi::OsString;
 use std::sync::Arc;
 
-use smithay::backend::renderer::element::solid::SolidColorBuffer;
 use smithay::desktop::{PopupManager, Space, Window};
 use smithay::input::{Seat, SeatState};
 use smithay::reexports::calloop::generic::Generic;
@@ -63,9 +62,17 @@ pub struct State {
     /// windows to toggle to.
     pub showing_terminal: bool,
 
-    /// A visible mouse pointer. Smithay tracks pointer position/focus for
-    /// input purposes regardless, but nothing renders it unless we do.
-    pub cursor_buffer: SolidColorBuffer,
+    /// Set while dragging out a text selection in the terminal (left
+    /// button held, no mouse reporting active).
+    pub text_selecting: bool,
+    /// Whether the drag in `text_selecting` has actually moved to a
+    /// different cell yet — a plain click with no drag should clear any
+    /// selection rather than leave a persistent single-cell one.
+    pub text_selection_dragged: bool,
+    /// The raw button code currently held for SGR mouse-reporting drag
+    /// purposes (mutually exclusive with `text_selecting` — reporting mode
+    /// and our own selection are never both active at once).
+    pub mouse_report_button_held: Option<u32>,
 }
 
 impl State {
@@ -117,7 +124,9 @@ impl State {
             hut,
             keymap: Keymap::load(),
             showing_terminal: true,
-            cursor_buffer: SolidColorBuffer::new((10, 10), [1.0, 1.0, 1.0, 1.0]),
+            text_selecting: false,
+            text_selection_dragged: false,
+            mouse_report_button_held: None,
         })
     }
 

@@ -7,6 +7,7 @@
 //! woken up (via a `calloop` channel) whenever there's new content.
 
 pub mod keys;
+pub mod mouse;
 pub mod palette;
 pub mod render;
 
@@ -21,6 +22,8 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::tty;
+
+use keys::Mods;
 
 pub use render::GlyphCache;
 
@@ -165,6 +168,64 @@ impl Terminal {
         *self.term.lock().mode()
     }
 
+    /// Whether the running program has requested any form of SGR mouse
+    /// reporting (click, drag, or full motion).
+    pub fn wants_mouse_reports(&self) -> bool {
+        mouse::wants_reports(self.mode())
+    }
+
+    /// Whether motion should be reported while a button is held.
+    pub fn wants_drag_reports(&self) -> bool {
+        mouse::wants_drag_reports(self.mode())
+    }
+
+    /// Report a mouse button press/release at the given 1-based cell
+    /// coordinates, if the running program requested mouse reporting.
+    pub fn report_mouse_button(
+        &self,
+        button: u32,
+        mods: Mods,
+        pressed: bool,
+        col: usize,
+        row: usize,
+    ) {
+        self.write_input(mouse::encode_button(button, mods, pressed, col, row));
+    }
+
+    /// Report motion while `button` is held.
+    pub fn report_mouse_drag(&self, button: u32, mods: Mods, col: usize, row: usize) {
+        self.write_input(mouse::encode_drag(button, mods, col, row));
+    }
+
+    /// Start a new text selection anchored at the given 1-based cell
+    /// coordinates (see [`mouse::start_selection`] for `left_half`).
+    pub fn start_selection(&self, col: usize, row: usize, left_half: bool) {
+        self.term.lock().selection = Some(mouse::start_selection(col, row, left_half));
+    }
+
+    /// Extend the in-progress selection, if any, to the given coordinates.
+    pub fn extend_selection(&self, col: usize, row: usize, left_half: bool) {
+        let mut term = self.term.lock();
+        if let Some(selection) = term.selection.as_mut() {
+            mouse::extend_selection(selection, col, row, left_half);
+        }
+    }
+
+    pub fn clear_selection(&self) {
+        self.term.lock().selection = None;
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.term.lock().selection.is_some()
+    }
+
+    /// The currently selected text, if any. Not yet wired to the Wayland
+    /// clipboard (mudhuts has no primary-selection source implementation
+    /// yet) — for now this just backs the visual highlight.
+    pub fn selection_text(&self) -> Option<String> {
+        self.term.lock().selection_to_string()
+    }
+
     /// Rasterize the current grid into `buf` (RGBA8, `width * height * 4`
     /// bytes) using `glyphs`, touching only what changed since the last
     /// call. Returns the redrawn pixel rectangles for damage tracking.
@@ -176,6 +237,11 @@ impl Terminal {
         height: usize,
     ) -> Vec<render::PixelRect> {
         let mut term = self.term.lock();
+        // Selection changes (e.g. dragging to extend it) aren't reflected
+        // in `Term`'s own damage tracking at all — that only tracks cell
+        // *content* changes — so without this, drag-selecting wouldn't
+        // visibly update most frames.
+        let has_selection = term.selection.is_some();
         let damage = match term.damage() {
             alacritty_terminal::term::TermDamage::Full => render::Damage::Full,
             alacritty_terminal::term::TermDamage::Partial(lines) => render::Damage::Lines(
@@ -189,6 +255,11 @@ impl Terminal {
             ),
         };
         term.reset_damage();
+        let damage = if has_selection {
+            render::Damage::Full
+        } else {
+            damage
+        };
         render::render(
             term.renderable_content(),
             glyphs,

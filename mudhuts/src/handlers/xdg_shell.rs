@@ -18,10 +18,52 @@ impl XdgShellHandler for State {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
+        // Every mudhuts window is fullscreen — hint that on the initial
+        // configure so clients that respect it (most toolkits) draw at the
+        // output's size from the start, rather than some arbitrary default
+        // the compositor would otherwise have to center/letterbox.
+        //
+        // Also permanently hint `Activated` (focused). There's no real
+        // per-window focus tracking yet — that needs the floating
+        // Sub-Window/Alert system (Phase 5) — and since only ever one
+        // thing is shown at a time in the meantime, toggling this off and
+        // on would just cost clients unnecessary redraws for a distinction
+        // that isn't meaningful yet. Never touched again after this.
+        surface.with_pending_state(|state| {
+            state.states.set(xdg_toplevel::State::Activated);
+        });
+        if let Some(output) = self.space.outputs().next()
+            && let Some(geo) = self.space.output_geometry(output)
+        {
+            surface.with_pending_state(|state| {
+                state.states.set(xdg_toplevel::State::Fullscreen);
+                state.size = Some(geo.size);
+            });
+        }
+
         // Phase 1: no Main Window / role organization yet (Phase 4+); just
         // composite it on top of the terminal.
+        let was_empty = self.space.elements().next().is_none();
         let window = Window::new_wayland_window(surface);
+        let wl_surface = window.toplevel().map(|t| t.wl_surface().clone());
         self.space.map_element(window, (0, 0), false);
+        if was_empty {
+            // Nothing else to show yet, so a newly launched window should
+            // become visible immediately rather than staying hidden behind
+            // the terminal until the user manually hits Ctrl+`.
+            self.showing_terminal = false;
+        }
+        // A new window should be able to receive keyboard input as soon as
+        // it's visible, not only after the user clicks it — matters
+        // especially for the was_empty case above, where there was never
+        // an existing window to click away from focus in the first place.
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            keyboard.set_focus(
+                self,
+                wl_surface,
+                smithay::utils::SERIAL_COUNTER.next_serial(),
+            );
+        }
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {

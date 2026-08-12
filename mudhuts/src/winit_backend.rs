@@ -1,7 +1,6 @@
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement;
-use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::winit::{self, WinitEvent};
@@ -100,20 +99,13 @@ pub fn init_winit(
                                 >,
                             > = Vec::new();
 
-                            if let Some(pointer) = state.seat.get_pointer() {
-                                let scale = output.current_scale().fractional_scale();
-                                let loc =
-                                    pointer.current_location().to_physical(scale).to_i32_round();
-                                elements.push(OutputRenderElements::from(
-                                    SolidColorRenderElement::from_buffer(
-                                        &state.cursor_buffer,
-                                        loc,
-                                        1.0,
-                                        1.0,
-                                        Kind::Cursor,
-                                    ),
-                                ));
-                            }
+                            // No compositor-drawn cursor here: under the
+                            // winit backend, the host compositor already
+                            // draws a normal cursor for this (nested)
+                            // window. A real cursor (xcursor theme lookup,
+                            // ideally with KDE's SVG cursor support) is
+                            // Phase 7's problem, once mudhuts is the one
+                            // actually owning the seat.
 
                             if show_terminal {
                                 match MemoryRenderBufferRenderElement::from_buffer(
