@@ -70,6 +70,10 @@ pub struct State {
     /// and our own selection are never both active at once).
     pub mouse_report_button_held: Option<u32>,
 
+    /// Set while dragging a docked Sub-Window's handle out to float —
+    /// see `docks.rs`.
+    pub dock_drag: Option<crate::docks::DockDrag>,
+
     /// Wakes up the winit backend's redraw handler (see `winit_backend.rs`,
     /// the only place that owns the actual window handle needed to call
     /// its `request_redraw()`) from anywhere else that changes something
@@ -103,6 +107,10 @@ impl State {
         let popups = PopupManager::default();
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
         let data_device_state = DataDeviceState::new::<Self>(&dh);
+        dh.create_global::<Self, mudhuts_protocols::server::mudhuts_shell_v1::MudhutsShellV1, _>(
+            1,
+            smithay::wayland::GlobalData,
+        );
 
         let mut seat_state = SeatState::new();
         let mut seat: Seat<Self> = seat_state.new_wl_seat(&dh, "mudhuts");
@@ -134,6 +142,7 @@ impl State {
             text_selecting: false,
             text_selection_dragged: false,
             mouse_report_button_held: None,
+            dock_drag: None,
             redraw_ping,
         })
     }
@@ -211,10 +220,13 @@ impl State {
     }
 
     /// Make `self.space` match what the focused Hut should currently be
-    /// showing: unmap whatever's mapped (harmless if nothing was), then
-    /// map the focused Hut's active Main Window if it isn't showing its
-    /// terminal. Call after anything that could change which Hut/tab is
-    /// focused or which view a Hut is showing (Alt-Tab commit,
+    /// showing: unmap whatever's mapped (harmless if nothing was), then map
+    /// the focused Hut's active Main Window (if it isn't showing its
+    /// terminal) plus every currently-floating Sub-Window and every Alert
+    /// belonging to that Main Window — docked Sub-Windows stay unmapped
+    /// (`docks.rs` draws a handle instead), Alerts are mapped last so they
+    /// end up on top. Call after anything that could change which Hut/tab
+    /// is focused or which view a Hut is showing (Alt-Tab commit,
     /// `ToggleTerminal`, `TabNext`/`TabPrev`, a new toplevel auto-switching
     /// in, a toplevel closing).
     pub fn sync_visible_main_window(&mut self) {
@@ -223,22 +235,44 @@ impl State {
             self.space.unmap_elem(&window);
         }
         let hut = self.stack.focused();
-        if !hut.showing_terminal
-            && let Some(window) = hut.active_window()
-        {
-            self.space.map_element(window.clone(), (0, 0), false);
+        if hut.showing_terminal {
+            return;
+        }
+        let Some(entry) = hut.active_main_window_entry() else {
+            return;
+        };
+        self.space.map_element(entry.window.clone(), (0, 0), false);
+        for sub in &entry.sub_windows {
+            if let crate::main_window::Dock::Floating(pos) = sub.dock {
+                self.space.map_element(sub.window.clone(), pos, false);
+            }
+        }
+        for alert in &entry.alerts {
+            self.space
+                .map_element(alert.window.clone(), alert.position, false);
         }
     }
 
-    /// Find a Main Window by its surface across *every* Hut, not just
-    /// whatever's currently visible in `self.space` — a background Hut's
-    /// windows still need commit/configure handling while hidden.
+    /// Find a window (Main Window, Sub-Window, or Alert) by its surface
+    /// across *every* Hut, not just whatever's currently visible in
+    /// `self.space` — a background Hut's windows still need commit/
+    /// configure handling while hidden, and so do docked Sub-Windows that
+    /// aren't mapped at all.
     pub fn find_window_by_surface(&self, surface: &WlSurface) -> Option<Window> {
         self.stack.huts().find_map(|h| {
-            h.main_windows()
-                .iter()
-                .find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == surface))
-                .cloned()
+            h.main_windows().iter().find_map(|entry| {
+                if entry.matches(surface) {
+                    return Some(entry.window.clone());
+                }
+                if let Some(sub) = entry.sub_windows.iter().find(|s| s.matches(surface)) {
+                    return Some(sub.window.clone());
+                }
+                entry
+                    .alerts
+                    .iter()
+                    .find(|a| a.matches(surface))
+                    .map(|a| a.window.clone())
+            })
         })
     }
 

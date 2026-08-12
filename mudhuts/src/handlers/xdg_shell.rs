@@ -1,6 +1,8 @@
 use smithay::desktop::{
     PopupKind, PopupManager, Window, find_popup_root_surface, get_popup_toplevel_coords,
 };
+use smithay::input::Seat;
+use smithay::input::pointer::{Focus, GrabStartData as PointerGrabStartData};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::{wl_seat, wl_surface::WlSurface};
@@ -12,6 +14,7 @@ use smithay::wayland::shell::xdg::{
 };
 
 use crate::State;
+use crate::grabs::MoveSurfaceGrab;
 use crate::ownership;
 
 impl XdgShellHandler for State {
@@ -102,7 +105,7 @@ impl XdgShellHandler for State {
             .active_window()
             .is_some_and(|w| w.toplevel().is_some_and(|t| t.wl_surface() == wl_surface));
         for hut in self.stack.huts_mut() {
-            if hut.remove_main_window(wl_surface) {
+            if hut.remove_window(wl_surface) {
                 break;
             }
         }
@@ -132,8 +135,46 @@ impl XdgShellHandler for State {
         surface.send_repositioned(token);
     }
 
-    fn move_request(&mut self, _surface: ToplevelSurface, _seat: wl_seat::WlSeat, _serial: Serial) {
-        // mudhuts windows are always fullscreen; there's nothing to drag.
+    /// Real interactive move, for floating Sub-Windows/Alerts only — bare
+    /// Main Windows are always fullscreen, so there's nothing to drag for
+    /// those (matches the plan's Phase 5 notes: mudhuts assumes CSD, so
+    /// this is what a client's own title bar actually calls).
+    fn move_request(&mut self, surface: ToplevelSurface, seat: wl_seat::WlSeat, serial: Serial) {
+        let wl_surface = surface.wl_surface().clone();
+
+        let Some(seat) = Seat::from_resource(&seat) else {
+            return;
+        };
+        let Some(start_data) = check_grab(&seat, &wl_surface, serial) else {
+            return;
+        };
+        let Some(pointer) = seat.get_pointer() else {
+            return;
+        };
+
+        let hut = self.stack.focused_mut();
+        let is_sub_window = hut.sub_window_mut(&wl_surface).is_some();
+        let is_alert = !is_sub_window && hut.alert_mut(&wl_surface).is_some();
+        if !is_sub_window && !is_alert {
+            return;
+        }
+
+        let Some(window) = self.find_window_by_surface(&wl_surface) else {
+            return;
+        };
+        let Some(initial_window_location) = self.space.element_location(&window) else {
+            return;
+        };
+
+        let grab = MoveSurfaceGrab {
+            start_data,
+            window,
+            initial_window_location,
+            surface: wl_surface,
+            sub_window: is_sub_window,
+        };
+
+        pointer.set_grab(self, grab, serial, Focus::Clear);
     }
 
     fn resize_request(
@@ -185,11 +226,13 @@ pub fn handle_commit(popups: &mut PopupManager, window: Option<Window>, surface:
 /// `WinitEvent::Resized`) — `new_toplevel`'s fullscreen size hint above is
 /// only ever sent once, at creation, so already-mapped Main Windows need
 /// an explicit fresh configure to actually resize; xdg_shell doesn't
-/// propagate a compositor-driven size change on its own.
+/// propagate a compositor-driven size change on its own. Only bare Main
+/// Windows are fullscreen — Sub-Windows/Alerts float at whatever size
+/// their own CSD/content wants, so they're left alone here.
 pub(crate) fn resize_all_main_windows(stack: &crate::stack::HutStack, size: Size<i32, Logical>) {
     for hut in stack.huts() {
-        for window in hut.main_windows() {
-            let Some(toplevel) = window.toplevel() else {
+        for entry in hut.main_windows() {
+            let Some(toplevel) = entry.window.toplevel() else {
                 continue;
             };
             toplevel.with_pending_state(|state| {
@@ -198,6 +241,32 @@ pub(crate) fn resize_all_main_windows(stack: &crate::stack::HutStack, size: Size
             toplevel.send_configure();
         }
     }
+}
+
+/// Confirm `seat`'s pointer actually has an active click grab on `surface`
+/// for `serial` before letting a `move_request` start a real drag —
+/// mirrors `.smithay-ref/smallvil`'s reference `check_grab` (ported
+/// panic-free per the project's no-panics rule: the reference uses
+/// `.unwrap()` throughout, replaced here with `?`/early-return).
+fn check_grab(
+    seat: &Seat<State>,
+    surface: &WlSurface,
+    serial: Serial,
+) -> Option<PointerGrabStartData<State>> {
+    let pointer = seat.get_pointer()?;
+
+    if !pointer.has_grab(serial) {
+        return None;
+    }
+
+    let start_data = pointer.grab_start_data()?;
+
+    let (focus, _) = start_data.focus.as_ref()?;
+    if !focus.id().same_client_as(&surface.id()) {
+        return None;
+    }
+
+    Some(start_data)
 }
 
 impl State {

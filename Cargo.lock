@@ -752,6 +752,13 @@ dependencies = [
 [[package]]
 name = "mudhuts-protocols"
 version = "0.1.0"
+dependencies = [
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-scanner",
+ "wayland-server",
+]
 
 [[package]]
 name = "mudhuts-term"
@@ -762,6 +769,15 @@ dependencies = [
  "fontconfig",
  "fontdue",
  "tracing",
+]
+
+[[package]]
+name = "mudhuts-test-client"
+version = "0.1.0"
+dependencies = [
+ "mudhuts-protocols",
+ "wayland-client",
+ "wayland-protocols",
 ]
 
 [[package]]

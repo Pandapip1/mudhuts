@@ -1,9 +1,12 @@
 mod chrome;
+mod docks;
 mod gpu_term;
+mod grabs;
 mod handlers;
 mod hut;
 mod input;
 mod keybindings;
+mod main_window;
 mod ownership;
 mod render;
 mod stack;

@@ -39,7 +39,7 @@ type Element = OutputRenderElements<GlesRenderer, WaylandSurfaceRenderElement<Gl
 /// to its app_id, then a placeholder — the same `with_states`/
 /// `XdgToplevelSurfaceData` mechanism `handlers/xdg_shell.rs`'s
 /// `handle_commit` already relies on for `initial_configure_sent`.
-fn window_title(window: &Window) -> String {
+pub(crate) fn window_title(window: &Window) -> String {
     let Some(toplevel) = window.toplevel() else {
         return "(window)".to_string();
     };
@@ -66,7 +66,7 @@ fn window_title(window: &Window) -> String {
     }
 }
 
-fn to_color32f(rgb: Rgb) -> [f32; 4] {
+pub(crate) fn to_color32f(rgb: Rgb) -> [f32; 4] {
     [
         rgb[0] as f32 / 255.0,
         rgb[1] as f32 / 255.0,
@@ -89,7 +89,7 @@ pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer) -> Vec<Element> {
     };
 
     let mut labels = vec!["Terminal".to_string()];
-    labels.extend(hut.main_windows().iter().map(window_title));
+    labels.extend(hut.main_windows().iter().map(|entry| window_title(&entry.window)));
 
     let cell_w = hut.glyphs.cell_width().max(1);
     let cell_h = hut.glyphs.cell_height().max(1) as i32;

@@ -5,7 +5,7 @@ version.workspace = true
 
 [dependencies]
 mudhuts-term = { path = "../mudhuts-term" }
-mudhuts-protocols = { path = "../mudhuts-protocols" }
+mudhuts-protocols = { path = "../mudhuts-protocols", features = ["server"] }
 alacritty_terminal = "0.26"
 serde = { version = "1", features = ["derive"] }
 toml = "1"

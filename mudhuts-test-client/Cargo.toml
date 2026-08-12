@@ -1,0 +1,9 @@
+[package]
+name = "mudhuts-test-client"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+mudhuts-protocols = { path = "../mudhuts-protocols", features = ["client"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }

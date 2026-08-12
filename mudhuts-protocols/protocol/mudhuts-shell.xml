@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="mudhuts_shell">
+  <copyright>
+    This protocol is part of mudhuts, a from-scratch Wayland compositor.
+    It is not shared with or endorsed by any other project.
+  </copyright>
+
+  <interface name="mudhuts_shell_v1" version="1">
+    <description summary="assign a window's role within mudhuts' Hut model">
+      Lets a client declare how one of its own xdg_toplevels should be
+      organized within mudhuts: as an ordinary Main Window (the default,
+      needing no request at all), a Sub-Window docked to a screen edge until
+      dragged out, or an always-on-top Alert. See mudhuts_window_role_v1.
+    </description>
+
+    <request name="get_window_role">
+      <description summary="create a role object for one of this client's own toplevels">
+        toplevel must belong to the client making this request. Creating a
+        second role object for the same toplevel is a protocol error.
+      </description>
+      <arg name="id" type="new_id" interface="mudhuts_window_role_v1"/>
+      <arg name="toplevel" type="object" interface="xdg_toplevel"/>
+    </request>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy this mudhuts_shell_v1 object">
+        Does not affect any mudhuts_window_role_v1 objects already created.
+      </description>
+    </request>
+  </interface>
+
+  <interface name="mudhuts_window_role_v1" version="1">
+    <description summary="the role of one Main-Window-owning toplevel">
+      Every toplevel starts out as a plain Main Window (equivalent to
+      set_main) until one of these requests changes that.
+    </description>
+
+    <request name="set_main">
+      <description summary="declare this toplevel an ordinary Main Window">
+        The default; only useful to explicitly move a toplevel back out of
+        the Sub-Window/Alert role it was previously given.
+      </description>
+    </request>
+
+    <request name="set_sub">
+      <description summary="declare this toplevel a Sub-Window of main">
+        main must be an existing Main Window in the same Hut as this
+        toplevel. Starts docked to whichever screen edge it's nearest,
+        minimized to a small handle until the user drags it out.
+      </description>
+      <arg name="main" type="object" interface="xdg_toplevel"/>
+    </request>
+
+    <request name="set_alert">
+      <description summary="declare this toplevel an Alert of main">
+        main must be an existing Main Window in the same Hut as this
+        toplevel. Alerts always float on top of main's content and can't be
+        docked/minimized.
+      </description>
+      <arg name="main" type="object" interface="xdg_toplevel"/>
+    </request>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy this role object">
+        Does not change the toplevel's current role — it stays whatever it
+        was last set to.
+      </description>
+    </request>
+  </interface>
+</protocol>

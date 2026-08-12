@@ -3,4 +3,16 @@ name = "mudhuts-protocols"
 edition.workspace = true
 version.workspace = true
 
+[features]
+# mudhuts itself only ever needs `server`; `client` exists for the Phase 5
+# test client (mudhuts-protocols-test-client), which has no other way to
+# speak mudhuts_shell_v1 since no existing app does.
+server = ["dep:wayland-server", "wayland-protocols/server"]
+client = ["dep:wayland-client", "wayland-protocols/client"]
+
 [dependencies]
+wayland-backend = "0.3"
+wayland-scanner = "0.31"
+wayland-protocols = "0.32"
+wayland-server = { version = "0.31", optional = true }
+wayland-client = { version = "0.31", optional = true }

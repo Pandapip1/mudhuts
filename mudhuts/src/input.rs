@@ -9,6 +9,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::SERIAL_COUNTER;
 
 use crate::State;
+use crate::docks;
 use crate::keybindings::Action;
 
 /// Translate a raw xkb keysym into mudhuts-term's neutral [`Key`], or
@@ -301,6 +302,10 @@ impl State {
                 let pos = event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
                 let serial = SERIAL_COUNTER.next_serial();
 
+                if self.dock_drag.is_some() {
+                    docks::advance_drag(self, pos);
+                }
+
                 if self.showing_terminal_effective() {
                     let (col, row, left_half) = self.stack.focused().pixel_to_cell(pos.x, pos.y);
                     if let Some(held) = self.mouse_report_button_held {
@@ -349,6 +354,10 @@ impl State {
                 let button_state = event.state();
                 let pressed = button_state == ButtonState::Pressed;
 
+                if !pressed && self.dock_drag.is_some() {
+                    docks::finish_drag(self);
+                }
+
                 if self.showing_terminal_effective() {
                     let pos = pointer.current_location();
                     let (col, row, left_half) = self.stack.focused().pixel_to_cell(pos.x, pos.y);
@@ -381,9 +390,13 @@ impl State {
                         }
                     }
                 } else if pressed && !pointer.is_grabbed() {
-                    if let Some((window, _loc)) = self
+                    let pos = pointer.current_location();
+                    if docks::start_drag(self, pos) {
+                        // Handled as a docked handle's drag-start instead
+                        // of a normal click-to-focus below.
+                    } else if let Some((window, _loc)) = self
                         .space
-                        .element_under(pointer.current_location())
+                        .element_under(pos)
                         .map(|(w, l)| (w.clone(), l))
                     {
                         self.space.raise_element(&window, true);

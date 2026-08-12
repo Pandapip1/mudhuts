@@ -17,6 +17,7 @@ use smithay::utils::Transform;
 
 use crate::State;
 use crate::chrome;
+use crate::docks;
 use crate::handlers::xdg_shell;
 use crate::render::OutputRenderElements;
 use crate::switcher;
@@ -157,6 +158,19 @@ pub fn init_winit(
                             // Alt-Tab popup above. Empty when the focused
                             // Hut has no Main Windows.
                             elements.extend(chrome::build(state.stack.focused_mut(), renderer));
+
+                            // Docked Sub-Window handles (Phase 5) — same
+                            // z-order slot as the tab strip, only shown
+                            // alongside the Main Window they belong to
+                            // (never while the terminal itself is the
+                            // visible view).
+                            if !show_terminal {
+                                elements.extend(docks::build(
+                                    state.stack.focused_mut(),
+                                    renderer,
+                                    (size.w, size.h),
+                                ));
+                            }
 
                             // No compositor-drawn cursor here: under the
                             // winit backend, the host compositor already

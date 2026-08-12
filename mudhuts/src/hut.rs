@@ -12,6 +12,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use mudhuts_term::{GlyphCache, TermEvent, Terminal};
 
 use crate::gpu_term::{GpuTermRenderer, LabelRenderer};
+use crate::main_window::MainWindowEntry;
 
 /// Initial grid size used before the real output size is known.
 const INITIAL_COLS: usize = 80;
@@ -53,10 +54,13 @@ pub struct Hut {
     pub element_id: Id,
 
     /// Client toplevels belonging to this Hut (see the plan's Phase 4
-    /// notes on PID-ancestry assignment), tab-ordered. At most one is
-    /// ever visible/mapped at a time — see `active_main_window` and
-    /// `State::sync_visible_main_window`.
-    main_windows: Vec<Window>,
+    /// notes on PID-ancestry assignment), tab-ordered, plus whatever's
+    /// been tagged as their Sub-Windows/Alerts (Phase 5). At most one
+    /// Main Window's tab is ever visible/mapped at a time — see
+    /// `active_main_window` and `State::sync_visible_main_window` — but
+    /// that one's floating Sub-Windows and Alerts are all visible
+    /// alongside it.
+    main_windows: Vec<MainWindowEntry>,
     /// Index into `main_windows` of the tab that's active — meaningless
     /// while `main_windows` is empty.
     active_main_window: usize,
@@ -121,6 +125,11 @@ impl Hut {
 
     /// The Main Window whose tab is currently active, if any.
     pub fn active_window(&self) -> Option<&Window> {
+        self.main_windows.get(self.active_main_window).map(|e| &e.window)
+    }
+
+    /// The active tab's full entry (Sub-Windows/Alerts included), if any.
+    pub fn active_main_window_entry(&self) -> Option<&MainWindowEntry> {
         self.main_windows.get(self.active_main_window)
     }
 
@@ -130,7 +139,7 @@ impl Hut {
         self.active_main_window
     }
 
-    pub fn main_windows(&self) -> &[Window] {
+    pub fn main_windows(&self) -> &[MainWindowEntry] {
         &self.main_windows
     }
 
@@ -142,32 +151,108 @@ impl Hut {
     /// tab and made the active one (matches the existing auto-switch
     /// spirit from Phase 2.5, now per-Hut and per-tab rather than global).
     pub fn push_main_window(&mut self, window: Window) {
-        self.main_windows.push(window);
+        self.main_windows.push(MainWindowEntry::new(window));
         self.active_main_window = self.main_windows.len() - 1;
     }
 
-    /// A client toplevel belonging to this Hut was destroyed. Returns
-    /// whether it was actually found here (callers check every Hut).
-    /// Falls back to showing the terminal if that was the last tab.
-    pub fn remove_main_window(&mut self, surface: &WlSurface) -> bool {
-        let Some(idx) = self
-            .main_windows
-            .iter()
-            .position(|w| w.toplevel().is_some_and(|t| t.wl_surface() == surface))
-        else {
-            return false;
-        };
-        self.main_windows.remove(idx);
+    /// Whether `surface` is currently a bare (untagged) Main Window in
+    /// this Hut — used to resolve `mudhuts_window_role_v1.set_sub`/
+    /// `set_alert`'s target toplevel (which must start out as a plain
+    /// Main Window; `new_toplevel` always adds new clients as one before
+    /// any role-assignment request can arrive on the same connection).
+    pub fn has_bare_main_window(&self, surface: &WlSurface) -> bool {
+        self.main_windows.iter().any(|e| e.matches(surface))
+    }
+
+    /// Remove and return a bare Main Window by surface, adjusting the
+    /// active tab index the same way [`Self::remove_window`] does.
+    /// Doesn't touch `showing_terminal`/redraw bookkeeping itself — the
+    /// caller (role assignment) always re-inserts it somewhere else
+    /// immediately, so nothing user-visible actually changes.
+    pub fn take_bare_main_window(&mut self, surface: &WlSurface) -> Option<Window> {
+        let idx = self.main_windows.iter().position(|e| e.matches(surface))?;
+        let entry = self.main_windows.remove(idx);
         if idx < self.active_main_window {
             self.active_main_window -= 1;
         }
         self.active_main_window = self
             .active_main_window
             .min(self.main_windows.len().saturating_sub(1));
-        if self.main_windows.is_empty() {
-            self.showing_terminal = true;
+        Some(entry.window)
+    }
+
+    /// Find a bare Main Window's entry by surface, mutably — for
+    /// `set_sub`/`set_alert` to reach the *target* ("main") toplevel's
+    /// `sub_windows`/`alerts` list.
+    pub fn find_main_window_mut(&mut self, surface: &WlSurface) -> Option<&mut MainWindowEntry> {
+        self.main_windows.iter_mut().find(|e| e.matches(surface))
+    }
+
+    /// Remove and return a Sub-Window or Alert (searching every Main
+    /// Window's own lists) by surface — for `mudhuts_window_role_v1.
+    /// set_main`, which moves a tagged window back to being a bare Main
+    /// Window.
+    pub fn take_nested_window(&mut self, surface: &WlSurface) -> Option<Window> {
+        for entry in &mut self.main_windows {
+            if let Some(idx) = entry.sub_windows.iter().position(|s| s.matches(surface)) {
+                return Some(entry.sub_windows.remove(idx).window);
+            }
+            if let Some(idx) = entry.alerts.iter().position(|a| a.matches(surface)) {
+                return Some(entry.alerts.remove(idx).window);
+            }
         }
-        true
+        None
+    }
+
+    /// Find a Sub-Window's own entry (for updating its `Dock` state
+    /// while dragging), searching every Main Window's `sub_windows`.
+    pub fn sub_window_mut(
+        &mut self,
+        surface: &WlSurface,
+    ) -> Option<&mut crate::main_window::SubWindow> {
+        self.main_windows
+            .iter_mut()
+            .find_map(|e| e.sub_windows.iter_mut().find(|s| s.matches(surface)))
+    }
+
+    /// Find an Alert's own entry (for updating its tracked position while
+    /// dragging), searching every Main Window's `alerts`.
+    pub fn alert_mut(&mut self, surface: &WlSurface) -> Option<&mut crate::main_window::Alert> {
+        self.main_windows
+            .iter_mut()
+            .find_map(|e| e.alerts.iter_mut().find(|a| a.matches(surface)))
+    }
+
+    /// A client toplevel belonging to this Hut was destroyed — a bare
+    /// Main Window, or a Sub-Window/Alert of one. Returns whether it was
+    /// actually found here (callers check every Hut). Falls back to
+    /// showing the terminal if a Main Window was removed and that was
+    /// the last tab.
+    pub fn remove_window(&mut self, surface: &WlSurface) -> bool {
+        if let Some(idx) = self.main_windows.iter().position(|e| e.matches(surface)) {
+            self.main_windows.remove(idx);
+            if idx < self.active_main_window {
+                self.active_main_window -= 1;
+            }
+            self.active_main_window = self
+                .active_main_window
+                .min(self.main_windows.len().saturating_sub(1));
+            if self.main_windows.is_empty() {
+                self.showing_terminal = true;
+            }
+            return true;
+        }
+        for entry in &mut self.main_windows {
+            if let Some(idx) = entry.sub_windows.iter().position(|s| s.matches(surface)) {
+                entry.sub_windows.remove(idx);
+                return true;
+            }
+            if let Some(idx) = entry.alerts.iter().position(|a| a.matches(surface)) {
+                entry.alerts.remove(idx);
+                return true;
+            }
+        }
+        false
     }
 
     /// Meta+Right/Left within this Hut: cycle the active Main Window tab.
