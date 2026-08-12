@@ -226,9 +226,35 @@ impl Terminal {
         self.term.lock().selection_to_string()
     }
 
+    /// If anything changed since the last call (content damage or an
+    /// active selection), every visible cell's resolved character/colors —
+    /// for the GPU atlas rendering path, which redraws everything whenever
+    /// *anything* changed rather than tracking fine-grained damage (see
+    /// [`render::collect_cells`]). Returns `None` when nothing changed, so
+    /// the caller can skip re-rendering entirely.
+    pub fn take_dirty_cells(&self) -> Option<Vec<render::CellInfo>> {
+        let mut term = self.term.lock();
+        let has_content_damage = match term.damage() {
+            alacritty_terminal::term::TermDamage::Full => true,
+            alacritty_terminal::term::TermDamage::Partial(mut lines) => lines.next().is_some(),
+        };
+        let changed = has_content_damage || term.selection.is_some();
+        term.reset_damage();
+        if !changed {
+            return None;
+        }
+        Some(render::collect_cells(term.renderable_content()))
+    }
+
     /// Rasterize the current grid into `buf` (RGBA8, `width * height * 4`
     /// bytes) using `glyphs`, touching only what changed since the last
     /// call. Returns the redrawn pixel rectangles for damage tracking.
+    ///
+    /// This is the CPU rendering path (kept as a fallback/reference — the
+    /// GPU atlas path in `mudhuts::gpu_term` is what's actually used now,
+    /// see the Phase 2.6 plan notes on why the CPU path doesn't scale to a
+    /// full 4K120Hz screen for a program that redraws large regions
+    /// frequently, e.g. `btop`).
     pub fn render(
         &self,
         glyphs: &mut GlyphCache,

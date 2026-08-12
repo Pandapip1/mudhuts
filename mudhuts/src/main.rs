@@ -1,3 +1,4 @@
+mod gpu_term;
 mod handlers;
 mod hut;
 mod input;

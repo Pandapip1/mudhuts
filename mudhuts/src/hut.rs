@@ -2,11 +2,12 @@
 //! only has a single Hut and doesn't yet organize client windows into it —
 //! see the plan at `/home/gavin/.claude/plans/cryptic-honking-lamport.md`.
 
-use smithay::backend::allocator::Fourcc;
-use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
-use smithay::utils::Transform;
+use smithay::backend::renderer::element::Id;
+use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 
 use mudhuts_term::{GlyphCache, TermEvent, Terminal};
+
+use crate::gpu_term::GpuTermRenderer;
 
 /// Initial grid size used before the real output size is known.
 const INITIAL_COLS: usize = 80;
@@ -15,8 +16,18 @@ const INITIAL_LINES: usize = 24;
 pub struct Hut {
     pub terminal: Terminal,
     pub glyphs: GlyphCache,
-    pub buffer: MemoryRenderBuffer,
+    /// Lazily created on first [`Hut::redraw`] call, once a renderer is
+    /// actually available (Phase 1 spawns Huts before the winit backend
+    /// exists).
+    gpu: Option<GpuTermRenderer>,
+    /// What `redraw` returned last time, reused when nothing changed
+    /// (cheap: an `Arc` clone, not a re-render).
+    last_texture: Option<GlesTexture>,
     pixel_size: (i32, i32),
+    /// Stable identity for this Hut's terminal render element across
+    /// frames (matters for the compositor's outer damage tracking, which
+    /// compares elements by id between frames).
+    pub element_id: Id,
 }
 
 impl Hut {
@@ -46,15 +57,15 @@ impl Hut {
             (INITIAL_COLS * cell_size.0 as usize) as i32,
             (INITIAL_LINES * cell_size.1 as usize) as i32,
         );
-        let buffer =
-            MemoryRenderBuffer::new(Fourcc::Abgr8888, pixel_size, 1, Transform::Normal, None);
 
         Ok((
             Hut {
                 terminal,
                 glyphs,
-                buffer,
+                gpu: None,
+                last_texture: None,
                 pixel_size,
+                element_id: Id::new(),
             },
             events,
         ))
@@ -74,7 +85,6 @@ impl Hut {
         let lines = (height.max(0) as usize / cell_h).max(1);
         self.terminal
             .resize(cols, lines, (cell_w as u16, cell_h as u16));
-        self.buffer.render().resize((width.max(0), height.max(0)));
     }
 
     /// Convert a pixel position (relative to the Hut's own buffer, i.e.
@@ -97,27 +107,52 @@ impl Hut {
         (col, row, left_half)
     }
 
-    /// Re-rasterize the terminal grid into the backing buffer.
-    pub fn redraw(&mut self) {
+    /// Re-render (via the GPU glyph-atlas renderer, if anything changed
+    /// since last time) and return the current texture to composite, or
+    /// `None` if there's nothing to show yet (zero pixel size, or the GPU
+    /// renderer failed to initialize).
+    pub fn redraw(&mut self, renderer: &mut GlesRenderer) -> Option<GlesTexture> {
         let (width, height) = self.pixel_size;
         if width <= 0 || height <= 0 {
-            return;
+            return None;
         }
-        let (width, height) = (width as usize, height as usize);
-        let terminal = &self.terminal;
-        let glyphs = &mut self.glyphs;
-        let _ = self.buffer.render().draw(|buf| {
-            let rects = terminal.render(glyphs, buf, width, height);
-            let damage = rects
-                .into_iter()
-                .map(|r| {
-                    smithay::utils::Rectangle::new(
-                        (r.x as i32, r.y as i32).into(),
-                        (r.width as i32, r.height as i32).into(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            Ok::<_, ()>(damage)
-        });
+
+        if self.gpu.is_none() {
+            match GpuTermRenderer::new(renderer) {
+                Ok(gpu) => self.gpu = Some(gpu),
+                Err(err) => {
+                    tracing::error!("failed to initialize GPU terminal renderer: {err}");
+                    return None;
+                }
+            }
+        }
+        let gpu = self.gpu.as_mut()?;
+
+        let Some(cells) = self.terminal.take_dirty_cells() else {
+            return self.last_texture.clone();
+        };
+
+        let cell_w = self.glyphs.cell_width();
+        let cell_h = self.glyphs.cell_height();
+        let baseline = self.glyphs.baseline();
+        match gpu.redraw(
+            renderer,
+            &mut self.glyphs,
+            &cells,
+            cell_w,
+            cell_h,
+            baseline,
+            width,
+            height,
+        ) {
+            Ok(texture) => {
+                self.last_texture = Some(texture.clone());
+                Some(texture)
+            }
+            Err(err) => {
+                tracing::error!("GPU terminal redraw failed: {err}");
+                self.last_texture.clone()
+            }
+        }
     }
 }

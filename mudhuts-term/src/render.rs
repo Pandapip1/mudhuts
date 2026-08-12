@@ -81,6 +81,11 @@ impl GlyphCache {
         self.cell_height
     }
 
+    /// Baseline offset (from the top of a cell) glyphs should be drawn at.
+    pub fn baseline(&self) -> usize {
+        self.baseline
+    }
+
     /// The primary/bold font if it covers `c`, otherwise a fontconfig-found
     /// fallback that does (loaded and cached on first use), otherwise the
     /// primary/bold font anyway (nothing on the system covers `c`).
@@ -129,7 +134,11 @@ impl GlyphCache {
         }
     }
 
-    fn glyph(&mut self, c: char, bold: bool) -> &(fontdue::Metrics, Vec<u8>) {
+    /// The rasterized glyph (coverage bitmap) for `(c, bold)`, cached after
+    /// the first call. Used both by the CPU [`render`] path and the GPU
+    /// atlas path (`mudhuts::gpu_term`), which uploads this bitmap into a
+    /// texture once per unique glyph instead of blitting it every frame.
+    pub fn glyph(&mut self, c: char, bold: bool) -> &(fontdue::Metrics, Vec<u8>) {
         if !self.cache.contains_key(&(c, bold)) {
             let rasterized = self.font_for_char(c, bold).rasterize(c, FONT_SIZE);
             self.cache.insert((c, bold), rasterized);
@@ -242,6 +251,65 @@ pub struct LineDamage {
     pub line: usize,
     pub left: usize,
     pub right: usize,
+}
+
+/// One visible cell's resolved (post cursor/selection/inverse) colors and
+/// character, for renderers that don't rasterize to a CPU pixel buffer
+/// themselves (the GPU atlas path — see `mudhuts::gpu_term`). Shares the
+/// exact same color-resolution logic as [`render`] so the two backends
+/// produce identical output.
+#[derive(Debug, Clone, Copy)]
+pub struct CellInfo {
+    pub col: usize,
+    pub row: usize,
+    pub c: char,
+    pub bold: bool,
+    pub fg: Rgb,
+    pub bg: Rgb,
+}
+
+/// Collect every visible cell's resolved colors/character. Unlike
+/// [`render`], this always covers the whole viewport — the GPU path
+/// redraws every cell whenever *anything* changed rather than tracking
+/// fine-grained per-line damage, since instanced GPU draws make that
+/// optimization unnecessary (see the Phase 2.6 plan notes).
+pub fn collect_cells(content: RenderableContent<'_>) -> Vec<CellInfo> {
+    let colors: &Colors = content.colors;
+    let cursor_point = content.cursor.point;
+    let cursor_shape = content.cursor.shape;
+    let cursor_visible = !matches!(cursor_shape, CursorShape::Hidden);
+    let selection = content.selection;
+
+    let mut cells = Vec::new();
+    for indexed in content.display_iter {
+        let line = indexed.point.line.0;
+        if line < 0 {
+            continue;
+        }
+        let row = line as usize;
+        let col = indexed.point.column.0;
+        let cell = indexed.cell;
+
+        let is_cursor_cell = cursor_visible && indexed.point == cursor_point;
+        let is_selected =
+            selection.is_some_and(|sel| sel.contains_cell(&indexed, cursor_point, cursor_shape));
+
+        let mut fg = palette::resolve_fg(cell.fg, cell.flags, colors);
+        let mut bg = palette::resolve_bg(cell.bg, colors);
+        if cell.flags.contains(Flags::INVERSE) || is_selected || is_cursor_cell {
+            std::mem::swap(&mut fg, &mut bg);
+        }
+
+        cells.push(CellInfo {
+            col,
+            row,
+            c: cell.c,
+            bold: cell.flags.contains(Flags::BOLD),
+            fg,
+            bg,
+        });
+    }
+    cells
 }
 
 /// Render the current terminal viewport into an RGBA8 `buf` of size

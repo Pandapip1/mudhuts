@@ -1,7 +1,8 @@
+use smithay::backend::renderer::Renderer;
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::Kind;
-use smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
+use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::winit::{self, WinitEvent};
 use smithay::desktop::space::space_render_elements;
@@ -64,7 +65,6 @@ pub fn init_winit(
                 WinitEvent::Redraw => {
                     let size = backend.window_size();
                     state.hut.resize_to_pixels(size.w, size.h);
-                    state.hut.redraw();
 
                     let show_terminal = state.showing_terminal_effective();
 
@@ -108,21 +108,21 @@ pub fn init_winit(
                             // actually owning the seat.
 
                             if show_terminal {
-                                match MemoryRenderBufferRenderElement::from_buffer(
-                                    renderer,
-                                    (0.0, 0.0),
-                                    &state.hut.buffer,
-                                    None,
-                                    None,
-                                    None,
-                                    Kind::Unspecified,
-                                ) {
-                                    Ok(term_element) => {
-                                        elements.push(OutputRenderElements::from(term_element))
-                                    }
-                                    Err(err) => {
-                                        tracing::warn!("failed to upload terminal buffer: {err}")
-                                    }
+                                if let Some(texture) = state.hut.redraw(renderer) {
+                                    let element = TextureRenderElement::from_static_texture(
+                                        state.hut.element_id.clone(),
+                                        renderer.context_id(),
+                                        (0.0, 0.0),
+                                        texture,
+                                        1,
+                                        smithay::utils::Transform::Normal,
+                                        None,
+                                        None,
+                                        None,
+                                        None,
+                                        Kind::Unspecified,
+                                    );
+                                    elements.push(OutputRenderElements::from(element));
                                 }
                             } else {
                                 match space_render_elements::<_, smithay::desktop::Window, _>(
