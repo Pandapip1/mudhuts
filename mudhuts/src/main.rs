@@ -20,9 +20,23 @@ use smithay::reexports::wayland_server::Display;
 
 pub use state::State;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::process::ExitCode {
     init_logging();
 
+    // Routed through `tracing::error!` (not the default `Termination`
+    // impl's `Debug`-printed-to-stderr behavior) so a startup failure
+    // reaches journald the same way panics and everything else do — see
+    // `init_logging`'s doc comment for why that matters here specifically.
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(err) => {
+            tracing::error!("{err}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut event_loop: EventLoop<'static, State> = EventLoop::try_new()?;
     let display: Display<State> = Display::new()?;
 
@@ -57,10 +71,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Sets up logging to both stderr (for nested/dev-shell testing, where
+/// it's visible directly) and the systemd journal via `tracing-journald`
+/// (which talks to journald's own socket directly, so it's captured no
+/// matter what does or doesn't capture this process's stdout/stderr —
+/// under the udev/TTY backend that's normally a greeter/session manager,
+/// which turned out not to forward or log a launched session's output
+/// anywhere accessible). Also installs a panic hook that logs the panic
+/// through `tracing` (in addition to the default hook's own stderr
+/// output), for the same reason: a panic that only reaches stderr is
+/// invisible when nothing captures stderr.
 fn init_logging() {
-    if let Ok(env_filter) = tracing_subscriber::EnvFilter::try_from_default_env() {
-        tracing_subscriber::fmt().with_env_filter(env_filter).init();
-    } else {
-        tracing_subscriber::fmt().init();
-    }
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    let journald_layer = match tracing_journald::layer() {
+        Ok(layer) => Some(layer),
+        Err(err) => {
+            eprintln!("failed to connect to the systemd journal, logging to stderr only: {err}");
+            None
+        }
+    };
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(tracing_subscriber::fmt::layer())
+        .with(journald_layer)
+        .init();
+
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tracing::error!("{info}");
+        default_hook(info);
+    }));
 }
