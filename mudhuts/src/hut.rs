@@ -96,6 +96,15 @@ impl Hut {
         self.touched
     }
 
+    /// Whatever [`Self::redraw`] last produced, without triggering a new
+    /// render — for the Alt-Tab preview popup's thumbnails, which read
+    /// every Hut's texture rather than just the focused one. `None` if
+    /// this Hut has never been drawn yet (e.g. `redraw` was never called
+    /// on it — its GPU renderer hasn't even been created).
+    pub fn cached_texture(&self) -> Option<GlesTexture> {
+        self.last_texture.clone()
+    }
+
     pub fn mark_touched(&mut self) {
         self.touched = true;
     }

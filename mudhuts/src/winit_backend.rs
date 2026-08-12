@@ -16,6 +16,7 @@ use smithay::utils::Transform;
 
 use crate::State;
 use crate::render::OutputRenderElements;
+use crate::switcher;
 
 pub fn init_winit(
     event_loop: &mut EventLoop<State>,
@@ -131,6 +132,33 @@ pub fn init_winit(
                                     WaylandSurfaceRenderElement<GlesRenderer>,
                                 >,
                             > = Vec::new();
+
+                            // Only the focused Hut normally gets redrawn
+                            // (see Phase 2.6's damage-avoidance work) —
+                            // but the Alt-Tab popup shows every Hut's
+                            // thumbnail, so while it's open they all need
+                            // fresh cached textures. Redundant with the
+                            // focused Hut's own redraw just below (cheap:
+                            // a second `redraw` call in the same tick is
+                            // a no-op cache hit, since damage was already
+                            // reset by the first).
+                            if state.stack.is_previewing() {
+                                for hut in state.stack.huts_mut() {
+                                    hut.redraw(renderer);
+                                }
+                            }
+
+                            // Pushed first (frontmost — `render_output`
+                            // takes elements in front-to-back order) so
+                            // the popup sits on top of whatever's below,
+                            // regardless of whether that's the terminal
+                            // or a client window; empty when no preview
+                            // session is open.
+                            elements.extend(switcher::build(
+                                &state.stack,
+                                (size.w, size.h),
+                                renderer,
+                            ));
 
                             // No compositor-drawn cursor here: under the
                             // winit backend, the host compositor already

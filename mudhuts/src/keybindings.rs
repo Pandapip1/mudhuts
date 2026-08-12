@@ -73,6 +73,67 @@ impl Chord {
             && self.logo == mods.logo
             && self.keysym == base_keysym.raw()
     }
+
+    /// Like [`Self::matches`], but any modifier bit set in `hold` is
+    /// exempted from the usual exact-equality check (whatever this chord
+    /// itself specifies for that bit is ignored) and instead required to
+    /// actually be held right now — see [`Keymap::stack_hold`] for why:
+    /// `stack-next`/`stack-prev` need to keep matching regardless of a
+    /// separately-configured "hold" modifier's state in the chord
+    /// definition itself, while still requiring it to be physically down.
+    pub fn matches_gated(
+        &self,
+        hold: &ModMask,
+        mods: &ModifiersState,
+        base_keysym: xkb::Keysym,
+    ) -> bool {
+        (hold.ctrl || self.ctrl == mods.ctrl)
+            && (hold.alt || self.alt == mods.alt)
+            && (hold.shift || self.shift == mods.shift)
+            && (hold.logo || self.logo == mods.logo)
+            && self.keysym == base_keysym.raw()
+            && hold.satisfied_by(mods)
+    }
+}
+
+/// A pure modifier mask — no base key, unlike [`Chord`]. Used for
+/// `stack-hold` (see [`Keymap::stack_hold`]), which gates other chords
+/// rather than triggering an action on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct ModMask {
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    logo: bool,
+}
+
+impl ModMask {
+    pub fn is_empty(&self) -> bool {
+        !(self.ctrl || self.alt || self.shift || self.logo)
+    }
+
+    /// Whether every bit set in this mask is currently held in `mods`.
+    /// Vacuously true for an empty mask.
+    pub fn satisfied_by(&self, mods: &ModifiersState) -> bool {
+        (!self.ctrl || mods.ctrl)
+            && (!self.alt || mods.alt)
+            && (!self.shift || mods.shift)
+            && (!self.logo || mods.logo)
+    }
+}
+
+/// Apply one modifier name (case-insensitive) to `mask`, shared between
+/// [`parse_chord`] and [`parse_mod_mask`]. Returns `false` for anything
+/// unrecognized, leaving `mask` untouched by that name.
+fn apply_modifier_name(mask: &mut ModMask, name: &str) -> bool {
+    match name.to_ascii_lowercase().as_str() {
+        "ctrl" | "control" => mask.ctrl = true,
+        "alt" => mask.alt = true,
+        "shift" => mask.shift = true,
+        "meta" | "super" | "logo" | "win" => mask.logo = true,
+        _ => return false,
+    }
+    true
 }
 
 /// Parse a chord spec like `"Ctrl+Shift+T"` into a [`Chord`]. Returns
@@ -87,20 +148,10 @@ fn parse_chord(spec: &str) -> Option<Chord> {
         .collect();
     let (key_name, mod_names) = parts.split_last()?;
 
-    let mut chord = Chord {
-        ctrl: false,
-        alt: false,
-        shift: false,
-        logo: false,
-        keysym: 0,
-    };
+    let mut mods = ModMask::default();
     for m in mod_names {
-        match m.to_ascii_lowercase().as_str() {
-            "ctrl" | "control" => chord.ctrl = true,
-            "alt" => chord.alt = true,
-            "shift" => chord.shift = true,
-            "meta" | "super" | "logo" | "win" => chord.logo = true,
-            _ => return None,
+        if !apply_modifier_name(&mut mods, m) {
+            return None;
         }
     }
 
@@ -108,8 +159,28 @@ fn parse_chord(spec: &str) -> Option<Chord> {
     if keysym.raw() == xkb::keysyms::KEY_NoSymbol {
         return None;
     }
-    chord.keysym = keysym.raw();
-    Some(chord)
+    Some(Chord {
+        ctrl: mods.ctrl,
+        alt: mods.alt,
+        shift: mods.shift,
+        logo: mods.logo,
+        keysym: keysym.raw(),
+    })
+}
+
+/// Parse a modifier-only spec like `"Alt"` or `"Ctrl+Alt"` (no base key)
+/// into a [`ModMask`] — used for `stack-hold`. `None` for an empty spec or
+/// an unrecognized modifier name.
+fn parse_mod_mask(spec: &str) -> Option<ModMask> {
+    let mut mask = ModMask::default();
+    let mut saw_any = false;
+    for part in spec.split('+').map(str::trim).filter(|s| !s.is_empty()) {
+        if !apply_modifier_name(&mut mask, part) {
+            return None;
+        }
+        saw_any = true;
+    }
+    saw_any.then_some(mask)
 }
 
 fn default_bindings() -> HashMap<Chord, Action> {
@@ -142,6 +213,13 @@ fn apply_override(
 
 pub struct Keymap {
     bindings: HashMap<Chord, Action>,
+    /// Gates `StackNext`/`StackPrev` matching (see [`Chord::matches_gated`])
+    /// and, once one of them fires, is what the preview popup watches for
+    /// release to commit — see the Phase 3.5 plan notes. Empty (the
+    /// default, since there's no default chord for it) means no gating and
+    /// no popup: `stack-next`/`stack-prev` just match normally and commit
+    /// immediately, same as before this existed.
+    stack_hold: ModMask,
 }
 
 impl Keymap {
@@ -152,25 +230,53 @@ impl Keymap {
     /// fatal — the compositor always ends up with at least the defaults.
     pub fn load() -> Self {
         let mut bindings = default_bindings();
+        let mut stack_hold = ModMask::default();
 
         let Some(path) = config_path() else {
-            return Self { bindings };
+            return Self {
+                bindings,
+                stack_hold,
+            };
         };
 
         let contents = match std::fs::read_to_string(&path) {
             Ok(contents) => contents,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Self { bindings },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Self {
+                    bindings,
+                    stack_hold,
+                };
+            }
             Err(err) => {
                 tracing::warn!("failed to read config at {}: {err}", path.display());
-                return Self { bindings };
+                return Self {
+                    bindings,
+                    stack_hold,
+                };
             }
         };
 
-        Self::apply_toml_overrides(&mut bindings, &contents, &path.display().to_string());
-        Self { bindings }
+        Self::apply_toml_overrides(
+            &mut bindings,
+            &mut stack_hold,
+            &contents,
+            &path.display().to_string(),
+        );
+        Self {
+            bindings,
+            stack_hold,
+        }
     }
 
-    fn apply_toml_overrides(bindings: &mut HashMap<Chord, Action>, contents: &str, source: &str) {
+    /// `stack-hold` is handled here rather than through [`apply_override`]
+    /// — it's a pure modifier mask with no base key and no `Action`, so it
+    /// doesn't fit the `action-name = "chord"` shape everything else uses.
+    fn apply_toml_overrides(
+        bindings: &mut HashMap<Chord, Action>,
+        stack_hold: &mut ModMask,
+        contents: &str,
+        source: &str,
+    ) {
         let config: ConfigFile = match toml::from_str(contents) {
             Ok(config) => config,
             Err(err) => {
@@ -178,8 +284,17 @@ impl Keymap {
                 return;
             }
         };
-        for (name, chord_spec) in config.keybindings {
-            if let Err(err) = apply_override(bindings, &name, &chord_spec) {
+        for (name, value) in config.keybindings {
+            if name == "stack-hold" {
+                match parse_mod_mask(&value) {
+                    Some(mask) => *stack_hold = mask,
+                    None => tracing::warn!(
+                        "invalid modifier mask {value:?} for stack-hold in config at {source}"
+                    ),
+                }
+                continue;
+            }
+            if let Err(err) = apply_override(bindings, &name, &value) {
                 tracing::warn!("{err} in config at {source}");
             }
         }
@@ -188,8 +303,18 @@ impl Keymap {
     pub fn lookup(&self, mods: &ModifiersState, base_keysym: xkb::Keysym) -> Option<Action> {
         self.bindings
             .iter()
-            .find(|(chord, _)| chord.matches(mods, base_keysym))
+            .find(|(chord, action)| match action {
+                Action::StackNext | Action::StackPrev => {
+                    chord.matches_gated(&self.stack_hold, mods, base_keysym)
+                }
+                _ => chord.matches(mods, base_keysym),
+            })
             .map(|(_, a)| *a)
+    }
+
+    /// See the `stack_hold` field doc.
+    pub fn stack_hold(&self) -> ModMask {
+        self.stack_hold
     }
 }
 
@@ -327,7 +452,8 @@ mod tests {
             toggle-terminal = "Alt+grave"
             close-focused = "Ctrl+Shift+W"
         "#;
-        Keymap::apply_toml_overrides(&mut bindings, toml, "<test>");
+        let mut stack_hold = ModMask::default();
+        Keymap::apply_toml_overrides(&mut bindings, &mut stack_hold, toml, "<test>");
 
         let alt_grave = parse_chord("Alt+grave").unwrap();
         assert_eq!(bindings.get(&alt_grave), Some(&Action::ToggleTerminal));
@@ -344,7 +470,13 @@ mod tests {
     fn malformed_toml_leaves_defaults_untouched() {
         let mut bindings = default_bindings();
         let before = bindings.clone();
-        Keymap::apply_toml_overrides(&mut bindings, "this is not valid toml [[[", "<test>");
+        let mut stack_hold = ModMask::default();
+        Keymap::apply_toml_overrides(
+            &mut bindings,
+            &mut stack_hold,
+            "this is not valid toml [[[",
+            "<test>",
+        );
         assert_eq!(bindings, before);
     }
 
@@ -367,6 +499,7 @@ mod tests {
     fn lookup_finds_the_bound_action_and_nothing_else() {
         let keymap = Keymap {
             bindings: default_bindings(),
+            stack_hold: ModMask::default(),
         };
         let tab = xkb::keysym_from_name("Tab", xkb::KEYSYM_CASE_INSENSITIVE);
         let grave = xkb::keysym_from_name("grave", xkb::KEYSYM_CASE_INSENSITIVE);
@@ -381,5 +514,98 @@ mod tests {
         );
         // Plain Tab (no modifiers) isn't bound to anything.
         assert_eq!(keymap.lookup(&mods(false, false, false, false), tab), None);
+    }
+
+    #[test]
+    fn parses_mod_mask() {
+        let mask = parse_mod_mask("Ctrl+Alt").expect("should parse");
+        assert!(mask.ctrl && mask.alt);
+        assert!(!mask.shift && !mask.logo);
+    }
+
+    #[test]
+    fn mod_mask_rejects_empty_and_unknown_names() {
+        assert_eq!(parse_mod_mask(""), None);
+        assert_eq!(parse_mod_mask("Hyper"), None);
+    }
+
+    #[test]
+    fn empty_mod_mask_is_satisfied_regardless_of_held_modifiers() {
+        let empty = ModMask::default();
+        assert!(empty.satisfied_by(&mods(false, false, false, false)));
+        assert!(empty.satisfied_by(&mods(true, true, true, true)));
+    }
+
+    #[test]
+    fn mod_mask_requires_its_own_bits_held_and_ignores_others() {
+        let hold = parse_mod_mask("Alt").unwrap();
+        assert!(!hold.satisfied_by(&mods(false, false, false, false)));
+        assert!(hold.satisfied_by(&mods(false, true, false, false)));
+        // Shift being held too doesn't matter — only Alt is required.
+        assert!(hold.satisfied_by(&mods(false, true, true, false)));
+    }
+
+    #[test]
+    fn matches_gated_ignores_held_bits_covered_by_hold_but_still_requires_hold() {
+        // Chord itself doesn't require Alt (alt: false) — mirrors the
+        // user's real setup: stack-next = "Shift+bracketright",
+        // stack-hold = "Alt".
+        let chord = parse_chord("Shift+bracketright").unwrap();
+        let hold = parse_mod_mask("Alt").unwrap();
+        let bracketright = xkb::keysym_from_name("bracketright", xkb::KEYSYM_CASE_INSENSITIVE);
+
+        // Alt+Shift+] : matches, even though the chord's own `alt` field
+        // is false — Alt is covered by `hold`, so it's exempted from the
+        // equality check and instead required to be held, which it is.
+        assert!(chord.matches_gated(&hold, &mods(false, true, true, false), bracketright));
+        // Shift+] alone (no Alt held): hold not satisfied, no match.
+        assert!(!chord.matches_gated(&hold, &mods(false, false, true, false), bracketright));
+        // Alt+] (no Shift): the chord's own shift requirement still
+        // applies normally since shift isn't part of `hold`.
+        assert!(!chord.matches_gated(&hold, &mods(false, true, false, false), bracketright));
+    }
+
+    #[test]
+    fn matches_gated_with_empty_hold_behaves_like_a_plain_match() {
+        let chord = parse_chord("Alt+Tab").unwrap();
+        let empty_hold = ModMask::default();
+        let tab = xkb::keysym_from_name("Tab", xkb::KEYSYM_CASE_INSENSITIVE);
+
+        assert_eq!(
+            chord.matches_gated(&empty_hold, &mods(false, true, false, false), tab),
+            chord.matches(&mods(false, true, false, false), tab)
+        );
+        assert_eq!(
+            chord.matches_gated(&empty_hold, &mods(false, false, false, false), tab),
+            chord.matches(&mods(false, false, false, false), tab)
+        );
+    }
+
+    #[test]
+    fn stack_hold_config_key_sets_the_mask_not_a_binding() {
+        let mut bindings = default_bindings();
+        let mut stack_hold = ModMask::default();
+        let toml = r#"
+            [keybindings]
+            stack-hold = "Alt"
+            stack-next = "Shift+bracketright"
+        "#;
+        Keymap::apply_toml_overrides(&mut bindings, &mut stack_hold, toml, "<test>");
+
+        assert_eq!(stack_hold, parse_mod_mask("Alt").unwrap());
+        let chord = parse_chord("Shift+bracketright").unwrap();
+        assert_eq!(bindings.get(&chord), Some(&Action::StackNext));
+    }
+
+    #[test]
+    fn invalid_stack_hold_is_rejected_without_mutating_it() {
+        let mut bindings = default_bindings();
+        let mut stack_hold = ModMask::default();
+        let toml = r#"
+            [keybindings]
+            stack-hold = "NotAModifier"
+        "#;
+        Keymap::apply_toml_overrides(&mut bindings, &mut stack_hold, toml, "<test>");
+        assert_eq!(stack_hold, ModMask::default());
     }
 }

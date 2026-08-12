@@ -6,6 +6,7 @@ mod keybindings;
 mod render;
 mod stack;
 mod state;
+mod switcher;
 mod winit_backend;
 
 use smithay::reexports::calloop::EventLoop;

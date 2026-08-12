@@ -22,6 +22,12 @@ use crate::hut::Hut;
 pub struct HutStack {
     huts: Vec<Hut>,
     current: usize,
+    /// Set while a preview session (see the Phase 3.5 plan notes — the
+    /// Alt-Tab-style popup, held open while a configured modifier stays
+    /// down) is open: which index is currently highlighted. Distinct from
+    /// `current`, which doesn't change until [`Self::commit_preview`] —
+    /// the visible/focused Hut stays frozen for the whole session.
+    preview: Option<usize>,
     loop_handle: LoopHandle<'static, State>,
     /// Environment applied to every spawned Hut's shell (currently just
     /// `WAYLAND_DISPLAY`, pointing it at mudhuts' own socket) — see
@@ -42,6 +48,7 @@ impl HutStack {
         let stack = Self {
             huts: vec![first],
             current: 0,
+            preview: None,
             loop_handle,
             extra_env,
         };
@@ -98,34 +105,132 @@ impl HutStack {
         Ok(())
     }
 
-    /// Alt+Tab.
-    pub fn next(&mut self) -> Result<(), String> {
+    /// Move `pos` forward by one step, applying the discard/spawn rules:
+    /// the entry currently at `pos` is discarded (rather than kept
+    /// alongside whatever's next) if it's never been touched, *unless*
+    /// its index matches `protect` — used to keep the live, currently
+    /// displayed Hut safe from a preview session's cursor landing back on
+    /// it before anything's actually been typed into it (see
+    /// [`Self::preview_next`]); the plain instant-commit [`Self::next`]
+    /// passes `None`, matching the original Phase 3 behavior exactly.
+    /// Spawns a fresh Hut if this runs past the end.
+    fn advance_forward(&mut self, pos: &mut usize, protect: Option<usize>) -> Result<(), String> {
         if self.huts.is_empty() {
-            // Should be unreachable (every path below maintains at least
+            // Should be unreachable (every path here maintains at least
             // one entry) — recover rather than index out of bounds.
-            return self.spawn_and_insert();
+            self.spawn_and_insert()?;
+            *pos = 0;
+            return Ok(());
         }
-        if !self.huts[self.current].touched() {
-            self.huts.remove(self.current);
+        let keep = protect == Some(*pos) || self.huts[*pos].touched();
+        if keep {
+            *pos += 1;
         } else {
-            self.current += 1;
+            self.huts.remove(*pos);
         }
-        if self.current >= self.huts.len() {
+        if *pos >= self.huts.len() {
             self.spawn_and_insert()?;
         }
         Ok(())
     }
 
-    /// Alt+Shift+Tab. No-op at the start of the stack — there's nowhere
-    /// further back, and only forward movement ever spawns a new Hut.
-    pub fn prev(&mut self) {
-        if self.current == 0 || self.huts.is_empty() {
+    /// Move `pos` backward by one step, same discard/`protect` rule as
+    /// [`Self::advance_forward`]. No-op at the start of the stack — there's
+    /// nowhere further back, and only forward movement ever spawns.
+    fn advance_backward(&mut self, pos: &mut usize, protect: Option<usize>) {
+        if *pos == 0 || self.huts.is_empty() {
             return;
         }
-        if !self.huts[self.current].touched() {
-            self.huts.remove(self.current);
+        let keep = protect == Some(*pos) || self.huts[*pos].touched();
+        if !keep {
+            self.huts.remove(*pos);
         }
-        self.current -= 1;
+        *pos -= 1;
+    }
+
+    /// Alt+Tab, instant-commit fallback for when no `stack-hold` modifier
+    /// is configured (see the plan's Phase 3.5 notes) — no preview, no
+    /// popup, `current` (and so the visible Hut) changes immediately.
+    pub fn next(&mut self) -> Result<(), String> {
+        let mut pos = self.current;
+        self.advance_forward(&mut pos, None)?;
+        self.current = pos;
+        Ok(())
+    }
+
+    /// Alt+Shift+Tab, instant-commit fallback (see [`Self::next`]).
+    pub fn prev(&mut self) {
+        let mut pos = self.current;
+        self.advance_backward(&mut pos, None);
+        self.current = pos;
+    }
+
+    /// Whether a preview session is currently open.
+    pub fn is_previewing(&self) -> bool {
+        self.preview.is_some()
+    }
+
+    /// The Hut currently highlighted for the popup — the preview cursor
+    /// if a session is open, else whatever's focused.
+    pub fn preview_index(&self) -> usize {
+        self.preview.unwrap_or(self.current)
+    }
+
+    /// All Huts in Stack order, for the popup renderer.
+    pub fn huts(&self) -> impl Iterator<Item = &Hut> {
+        self.huts.iter()
+    }
+
+    /// All Huts in Stack order, mutably — for redrawing every one of them
+    /// while the popup is open (see the plan's Phase 3.5 notes: only the
+    /// focused Hut normally gets redrawn, but the popup shows all of
+    /// them, so they all need fresh cached textures while it's visible).
+    pub fn huts_mut(&mut self) -> impl Iterator<Item = &mut Hut> {
+        self.huts.iter_mut()
+    }
+
+    /// Begin a preview session (peeking one step forward from the focused
+    /// Hut) if none is open, or advance an already-open one. Doesn't
+    /// touch `current`/the visible background at all — see
+    /// [`Self::commit_preview`].
+    pub fn preview_next(&mut self) -> Result<(), String> {
+        let mut pos = self.preview.unwrap_or(self.current);
+        self.advance_forward(&mut pos, Some(self.current))?;
+        self.preview = Some(pos);
+        Ok(())
+    }
+
+    /// Begin a preview session (wrapping around to the least-recently-used
+    /// entry) if none is open, or retreat an already-open one.
+    pub fn preview_prev(&mut self) {
+        let pos = match self.preview {
+            Some(mut pos) => {
+                self.advance_backward(&mut pos, Some(self.current));
+                pos
+            }
+            None => self.huts.len().saturating_sub(1),
+        };
+        self.preview = Some(pos);
+    }
+
+    /// Commit the open preview session: the highlighted Hut becomes the
+    /// front of the Stack (real MRU reordering, moving it to index 0) and
+    /// `current` follows it. No-op if no session is open. Marks the
+    /// committed Hut touched — selecting it *is* using it, and matters if
+    /// it was a freshly-spawned entry nothing's been typed into yet: the
+    /// very next preview session starts by peeking from `current`, and
+    /// without this, that peek could discard the Hut whose content is
+    /// currently on screen for being "never touched."
+    pub fn commit_preview(&mut self) {
+        let Some(pos) = self.preview.take() else {
+            return;
+        };
+        if pos < self.huts.len() {
+            let mut hut = self.huts.remove(pos);
+            hut.mark_touched();
+            self.huts.insert(0, hut);
+        }
+        self.current = 0;
     }
 
     /// A Hut's shell exited. Per the last-Hut rule, if it was the only one
@@ -138,11 +243,19 @@ impl HutStack {
             if idx < self.current {
                 self.current -= 1;
             }
+            if let Some(preview) = &mut self.preview
+                && idx < *preview
+            {
+                *preview -= 1;
+            }
         }
         if self.huts.is_empty() {
             self.spawn_and_insert()?;
         }
         self.current = self.current.min(self.huts.len().saturating_sub(1));
+        if let Some(preview) = &mut self.preview {
+            *preview = (*preview).min(self.huts.len().saturating_sub(1));
+        }
         Ok(())
     }
 }
@@ -277,5 +390,127 @@ mod tests {
         stack.remove_exited(999_999).unwrap();
         assert_eq!(stack.len(), 1);
         assert_eq!(stack.focused().id, id);
+    }
+
+    #[test]
+    fn preview_next_peeks_forward_without_touching_current() {
+        let mut stack = new_stack();
+        let first_id = stack.focused().id;
+        stack.preview_next().unwrap();
+        assert!(stack.is_previewing());
+        assert_eq!(stack.len(), 2, "peeking forward should spawn a 2nd Hut");
+        assert_eq!(stack.focused().id, first_id, "background must stay frozen");
+        assert_ne!(stack.huts().nth(stack.preview_index()).unwrap().id, first_id);
+    }
+
+    #[test]
+    fn preview_session_never_discards_the_untouched_but_currently_focused_hut() {
+        // Regression case: `current` starts untouched (nothing's been
+        // typed into the initial shell yet). A fresh preview session
+        // peeking forward from it must not discard it for being
+        // "untouched" — it's the live, on-screen content, not a dead
+        // entry being left behind.
+        let mut stack = new_stack();
+        assert!(!stack.focused().touched());
+        let first_id = stack.focused().id;
+        stack.preview_next().unwrap();
+        assert_eq!(stack.focused().id, first_id, "current survives untouched");
+        // Walk the preview cursor back onto index 0 (current's own slot)
+        // within the same session — still must not be discarded. (The
+        // untouched spawn from the peek above *does* get discarded here,
+        // correctly — it's being left behind — so length drops to 1.)
+        stack.preview_prev();
+        assert_eq!(stack.preview_index(), 0);
+        assert_eq!(stack.len(), 1, "current wasn't discarded by landing back on it");
+        assert_eq!(stack.focused().id, first_id);
+    }
+
+    #[test]
+    fn preview_advancing_within_an_open_session_still_discards_untouched_entries() {
+        let mut stack = new_stack();
+        stack.focused_mut().mark_touched();
+        stack.preview_next().unwrap(); // spawn #2, preview = 1 (untouched)
+        stack.preview_next().unwrap(); // leaving #2 untouched -> discarded, spawn #3 in its place
+        assert_eq!(stack.len(), 2, "the untouched 2nd entry should be discarded, not accumulated");
+    }
+
+    #[test]
+    fn preview_prev_with_no_session_wraps_to_the_least_recently_used_entry() {
+        let mut stack = new_stack();
+        stack.focused_mut().mark_touched();
+        let first_id = stack.focused().id;
+
+        // Build real history the way a hold-configured user actually
+        // would (preview + commit, never the instant-commit `next()`) —
+        // `current` is always index 0 afterwards, by construction, which
+        // is what makes "wrap to the last index" mean "least recently
+        // used" in the first place.
+        stack.preview_next().unwrap();
+        stack.commit_preview();
+        assert_ne!(
+            stack.focused().id,
+            first_id,
+            "sanity: committed to the newly-spawned Hut, pushing first_id to index 1"
+        );
+
+        stack.preview_prev();
+        assert_eq!(stack.preview_index(), 1, "wraps to the oldest entry");
+        assert_eq!(stack.huts().nth(stack.preview_index()).unwrap().id, first_id);
+    }
+
+    #[test]
+    fn commit_preview_moves_the_selection_to_the_front_and_marks_it_touched() {
+        let mut stack = new_stack();
+        let first_id = stack.focused().id;
+        stack.preview_next().unwrap(); // spawn #2, preview it (untouched)
+        let second_id = stack.huts().nth(stack.preview_index()).unwrap().id;
+        assert_ne!(second_id, first_id);
+
+        stack.commit_preview();
+
+        assert!(!stack.is_previewing());
+        assert_eq!(stack.focused().id, second_id, "committed selection becomes focused");
+        assert!(stack.focused().touched(), "committing counts as using it");
+        assert_eq!(stack.len(), 2, "the Hut left behind (first_id) is kept, not discarded");
+    }
+
+    #[test]
+    fn commit_preview_with_no_open_session_is_a_no_op() {
+        let mut stack = new_stack();
+        let id = stack.focused().id;
+        stack.commit_preview();
+        assert_eq!(stack.focused().id, id);
+        assert_eq!(stack.len(), 1);
+    }
+
+    #[test]
+    fn remove_exited_adjusts_a_stale_preview_index() {
+        let mut stack = new_stack();
+        stack.focused_mut().mark_touched();
+        stack.next().unwrap(); // huts = [A(touched), B(untouched)], current = 1
+        stack.focused_mut().mark_touched(); // touch B
+        stack.next().unwrap(); // huts = [A, B, C(untouched)], current = 2
+
+        let a_id = stack.huts().next().unwrap().id;
+        let c_id = stack.focused().id;
+
+        // C is touched by virtue of being `current`/protected, so peeking
+        // forward from it spawns a brand new 4th entry rather than
+        // reusing/discarding anything.
+        stack.preview_next().unwrap();
+        let d_id = stack.huts().last().unwrap().id;
+        assert_eq!(stack.preview_index(), 3);
+
+        // A (index 0) exits — before both `current` (2) and the preview
+        // cursor (3), so both should shift down by one to keep pointing
+        // at the same logical Huts.
+        stack.remove_exited(a_id).unwrap();
+
+        assert_eq!(stack.focused().id, c_id, "current follows the same Hut");
+        assert_eq!(
+            stack.huts().nth(stack.preview_index()).unwrap().id,
+            d_id,
+            "preview cursor follows the same Hut"
+        );
     }
 }

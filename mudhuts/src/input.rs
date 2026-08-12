@@ -164,19 +164,35 @@ impl State {
                 }
             }
             Action::StackNext => {
-                if let Err(err) = self.stack.next() {
+                // With no `stack-hold` configured, there's nothing to
+                // preview-and-commit-on-release with, so this commits
+                // immediately (Phase 3's original behavior). Otherwise it
+                // opens/advances a preview session instead — see
+                // `Keymap::stack_hold`'s doc and the keyboard-input
+                // closure below, which watches for that modifier's
+                // release to commit.
+                let result = if self.keymap.stack_hold().is_empty() {
+                    self.stack.next()
+                } else {
+                    self.stack.preview_next()
+                };
+                if let Err(err) = result {
                     tracing::error!("failed to advance the Hut stack: {err}");
                 }
-                // The newly-focused Hut gets resized to the real output
-                // size as part of the redraw this triggers (see
-                // `winit_backend.rs`'s `resize_all` call, which runs
-                // before that frame's texture is generated) — a
-                // freshly-spawned one starts at the placeholder default
+                // The newly-focused (or newly-previewed) Hut gets resized
+                // to the real output size as part of the redraw this
+                // triggers (see `winit_backend.rs`'s `resize_all` call,
+                // which runs before that frame's texture is generated) —
+                // a freshly-spawned one starts at the placeholder default
                 // grid size otherwise.
                 self.request_redraw();
             }
             Action::StackPrev => {
-                self.stack.prev();
+                if self.keymap.stack_hold().is_empty() {
+                    self.stack.prev();
+                } else {
+                    self.stack.preview_prev();
+                }
                 self.request_redraw();
             }
             // Depend on later phases — see the plan (Main Window tab
@@ -207,6 +223,18 @@ impl State {
                     serial,
                     time,
                     |data, mods, keysym| {
+                        // Checked on *every* event, press or release —
+                        // releasing the `stack-hold` modifier itself is
+                        // what commits an open preview session, and that
+                        // release is a plain modifier keyup, not
+                        // something any chord matches.
+                        if data.stack.is_previewing()
+                            && !data.keymap.stack_hold().satisfied_by(mods)
+                        {
+                            data.stack.commit_preview();
+                            data.request_redraw();
+                        }
+
                         // Global keybindings always win, regardless of
                         // whether the terminal or a client window is the
                         // active view — otherwise there'd be no way to
