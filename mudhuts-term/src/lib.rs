@@ -95,12 +95,17 @@ fn window_size(size: GridSize, cell_size: (u16, u16)) -> WindowSize {
 impl Terminal {
     /// Spawn a new shell in a fresh PTY. `cell_size` is the glyph cell
     /// size in pixels (from [`GlyphCache`]), used only for `TIOCSWINSZ`
-    /// bookkeeping. Returns the terminal plus a `calloop` channel the
+    /// bookkeeping. `extra_env` is set in the shell's (and thus its
+    /// children's) environment only — deliberately *not* via
+    /// `std::env::set_var` on the compositor's own process, which would
+    /// also affect e.g. the backend's own connection to whatever it's
+    /// nested inside. Returns the terminal plus a `calloop` channel the
     /// caller should insert into its event loop to know when to redraw.
     pub fn spawn(
         cols: usize,
         lines: usize,
         cell_size: (u16, u16),
+        extra_env: impl IntoIterator<Item = (String, String)>,
     ) -> io::Result<(Terminal, calloop::channel::Channel<TermEvent>)> {
         tty::setup_env();
 
@@ -111,7 +116,11 @@ impl Terminal {
         let term = Term::new(Config::default(), &size, event_proxy.clone());
         let term = Arc::new(FairMutex::new(term));
 
-        let pty = tty::new(&tty::Options::default(), window_size(size, cell_size), 0)?;
+        let pty_options = tty::Options {
+            env: extra_env.into_iter().collect(),
+            ..Default::default()
+        };
+        let pty = tty::new(&pty_options, window_size(size, cell_size), 0)?;
 
         let pty_event_loop = PtyEventLoop::new(term.clone(), event_proxy, pty, false, false)?;
         let notifier = Notifier(pty_event_loop.channel());

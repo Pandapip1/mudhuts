@@ -19,13 +19,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let socket = state::create_socket()?;
 
-    // Must happen before spawning the Hut's shell: children inherit the
-    // environment at fork time, so setting this any later would leave the
-    // shell (and anything launched from it) connected to whatever
-    // compositor mudhuts itself is nested in, not mudhuts' own socket.
-    unsafe { std::env::set_var("WAYLAND_DISPLAY", &socket.1) };
-
-    let (hut, term_events) = hut::Hut::spawn()?;
+    // Point the Hut's shell (and anything launched from it) at mudhuts'
+    // own socket, *without* touching the compositor's own process-wide
+    // `WAYLAND_DISPLAY` — the winit backend still needs that pointed at
+    // whatever mudhuts itself is nested inside, read when `init_winit`
+    // runs below.
+    let socket_name = socket.1.to_string_lossy().into_owned();
+    let (hut, term_events) = hut::Hut::spawn([("WAYLAND_DISPLAY".to_string(), socket_name)])?;
 
     let mut state = State::new(&mut event_loop, display, hut, socket)?;
 

@@ -20,10 +20,17 @@ pub struct Hut {
 }
 
 impl Hut {
-    /// Spawn a new Hut (shell + empty framebuffer). Returns the Hut plus a
-    /// channel the caller must insert into the calloop event loop to learn
-    /// about terminal events (title changes, shell exit).
-    pub fn spawn() -> Result<
+    /// Spawn a new Hut (shell + empty framebuffer). `extra_env` is set in
+    /// the shell's environment only (see [`Terminal::spawn`] — notably,
+    /// this is how mudhuts points the shell at its own Wayland socket
+    /// without touching the compositor's own `WAYLAND_DISPLAY`, which the
+    /// backend needs untouched to find whatever it's nested inside).
+    /// Returns the Hut plus a channel the caller must insert into the
+    /// calloop event loop to learn about terminal events (title changes,
+    /// shell exit).
+    pub fn spawn(
+        extra_env: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<
         (
             Hut,
             smithay::reexports::calloop::channel::Channel<TermEvent>,
@@ -32,8 +39,8 @@ impl Hut {
     > {
         let glyphs = GlyphCache::new()?;
         let cell_size = (glyphs.cell_width() as u16, glyphs.cell_height() as u16);
-        let (terminal, events) =
-            Terminal::spawn(INITIAL_COLS, INITIAL_LINES, cell_size).map_err(|e| e.to_string())?;
+        let (terminal, events) = Terminal::spawn(INITIAL_COLS, INITIAL_LINES, cell_size, extra_env)
+            .map_err(|e| e.to_string())?;
 
         let pixel_size = (
             (INITIAL_COLS * cell_size.0 as usize) as i32,
