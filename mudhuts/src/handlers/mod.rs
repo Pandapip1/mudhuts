@@ -1,5 +1,5 @@
 mod compositor;
-mod xdg_shell;
+pub(crate) mod xdg_shell;
 
 use smithay::input::dnd::DndGrabHandler;
 use smithay::input::pointer::CursorImageStatus;

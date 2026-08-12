@@ -4,7 +4,7 @@ use smithay::desktop::{
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::{wl_seat, wl_surface::WlSurface};
-use smithay::utils::Serial;
+use smithay::utils::{Logical, Serial, Size};
 use smithay::wayland::compositor::with_states;
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
@@ -178,6 +178,25 @@ pub fn handle_commit(popups: &mut PopupManager, window: Option<Window>, surface:
         && !xdg.is_initial_configure_sent()
     {
         let _ = xdg.send_configure();
+    }
+}
+
+/// Called whenever the output resizes (`winit_backend.rs`'s
+/// `WinitEvent::Resized`) — `new_toplevel`'s fullscreen size hint above is
+/// only ever sent once, at creation, so already-mapped Main Windows need
+/// an explicit fresh configure to actually resize; xdg_shell doesn't
+/// propagate a compositor-driven size change on its own.
+pub(crate) fn resize_all_main_windows(stack: &crate::stack::HutStack, size: Size<i32, Logical>) {
+    for hut in stack.huts() {
+        for window in hut.main_windows() {
+            let Some(toplevel) = window.toplevel() else {
+                continue;
+            };
+            toplevel.with_pending_state(|state| {
+                state.size = Some(size);
+            });
+            toplevel.send_configure();
+        }
     }
 }
 

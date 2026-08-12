@@ -6,14 +6,14 @@
 //! pipeline: `TextureRenderElement` composites a texture at whatever
 //! size/location it's given regardless of the texture's native size.
 
-use smithay::backend::renderer::Renderer;
+use smithay::backend::renderer::{Renderer, Texture};
 use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::gles::GlesRenderer;
-use smithay::utils::{Physical, Point, Rectangle, Size, Transform};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
 
 use crate::render::OutputRenderElements;
 use crate::stack::HutStack;
@@ -48,6 +48,17 @@ pub fn build(stack: &HutStack, output_size: (i32, i32), renderer: &GlesRenderer)
         let y = panel_y + PADDING;
 
         if let Some(texture) = hut.cached_texture() {
+            // `size` below is the *destination* size (the thumbnail) —
+            // without an explicit `src`, `TextureRenderElement` defaults
+            // the source rect to that same override size rather than the
+            // texture's real dimensions, so it'd sample only the
+            // thumbnail-sized top-left corner of the full-resolution
+            // terminal texture (cropped, not scaled). Pass the real size
+            // explicitly so `size` is free to scale independently.
+            let src = Rectangle::<f64, Logical>::from_size(Size::from((
+                texture.width() as f64,
+                texture.height() as f64,
+            )));
             let element = TextureRenderElement::from_static_texture(
                 Id::new(),
                 renderer.context_id(),
@@ -56,7 +67,7 @@ pub fn build(stack: &HutStack, output_size: (i32, i32), renderer: &GlesRenderer)
                 1,
                 Transform::Normal,
                 None,
-                None,
+                Some(src),
                 Some(Size::from(THUMB_SIZE)),
                 None,
                 Kind::Unspecified,

@@ -18,7 +18,7 @@ use alacritty_terminal::event::{
     Event as AlacrittyEvent, EventListener, Notify, OnResize, WindowSize,
 };
 use alacritty_terminal::event_loop::{EventLoop as PtyEventLoop, Notifier};
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::tty;
@@ -223,6 +223,14 @@ impl Terminal {
 
     pub fn clear_selection(&self) {
         self.term.lock().selection = None;
+    }
+
+    /// Scroll the scrollback view by `lines` (positive moves further up
+    /// into history, negative moves back down toward the live bottom) —
+    /// for mouse-wheel scrolling when the running program hasn't grabbed
+    /// the mouse itself (see [`Self::wants_mouse_reports`]).
+    pub fn scroll(&self, lines: i32) {
+        self.term.lock().scroll_display(Scroll::Delta(lines));
     }
 
     pub fn has_selection(&self) -> bool {

@@ -9,6 +9,7 @@ use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::winit::{self, WinitEvent};
 use smithay::desktop::space::space_render_elements;
+use smithay::input::keyboard::KeyboardSource;
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::calloop::ping::PingSource;
@@ -16,6 +17,7 @@ use smithay::utils::Transform;
 
 use crate::State;
 use crate::chrome;
+use crate::handlers::xdg_shell;
 use crate::render::OutputRenderElements;
 use crate::switcher;
 
@@ -89,6 +91,13 @@ pub fn init_winit(
                         None,
                         None,
                     );
+                    // `new_toplevel`'s fullscreen size hint is only ever
+                    // sent once, at creation — already-mapped Main
+                    // Windows (visible or not) need a fresh configure to
+                    // actually resize when the output does.
+                    let scale = output.current_scale().fractional_scale();
+                    let logical_size = size.to_f64().to_logical(scale).to_i32_round();
+                    xdg_shell::resize_all_main_windows(&state.stack, logical_size);
                     backend.borrow().window().request_redraw();
                 }
                 WinitEvent::Input(event) => {
@@ -230,6 +239,25 @@ pub fn init_winit(
                     state.space.refresh();
                     state.popups.cleanup();
                     let _ = state.display_handle.flush_clients();
+                }
+                WinitEvent::Focus(false) => {
+                    // The nested window just lost keyboard focus at the
+                    // host level (e.g. the host compositor's own Alt+Tab,
+                    // or the user clicking elsewhere on the real desktop).
+                    // Wayland only ever delivers key events to whichever
+                    // surface currently holds focus, so any modifier
+                    // *release* that happens while we're unfocused never
+                    // reaches us — our internal xkb tracking would then
+                    // permanently believe that modifier is still held,
+                    // silently breaking every keybinding match that
+                    // requires it to be released (this matched the exact
+                    // symptom reported: Ctrl+`/Alt+[/Alt+] intermittently
+                    // "stopped working" and fell through to raw terminal
+                    // encoding). Release everything now rather than carry
+                    // a stuck bit forward.
+                    if let Some(keyboard) = state.seat.get_keyboard() {
+                        keyboard.release_source(state, KeyboardSource::MAIN);
+                    }
                 }
                 WinitEvent::CloseRequested => {
                     state.loop_signal.stop();

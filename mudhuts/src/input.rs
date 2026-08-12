@@ -452,26 +452,41 @@ impl State {
                     }
                 }
 
-                if self.showing_terminal_effective()
-                    && vertical_amount != 0.0
-                    && let Some(pointer) = self.seat.get_pointer()
-                    && self.stack.focused().terminal.wants_mouse_reports()
-                {
-                    let pos = pointer.current_location();
-                    let (col, row, _) = self.stack.focused().pixel_to_cell(pos.x, pos.y);
-                    let mods = self.current_mods();
-                    let wheel_button = if vertical_amount > 0.0 {
-                        mudhuts_term::mouse::BUTTON_WHEEL_DOWN
+                if self.showing_terminal_effective() && vertical_amount != 0.0 {
+                    if self.stack.focused().terminal.wants_mouse_reports() {
+                        if let Some(pointer) = self.seat.get_pointer() {
+                            let pos = pointer.current_location();
+                            let (col, row, _) = self.stack.focused().pixel_to_cell(pos.x, pos.y);
+                            let mods = self.current_mods();
+                            let wheel_button = if vertical_amount > 0.0 {
+                                mudhuts_term::mouse::BUTTON_WHEEL_DOWN
+                            } else {
+                                mudhuts_term::mouse::BUTTON_WHEEL_UP
+                            };
+                            self.stack.focused().terminal.report_mouse_button(
+                                wheel_button,
+                                mods,
+                                true,
+                                col + 1,
+                                row + 1,
+                            );
+                        }
                     } else {
-                        mudhuts_term::mouse::BUTTON_WHEEL_UP
-                    };
-                    self.stack.focused().terminal.report_mouse_button(
-                        wheel_button,
-                        mods,
-                        true,
-                        col + 1,
-                        row + 1,
-                    );
+                        // No app has grabbed the mouse — scroll this
+                        // Hut's own scrollback instead of doing nothing.
+                        // `vertical_amount > 0.0` is "scroll down" (same
+                        // convention as the wheel-report mapping above);
+                        // `Terminal::scroll`'s sign is the opposite
+                        // (positive moves further *up* into history).
+                        let lines = -(vertical_amount / 15.0 * 3.0).round() as i32;
+                        let lines = if lines != 0 {
+                            lines
+                        } else {
+                            -vertical_amount.signum() as i32
+                        };
+                        self.stack.focused().terminal.scroll(lines);
+                        self.request_redraw();
+                    }
                 }
 
                 let Some(pointer) = self.seat.get_pointer() else {
