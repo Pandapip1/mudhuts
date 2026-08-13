@@ -34,6 +34,13 @@ pub enum Action {
     /// Close the focused client window. Implemented now — doesn't depend
     /// on later phases.
     CloseFocused,
+    /// Copy the terminal's current text selection (if any) to the regular
+    /// clipboard (`wl_data_device`/`ext_data_control`), not primary — see
+    /// `input.rs`'s `PointerButton` handler for the separate, automatic
+    /// "selecting = copy to primary" path that needs no keybinding at all.
+    /// Bound to `Ctrl+Shift+C` rather than plain `Ctrl+C`, which is already
+    /// SIGINT inside the terminal.
+    CopySelection,
 }
 
 /// `(config key, default chord, action)` — the single source of truth for
@@ -47,6 +54,7 @@ const DEFAULTS: &[(&str, &str, Action)] = &[
     ("wrap-tab", "Meta+Shift+T", Action::WrapTab),
     ("wrap-tile", "Meta+Shift+V", Action::WrapTile),
     ("close-focused", "Meta+Shift+Q", Action::CloseFocused),
+    ("copy-selection", "Ctrl+Shift+C", Action::CopySelection),
 ];
 
 fn action_by_name(name: &str) -> Option<Action> {

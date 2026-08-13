@@ -19,6 +19,8 @@ use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
 use smithay::wayland::foreign_toplevel_list::ForeignToplevelListState;
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
+use smithay::wayland::selection::ext_data_control::DataControlState;
+use smithay::wayland::selection::primary_selection::PrimarySelectionState;
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::socket::ListeningSocketSource;
@@ -53,6 +55,22 @@ pub struct State {
     pub output_manager_state: OutputManagerState,
     pub seat_state: SeatState<State>,
     pub data_device_state: DataDeviceState,
+    /// `zwp_primary_selection_v1` — the X11-style "select text = copy to
+    /// primary" selection, independent of the regular clipboard (see
+    /// `input.rs`'s `PointerButton` handler, which commits to this on
+    /// every completed drag-selection, vs. an explicit copy keybinding for
+    /// `data_device_state` above). Shares its per-seat storage with
+    /// `data_device_state` under the hood (both just set fields on the
+    /// same `SeatData`) — this is a second protocol surface, not a second
+    /// independent selection system.
+    pub primary_selection_state: PrimarySelectionState,
+    /// `ext_data_control_v1` — lets a privileged client (a clipboard
+    /// manager/history tool) see and set *both* selections above on this
+    /// seat's behalf, rather than just this compositor. Reuses
+    /// `set_data_device_selection`/`set_primary_selection` for the
+    /// "compositor sets a selection" direction; there's no separate setter
+    /// for data-control specifically (see `handlers/mod.rs`'s module doc).
+    pub data_control_state: DataControlState,
     pub popups: PopupManager,
 
     pub seat: Seat<Self>,
@@ -161,6 +179,12 @@ impl State {
         let popups = PopupManager::default();
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
         let data_device_state = DataDeviceState::new::<Self>(&dh);
+        let primary_selection_state = PrimarySelectionState::new::<Self>(&dh);
+        // Order matters: this constructor borrows `primary_selection_state`
+        // to decide whether to advertise primary-selection support to
+        // data-control clients too, so it must come after.
+        let data_control_state =
+            DataControlState::new::<Self, _>(&dh, Some(&primary_selection_state), |_| true);
         dh.create_global::<Self, mudhuts_protocols::server::mudhuts_shell_v1::MudhutsShellV1, _>(
             2,
             smithay::wayland::GlobalData,
@@ -193,6 +217,8 @@ impl State {
             output_manager_state,
             seat_state,
             data_device_state,
+            primary_selection_state,
+            data_control_state,
             popups,
             seat,
             stack,
