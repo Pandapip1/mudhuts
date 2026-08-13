@@ -17,6 +17,9 @@ use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
 use crate::render::OutputRenderElements;
 use crate::stack::HutStack;
 
+/// Base sizes (scale 1.0) — scaled via `crate::render::scaled` wherever
+/// they're actually used, so the popup stays the same apparent size
+/// regardless of the output's real DPI scale.
 const THUMB_SIZE: (i32, i32) = (220, 140);
 const GAP: i32 = 20;
 const PADDING: i32 = 24;
@@ -33,9 +36,20 @@ pub fn build(stack: &HutStack, output_size: (i32, i32), renderer: &GlesRenderer,
         return Vec::new();
     }
 
+    // Physical-pixel math throughout this function (panel/thumbnail
+    // positions, the highlight border) — `crate::render::scaled` applied
+    // directly, since none of it flows through an `Element::geometry`
+    // call that would otherwise re-apply the output scale on its own
+    // (unlike the thumbnail's own `size` below).
+    let thumb_w = crate::render::scaled(THUMB_SIZE.0, scale);
+    let thumb_h = crate::render::scaled(THUMB_SIZE.1, scale);
+    let gap = crate::render::scaled(GAP, scale);
+    let padding = crate::render::scaled(PADDING, scale);
+    let highlight_margin = crate::render::scaled(HIGHLIGHT_MARGIN, scale);
+
     let count = stack.len().max(1) as i32;
-    let panel_w = count * THUMB_SIZE.0 + (count - 1).max(0) * GAP + 2 * PADDING;
-    let panel_h = THUMB_SIZE.1 + 2 * PADDING;
+    let panel_w = count * thumb_w + (count - 1).max(0) * gap + 2 * padding;
+    let panel_h = thumb_h + 2 * padding;
     let panel_x = (output_size.0 - panel_w) / 2;
     let panel_y = (output_size.1 - panel_h) / 2;
 
@@ -43,8 +57,8 @@ pub fn build(stack: &HutStack, output_size: (i32, i32), renderer: &GlesRenderer,
     let mut elements = Vec::new();
 
     for (i, hut) in stack.top_level_huts().enumerate() {
-        let x = panel_x + PADDING + i as i32 * (THUMB_SIZE.0 + GAP);
-        let y = panel_y + PADDING;
+        let x = panel_x + padding + i as i32 * (thumb_w + gap);
+        let y = panel_y + padding;
 
         if let Some(texture) = hut.cached_texture() {
             // `size` below is the *destination* size (the thumbnail) —
@@ -62,14 +76,18 @@ pub fn build(stack: &HutStack, output_size: (i32, i32), renderer: &GlesRenderer,
             // wraps the same ever-changing terminal content as the main
             // render element (see `Hut::damage_tracker`'s doc comment),
             // just scaled down.
-            // `THUMB_SIZE` is a physical-pixel on-screen size (see this
-            // module's other constants) — divided by `scale` here for the
-            // same reason `render.rs`'s `physical_element_size` exists:
+            //
+            // The *base* (unscaled) `THUMB_SIZE`, not `thumb_w`/`thumb_h`
+            // above — this `size` is a `Logical` destination override, and
             // `Element::geometry(scale)` re-applies the output's scale to
-            // whatever `size` this element is given, so passing
-            // `THUMB_SIZE` directly would render the thumbnail at
-            // `THUMB_SIZE * scale` physical pixels instead.
-            let thumb_size = crate::render::physical_element_size(THUMB_SIZE.0, THUMB_SIZE.1, scale);
+            // it automatically. Passing the already-scaled physical size
+            // here would double-apply `scale` (see
+            // `render::texture_buffer_scale`'s doc comment for the same
+            // trap in a different guise). The surrounding physical-pixel
+            // math above (`thumb_w`/`thumb_h`, used for *position* only)
+            // has to stay scaled itself since `location` is taken
+            // literally, unlike `size`.
+            let thumb_size = Size::from(THUMB_SIZE);
             let element = TextureRenderElement::from_texture_with_damage(
                 hut.thumbnail_id.clone(),
                 renderer.context_id(),
@@ -89,11 +107,8 @@ pub fn build(stack: &HutStack, output_size: (i32, i32), renderer: &GlesRenderer,
 
         if i == preview_index {
             let geometry = Rectangle::<i32, Physical>::new(
-                Point::from((x - HIGHLIGHT_MARGIN, y - HIGHLIGHT_MARGIN)),
-                Size::from((
-                    THUMB_SIZE.0 + 2 * HIGHLIGHT_MARGIN,
-                    THUMB_SIZE.1 + 2 * HIGHLIGHT_MARGIN,
-                )),
+                Point::from((x - highlight_margin, y - highlight_margin)),
+                Size::from((thumb_w + 2 * highlight_margin, thumb_h + 2 * highlight_margin)),
             );
             let highlight = SolidColorRenderElement::new(
                 hut.thumbnail_highlight_id.clone(),

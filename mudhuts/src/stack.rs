@@ -46,6 +46,12 @@ pub struct HutStack {
     /// `Hut::spawn`'s doc comment for why this can't just be `main`'s own
     /// process env.
     extra_env: Vec<(String, String)>,
+    /// The real output scale every *newly*-spawned Hut (`wrap_tab`/
+    /// `wrap_tile`/`spawn_and_insert`) should start at. Starts at `1.0`
+    /// (matching `main.rs`'s pre-backend initial spawn) and is updated
+    /// once, by [`Self::rescale_all`], the moment the real value becomes
+    /// known — see that method's doc comment.
+    scale: f64,
 }
 
 impl HutStack {
@@ -64,6 +70,7 @@ impl HutStack {
             panel_id: Id::new(),
             loop_handle,
             extra_env,
+            scale: 1.0,
         };
         let id = stack.villages[0].focused_hut().id;
         stack.insert_channel(id, first_events)?;
@@ -147,6 +154,23 @@ impl HutStack {
         }
     }
 
+    /// Catch every already-spawned Hut up to the real output scale, the
+    /// first (and only) time it becomes known — `main.rs` spawns the
+    /// initial Hut before any backend/output exists, so it and anything
+    /// spawned before this call started at scale 1.0 (see `Hut::rescale`'s
+    /// doc comment). Called once, right after `winit_backend.rs`/
+    /// `udev_backend.rs` learn the output's real scale, before the first
+    /// real frame renders. Also remembered here so every *later*
+    /// `wrap_tab`/`wrap_tile`/`spawn_and_insert` spawn starts at the right
+    /// scale from birth instead of needing this same catch-up.
+    pub fn rescale_all(&mut self, scale: f64) -> Result<(), String> {
+        self.scale = scale;
+        for hut in self.all_huts_mut() {
+            hut.rescale(scale)?;
+        }
+        Ok(())
+    }
+
     /// Meta+Left/Right's bubble-up step, once the focused Hut's own Main
     /// Window tabs have already been ruled out (fewer than 2 — see
     /// `input.rs`) — see [`Village::cycle_innermost`].
@@ -170,7 +194,7 @@ impl HutStack {
     /// `current` doesn't follow a preview session until it's committed).
     pub fn wrap_tab(&mut self) -> Result<(), String> {
         self.commit_preview();
-        let (hut, events) = Hut::spawn(self.extra_env.clone())?;
+        let (hut, events) = Hut::spawn(self.extra_env.clone(), self.scale)?;
         let id = hut.id;
         self.villages[self.current].wrap_focused(|old| Village::wrap_tab(Village::Hut(Box::new(hut)), old));
         self.insert_channel(id, events)
@@ -180,7 +204,7 @@ impl HutStack {
     /// Tile-Village instead.
     pub fn wrap_tile(&mut self) -> Result<(), String> {
         self.commit_preview();
-        let (hut, events) = Hut::spawn(self.extra_env.clone())?;
+        let (hut, events) = Hut::spawn(self.extra_env.clone(), self.scale)?;
         let id = hut.id;
         self.villages[self.current]
             .wrap_focused(|old| Village::wrap_tile(Village::Hut(Box::new(hut)), old, Axis::Horizontal));
@@ -199,7 +223,7 @@ impl HutStack {
     }
 
     fn spawn_and_insert(&mut self) -> Result<(), String> {
-        let (hut, events) = Hut::spawn(self.extra_env.clone())?;
+        let (hut, events) = Hut::spawn(self.extra_env.clone(), self.scale)?;
         let id = hut.id;
         self.insert_channel(id, events)?;
         self.villages.push(Village::Hut(Box::new(hut)));
@@ -388,7 +412,7 @@ mod tests {
     }
 
     fn new_stack() -> HutStack {
-        let (hut, events) = Hut::spawn(std::iter::empty()).unwrap();
+        let (hut, events) = Hut::spawn(std::iter::empty(), 1.0).unwrap();
         HutStack::new(hut, events, loop_handle(), Vec::new()).unwrap()
     }
 

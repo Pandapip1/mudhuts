@@ -21,6 +21,9 @@ use mudhuts_term::palette::Rgb;
 use crate::hut::Hut;
 use crate::render::OutputRenderElements;
 
+/// Base sizes (scale 1.0) — scaled via `crate::render::scaled` wherever
+/// they're actually used, so this chrome stays the same apparent size
+/// regardless of the output's real DPI scale.
 const TAB_PADDING: i32 = 12;
 const TAB_GAP: i32 = 4;
 const LEFT_MARGIN: i32 = 16;
@@ -96,11 +99,11 @@ pub(crate) fn to_color32f(rgb: Rgb) -> [f32; 4] {
 /// to show (no Main Windows), so callers (`render.rs`'s Village-level
 /// stacking, `input.rs`'s click hit-testing) don't need their own
 /// separate "is there a strip at all" check.
-pub fn strip_height(hut: &Hut) -> i32 {
+pub fn strip_height(hut: &Hut, scale: f64) -> i32 {
     if hut.main_window_count() == 0 {
         return 0;
     }
-    hut.glyphs.cell_height().max(1) as i32 + TAB_PADDING * 2
+    hut.glyphs.cell_height().max(1) as i32 + crate::render::scaled(TAB_PADDING, scale) * 2
 }
 
 /// One tab's clickable/drawable rectangle, plus which tab it is — `0` is
@@ -117,26 +120,28 @@ pub struct TabRect {
 /// `y` (pushed down by however many Village-level tab strips are stacked
 /// above it — see `village_chrome.rs`'s module doc) — empty if there's
 /// nothing to show.
-pub fn tab_layout(hut: &Hut, y: i32) -> Vec<TabRect> {
+pub fn tab_layout(hut: &Hut, y: i32, scale: f64) -> Vec<TabRect> {
     if hut.main_window_count() == 0 {
         return Vec::new();
     }
     let cell_w = hut.glyphs.cell_width().max(1);
-    let tab_h = strip_height(hut);
+    let tab_h = strip_height(hut, scale);
+    let padding = crate::render::scaled(TAB_PADDING, scale);
+    let gap = crate::render::scaled(TAB_GAP, scale);
 
     let mut labels = vec!["Terminal".to_string()];
     labels.extend(hut.main_windows().iter().map(|entry| window_title(&entry.window)));
 
     let mut rects = Vec::new();
-    let mut x = LEFT_MARGIN;
+    let mut x = crate::render::scaled(LEFT_MARGIN, scale);
     for (i, label) in labels.iter().enumerate() {
         let label_w = (label.chars().count().max(1) * cell_w) as i32;
-        let tab_w = label_w + TAB_PADDING * 2;
+        let tab_w = label_w + padding * 2;
         rects.push(TabRect {
             index: i,
             rect: Rectangle::new(Point::from((x, y)), Size::from((tab_w, tab_h))),
         });
-        x += tab_w + TAB_GAP;
+        x += tab_w + gap;
     }
     rects
 }
@@ -145,10 +150,11 @@ pub fn tab_layout(hut: &Hut, y: i32) -> Vec<TabRect> {
 /// at physical-pixel row `y`, or an empty list if the focused Hut has no
 /// Main Windows.
 pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer, y: i32, scale: f64) -> Vec<Element> {
-    let rects = tab_layout(hut, y);
+    let rects = tab_layout(hut, y, scale);
     if rects.is_empty() {
         return Vec::new();
     }
+    let padding = crate::render::scaled(TAB_PADDING, scale);
 
     let active_index = if hut.showing_terminal {
         0
@@ -210,8 +216,8 @@ pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer, y: i32, scale: f64) -> 
                     text_ids[i].clone(),
                     renderer.context_id(),
                     (
-                        (rect.loc.x + TAB_PADDING) as f64,
-                        (rect.loc.y + TAB_PADDING) as f64,
+                        (rect.loc.x + padding) as f64,
+                        (rect.loc.y + padding) as f64,
                     ),
                     texture,
                     crate::render::texture_buffer_scale(scale),

@@ -98,7 +98,7 @@ mod tests {
     }
 
     fn new_stack() -> HutStack {
-        let (hut, events) = Hut::spawn(std::iter::empty()).unwrap();
+        let (hut, events) = Hut::spawn(std::iter::empty(), 1.0).unwrap();
         HutStack::new(hut, events, loop_handle(), Vec::new()).unwrap()
     }
 

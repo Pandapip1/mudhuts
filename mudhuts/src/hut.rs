@@ -137,6 +137,7 @@ impl Hut {
     /// exit).
     pub fn spawn(
         extra_env: impl IntoIterator<Item = (String, String)>,
+        scale: f64,
     ) -> Result<
         (
             Hut,
@@ -145,7 +146,7 @@ impl Hut {
         String,
     > {
         let id = next_hut_id();
-        let glyphs = GlyphCache::new()?;
+        let glyphs = GlyphCache::new(scale)?;
         let cell_size = (glyphs.cell_width() as u16, glyphs.cell_height() as u16);
         let extra_env = extra_env
             .into_iter()
@@ -429,6 +430,34 @@ impl Hut {
         let lines = (height.max(0) as usize / cell_h).max(1);
         self.terminal
             .resize(cols, lines, (cell_w as u16, cell_h as u16));
+    }
+
+    /// Rebuild this Hut's glyph cache for a newly-known real output scale,
+    /// re-deriving its terminal grid's cols/lines from the new cell size
+    /// at the same physical `pixel_size`, and dropping its GPU glyph atlas
+    /// (`gpu`/`label_renderer`) so it's rebuilt from scratch at the new
+    /// glyph size the next time this Hut is drawn — a `GlyphCache` can't
+    /// be rescaled in place (see its own doc comment: every cached glyph
+    /// bitmap was rasterized at the size it was built for).
+    ///
+    /// Only ever needed once per Hut, right after the real output scale
+    /// becomes known for the first time — `main.rs` spawns the very first
+    /// Hut before any backend/output exists yet (so it starts at scale
+    /// 1.0), and this is what catches it up once `winit_backend.rs`/
+    /// `udev_backend.rs` learn the real value (see `HutStack::rescale_all`).
+    pub fn rescale(&mut self, scale: f64) -> Result<(), String> {
+        self.glyphs = GlyphCache::new(scale)?;
+        self.gpu = None;
+        self.label_renderer = None;
+
+        let (width, height) = self.pixel_size;
+        let cell_w = self.glyphs.cell_width().max(1);
+        let cell_h = self.glyphs.cell_height().max(1);
+        let cols = (width.max(0) as usize / cell_w).max(1);
+        let lines = (height.max(0) as usize / cell_h).max(1);
+        self.terminal
+            .resize(cols, lines, (cell_w as u16, cell_h as u16));
+        Ok(())
     }
 
     /// Convert a pixel position (relative to the Hut's own buffer, i.e.

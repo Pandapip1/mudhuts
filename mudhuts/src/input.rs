@@ -311,6 +311,7 @@ impl State {
 
         let cell_w = self.stack.focused().glyphs.cell_width().max(1);
         let cell_h = self.stack.focused().glyphs.cell_height().max(1) as i32;
+        let scale = self.output_scale();
 
         if village_chrome::handle_click(
             self.stack.focused_village_mut(),
@@ -318,6 +319,7 @@ impl State {
             0,
             cell_w,
             cell_h,
+            scale,
         ) {
             self.sync_visible_main_window();
             self.sync_keyboard_focus_to_view();
@@ -325,8 +327,8 @@ impl State {
             return true;
         }
 
-        let strip_y = village_chrome::stack_height(self.stack.focused_village(), cell_h);
-        let hit = chrome::tab_layout(self.stack.focused(), strip_y)
+        let strip_y = village_chrome::stack_height(self.stack.focused_village(), cell_h, scale);
+        let hit = chrome::tab_layout(self.stack.focused(), strip_y, scale)
             .into_iter()
             .find(|t| t.rect.contains(pixel));
         if let Some(hit) = hit {

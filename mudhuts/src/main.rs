@@ -85,7 +85,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // runs below.
     let socket_name = socket.1.to_string_lossy().into_owned();
     let extra_env = vec![("WAYLAND_DISPLAY".to_string(), socket_name.clone())];
-    let (hut, term_events) = hut::Hut::spawn(extra_env.clone())?;
+    // Spawned before any backend/output exists, so the real scale isn't
+    // known yet — starts at 1.0 and gets caught up by
+    // `HutStack::rescale_all` once `init_udev`/`init_winit` below learn
+    // the real value (see `Hut::rescale`'s doc comment).
+    let (hut, term_events) = hut::Hut::spawn(extra_env.clone(), 1.0)?;
 
     let (redraw_ping, redraw_ping_source) = smithay::reexports::calloop::ping::make_ping()?;
     let loop_handle = event_loop.handle();

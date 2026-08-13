@@ -28,6 +28,8 @@ use crate::chrome::{to_color32f, window_title};
 use crate::render::{ChangeTracker, LabelCache, OutputRenderElements};
 use crate::village::Village;
 
+/// Base sizes (scale 1.0) — scaled via `crate::render::scaled` wherever
+/// they're actually used, matching `chrome.rs`'s own constants.
 const TAB_PADDING: i32 = 12;
 const TAB_GAP: i32 = 4;
 const LEFT_MARGIN: i32 = 16;
@@ -68,26 +70,28 @@ fn child_label(village: &Village) -> String {
     "Terminal".to_string()
 }
 
-fn tab_h(cell_h: i32) -> i32 {
-    cell_h + TAB_PADDING * 2
+fn tab_h(cell_h: i32, scale: f64) -> i32 {
+    cell_h + crate::render::scaled(TAB_PADDING, scale) * 2
 }
 
 /// One Tab-Village level's tab rects, at physical-pixel row `y` — shared
 /// between rendering and click hit-testing (see this module's doc), so
 /// the two can never disagree about where a tab actually is.
-fn level_layout(children: &[Village], y: i32, cell_w: usize, cell_h: i32) -> Vec<TabRect> {
-    let h = tab_h(cell_h);
+fn level_layout(children: &[Village], y: i32, cell_w: usize, cell_h: i32, scale: f64) -> Vec<TabRect> {
+    let h = tab_h(cell_h, scale);
+    let padding = crate::render::scaled(TAB_PADDING, scale);
+    let gap = crate::render::scaled(TAB_GAP, scale);
     let mut rects = Vec::new();
-    let mut x = LEFT_MARGIN;
+    let mut x = crate::render::scaled(LEFT_MARGIN, scale);
     for (i, child) in children.iter().enumerate() {
         let label = child_label(child);
         let label_w = (label.chars().count().max(1) * cell_w) as i32;
-        let tab_w = label_w + TAB_PADDING * 2;
+        let tab_w = label_w + padding * 2;
         rects.push(TabRect {
             index: i,
             rect: Rectangle::new(Point::from((x, y)), Size::from((tab_w, h))),
         });
-        x += tab_w + TAB_GAP;
+        x += tab_w + gap;
     }
     rects
 }
@@ -97,10 +101,10 @@ fn level_layout(children: &[Village], y: i32, cell_w: usize, cell_h: i32) -> Vec
 /// 2+ children (nothing to stack). Used by `render.rs` to know where
 /// `chrome.rs`'s own strip (and, when not tiled/tabbed at all, the
 /// terminal/window content itself) should start.
-pub fn stack_height(village: &Village, cell_h: i32) -> i32 {
+pub fn stack_height(village: &Village, cell_h: i32, scale: f64) -> i32 {
     match village {
         Village::Tab(tab) if tab.children.len() >= 2 => {
-            tab_h(cell_h) + stack_height(&tab.children[tab.active], cell_h)
+            tab_h(cell_h, scale) + stack_height(&tab.children[tab.active], cell_h, scale)
         }
         _ => 0,
     }
@@ -112,7 +116,14 @@ pub fn stack_height(village: &Village, cell_h: i32) -> i32 {
 /// returns `true` (the caller should re-sync visible content/focus and
 /// redraw); `false` if the click didn't land on any Village-level tab —
 /// the tile-pane/Hut-level click handling should take over instead.
-pub fn handle_click(village: &mut Village, pos: (i32, i32), y: i32, cell_w: usize, cell_h: i32) -> bool {
+pub fn handle_click(
+    village: &mut Village,
+    pos: (i32, i32),
+    y: i32,
+    cell_w: usize,
+    cell_h: i32,
+    scale: f64,
+) -> bool {
     let Village::Tab(tab) = village else {
         return false;
     };
@@ -120,13 +131,20 @@ pub fn handle_click(village: &mut Village, pos: (i32, i32), y: i32, cell_w: usiz
         return false;
     }
     let point = Point::from(pos);
-    for TabRect { index: i, rect } in level_layout(&tab.children, y, cell_w, cell_h) {
+    for TabRect { index: i, rect } in level_layout(&tab.children, y, cell_w, cell_h, scale) {
         if rect.contains(point) {
             tab.active = i;
             return true;
         }
     }
-    handle_click(&mut tab.children[tab.active], pos, y + tab_h(cell_h), cell_w, cell_h)
+    handle_click(
+        &mut tab.children[tab.active],
+        pos,
+        y + tab_h(cell_h, scale),
+        cell_w,
+        cell_h,
+        scale,
+    )
 }
 
 /// Build the Village-level tab-strip stack's render elements, recursing
@@ -159,7 +177,8 @@ pub fn build(
         tab.bg_tracker.push(ChangeTracker::new());
     }
 
-    let rects = level_layout(&tab.children, y, cell_w, cell_h);
+    let rects = level_layout(&tab.children, y, cell_w, cell_h, scale);
+    let padding = crate::render::scaled(TAB_PADDING, scale);
     let mut elements = Vec::new();
     for TabRect { index: i, rect } in rects {
         let active = i == tab.active;
@@ -193,8 +212,8 @@ pub fn build(
                     text_id,
                     renderer.context_id(),
                     (
-                        (rect.loc.x + TAB_PADDING) as f64,
-                        (rect.loc.y + TAB_PADDING) as f64,
+                        (rect.loc.x + padding) as f64,
+                        (rect.loc.y + padding) as f64,
                     ),
                     texture,
                     crate::render::texture_buffer_scale(scale),
@@ -219,7 +238,7 @@ pub fn build(
     let (deeper_elements, next_y) = build(
         &mut tab.children[tab.active],
         renderer,
-        y + tab_h(cell_h),
+        y + tab_h(cell_h, scale),
         cell_w,
         cell_h,
         scale,

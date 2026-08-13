@@ -56,25 +56,14 @@ pub(crate) fn texture_buffer_scale(scale: f64) -> i32 {
     scale.round().max(1.0) as i32
 }
 
-/// Convert a physical-pixel destination size into the `Logical` `size`
-/// override a [`TextureRenderElement`] needs when it *also* sets an
-/// explicit `src` covering the texture's full real pixel dimensions (see
-/// `switcher.rs`'s thumbnail, the one call site that needs this) — safe
-/// specifically because an explicit `src` makes `Element::src()` ignore
-/// `logical_size()`/`self.size` entirely, so shrinking `size` here only
-/// affects `geometry()`'s destination rect, not the sampled region (see
-/// [`texture_buffer_scale`]'s doc comment for the call sites where that
-/// isn't true, and why they need the buffer-scale argument instead of
-/// this).
-pub(crate) fn physical_element_size(
-    physical_w: i32,
-    physical_h: i32,
-    scale: f64,
-) -> smithay::utils::Size<i32, smithay::utils::Logical> {
-    smithay::utils::Size::from((
-        ((physical_w as f64) / scale).round() as i32,
-        ((physical_h as f64) / scale).round() as i32,
-    ))
+/// Scale a hand-tuned chrome constant (padding, margin, handle size, ...)
+/// so it stays the same *apparent* size regardless of the output's real
+/// DPI scale, instead of the same fixed physical-pixel count everywhere —
+/// used by `chrome.rs`/`village_chrome.rs`/`docks.rs`/`switcher.rs`/this
+/// module's own tile-pane border, wherever a constant was previously a
+/// bare physical-pixel literal.
+pub(crate) fn scaled(px: i32, scale: f64) -> i32 {
+    ((px as f64) * scale).round() as i32
 }
 
 /// Tracks whether some comparable value changed since the last check,
@@ -482,13 +471,14 @@ fn build_tile_elements(
     // around the pane's edges, since a single filled rectangle would
     // just hide its content instead of framing it.
     if let Some(&(x, y, w, h)) = rects.get(active) {
-        const BORDER: i32 = 3;
+        const BASE_BORDER: i32 = 3;
+        let border = scaled(BASE_BORDER, scale).max(1);
         let color = [0.3, 0.6, 1.0, 1.0];
         let strips = [
-            (x, y, w, BORDER),               // top
-            (x, y + h - BORDER, w, BORDER),  // bottom
-            (x, y, BORDER, h),               // left
-            (x + w - BORDER, y, BORDER, h),  // right
+            (x, y, w, border),                // top
+            (x, y + h - border, w, border),   // bottom
+            (x, y, border, h),                // left
+            (x + w - border, y, border, h),   // right
         ];
         for (id, (sx, sy, sw, sh)) in highlight_ids.into_iter().zip(strips) {
             let background = SolidColorRenderElement::new(

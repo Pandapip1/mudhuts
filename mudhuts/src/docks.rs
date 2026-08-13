@@ -41,6 +41,10 @@ use crate::hut::Hut;
 use crate::main_window::{Dock, Edge};
 use crate::render::OutputRenderElements;
 
+/// Base sizes (scale 1.0) — scaled via `crate::render::scaled` (or, for
+/// the `f64` threshold, a plain multiply) wherever they're actually used,
+/// so this chrome stays the same apparent size regardless of the output's
+/// real DPI scale.
 const HANDLE_W: i32 = 140;
 const HANDLE_H: i32 = 28;
 const HANDLE_GAP: i32 = 4;
@@ -88,11 +92,15 @@ pub struct Handle {
 /// Sub-Window handles currently are. Empty if the terminal is showing or
 /// there's no active Main Window — handles only make sense alongside the
 /// Main Window they belong to.
-pub fn handle_layout(hut: &Hut, output_size: (i32, i32)) -> Vec<Handle> {
+pub fn handle_layout(hut: &Hut, output_size: (i32, i32), scale: f64) -> Vec<Handle> {
     let Some(entry) = hut.active_main_window_entry() else {
         return Vec::new();
     };
     let (output_w, output_h) = output_size;
+    let handle_w = crate::render::scaled(HANDLE_W, scale);
+    let handle_h = crate::render::scaled(HANDLE_H, scale);
+    let handle_gap = crate::render::scaled(HANDLE_GAP, scale);
+    let edge_margin = crate::render::scaled(EDGE_MARGIN, scale);
 
     let mut handles = Vec::new();
     for edge in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom] {
@@ -103,17 +111,17 @@ pub fn handle_layout(hut: &Hut, output_size: (i32, i32)) -> Vec<Handle> {
         for (n, sub) in docked_on_edge.enumerate() {
             let step = n as i32;
             let (x, y) = match edge {
-                Edge::Left => (0, EDGE_MARGIN + step * (HANDLE_H + HANDLE_GAP)),
-                Edge::Right => (output_w - HANDLE_W, EDGE_MARGIN + step * (HANDLE_H + HANDLE_GAP)),
-                Edge::Top => (EDGE_MARGIN + step * (HANDLE_W + HANDLE_GAP), 0),
-                Edge::Bottom => (EDGE_MARGIN + step * (HANDLE_W + HANDLE_GAP), output_h - HANDLE_H),
+                Edge::Left => (0, edge_margin + step * (handle_h + handle_gap)),
+                Edge::Right => (output_w - handle_w, edge_margin + step * (handle_h + handle_gap)),
+                Edge::Top => (edge_margin + step * (handle_w + handle_gap), 0),
+                Edge::Bottom => (edge_margin + step * (handle_w + handle_gap), output_h - handle_h),
             };
             let Some(toplevel) = sub.window.toplevel() else {
                 continue;
             };
             handles.push(Handle {
                 surface: toplevel.wl_surface().clone(),
-                rect: Rectangle::new(Point::from((x, y)), Size::from((HANDLE_W, HANDLE_H))),
+                rect: Rectangle::new(Point::from((x, y)), Size::from((handle_w, handle_h))),
                 title: window_title(&sub.window),
             });
         }
@@ -133,7 +141,8 @@ fn truncate(title: &str) -> String {
 /// Build the docked-handle chrome's render elements, or an empty list if
 /// there's nothing docked right now.
 pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer, output_size: (i32, i32), scale: f64) -> Vec<Element> {
-    let handles = handle_layout(hut, output_size);
+    let handles = handle_layout(hut, output_size, scale);
+    let text_inset = crate::render::scaled(6, scale);
     let mut elements = Vec::new();
 
     for handle in &handles {
@@ -174,8 +183,8 @@ pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer, output_size: (i32, i32)
                 text_id,
                 renderer.context_id(),
                 (
-                    (handle.rect.loc.x + 6) as f64,
-                    (handle.rect.loc.y + 6) as f64,
+                    (handle.rect.loc.x + text_inset) as f64,
+                    (handle.rect.loc.y + text_inset) as f64,
                 ),
                 texture,
                 crate::render::texture_buffer_scale(scale),
@@ -218,7 +227,7 @@ pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer, output_size: (i32, i32)
 /// physical, like [`Handle::rect`] — `input.rs` converts the seat's
 /// (genuinely Logical) pointer position before calling this.
 pub fn start_drag(state: &mut State, pos: Point<f64, Physical>) -> bool {
-    let handles = handle_layout(state.stack.focused(), state.output_size);
+    let handles = handle_layout(state.stack.focused(), state.output_size, state.output_scale());
     let Some(handle) = handles.into_iter().find(|h| h.rect.to_f64().contains(pos)) else {
         return false;
     };
@@ -248,7 +257,7 @@ pub fn advance_drag(state: &mut State, pos: Point<f64, Physical>) {
 
     if !detached {
         let delta = pos - start;
-        if delta.x.hypot(delta.y) <= DETACH_THRESHOLD {
+        if delta.x.hypot(delta.y) <= DETACH_THRESHOLD * state.output_scale() {
             return;
         }
         let logical = pos.to_logical(Scale::from(state.output_scale())).to_i32_round();

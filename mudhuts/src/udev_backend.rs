@@ -712,6 +712,12 @@ fn connector_connected(
 
     state.space.map_output(&output, (0, 0));
     state.output_size = (wl_mode.size.w, wl_mode.size.h);
+    // Catches up the initial Hut (spawned in `main.rs` before this
+    // backend existed, at scale 1.0) and remembers `scale` for every Hut
+    // spawned from here on — see `HutStack::rescale_all`'s doc comment.
+    if let Err(err) = state.stack.rescale_all(scale) {
+        tracing::warn!("failed to rescale initial Hut to real output scale: {err}");
+    }
     let (_, _, usable_w, usable_h) = state.usable_area();
     state.stack.resize_all(usable_w, usable_h);
     // Nothing else re-pushes capture buffer constraints when the output's

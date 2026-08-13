@@ -12,7 +12,9 @@ use alacritty_terminal::vte::ansi::CursorShape;
 
 use crate::palette::{self, Rgb};
 
-/// Point size used to rasterize glyphs. Cell geometry is derived from this.
+/// Base point size used to rasterize glyphs at scale 1.0 — [`GlyphCache::new`]
+/// multiplies this by the real output scale. Cell geometry is derived from
+/// the scaled result.
 const FONT_SIZE: f32 = 16.0;
 
 pub struct GlyphCache {
@@ -29,13 +31,24 @@ pub struct GlyphCache {
     /// frame it's drawn.
     fallback_for_char: HashMap<char, Option<std::path::PathBuf>>,
     cache: HashMap<(char, bool), (fontdue::Metrics, Vec<u8>)>,
+    /// `FONT_SIZE * scale` this cache was built for — every glyph in
+    /// `cache` was rasterized at this size, so it has to stay fixed for
+    /// this instance's lifetime (a scale change means a fresh `GlyphCache`,
+    /// not mutating this one — see `Hut::rescale`).
+    font_size: f32,
     cell_width: usize,
     cell_height: usize,
     baseline: usize,
 }
 
 impl GlyphCache {
-    pub fn new() -> Result<Self, String> {
+    /// `scale` is the output's real DPI scale (`1.0` on a standard-density
+    /// display) — multiplied into `FONT_SIZE` so text renders at the same
+    /// *apparent* size regardless of the panel's pixel density, not just
+    /// the same pixel count. See `mudhuts::hut::Hut::rescale`'s doc
+    /// comment for why the caller may not know the real value yet at
+    /// construction time and might rebuild this later.
+    pub fn new(scale: f64) -> Result<Self, String> {
         let fc = fontconfig::Fontconfig::new().ok_or("failed to initialize fontconfig")?;
         let regular_path = fc.find("monospace", None).map_err(|e| e.to_string())?.path;
         let bold_path = fc
@@ -52,9 +65,10 @@ impl GlyphCache {
         let regular = load(&regular_path)?;
         let bold = load(&bold_path).or_else(|_| load(&regular_path))?;
 
-        let advance = regular.metrics('M', FONT_SIZE).advance_width;
+        let font_size = FONT_SIZE * (scale.max(0.0) as f32);
+        let advance = regular.metrics('M', font_size).advance_width;
         let line_metrics = regular
-            .horizontal_line_metrics(FONT_SIZE)
+            .horizontal_line_metrics(font_size)
             .ok_or("font has no horizontal line metrics")?;
         let cell_width = advance.ceil().max(1.0) as usize;
         let cell_height = line_metrics.new_line_size.ceil().max(1.0) as usize;
@@ -67,6 +81,7 @@ impl GlyphCache {
             fallback_fonts: HashMap::new(),
             fallback_for_char: HashMap::new(),
             cache: HashMap::new(),
+            font_size,
             cell_width,
             cell_height,
             baseline,
@@ -140,7 +155,8 @@ impl GlyphCache {
     /// texture once per unique glyph instead of blitting it every frame.
     pub fn glyph(&mut self, c: char, bold: bool) -> &(fontdue::Metrics, Vec<u8>) {
         if !self.cache.contains_key(&(c, bold)) {
-            let rasterized = self.font_for_char(c, bold).rasterize(c, FONT_SIZE);
+            let font_size = self.font_size;
+            let rasterized = self.font_for_char(c, bold).rasterize(c, font_size);
             self.cache.insert((c, bold), rasterized);
         }
         // Unreachable in practice (just inserted above if missing), but
