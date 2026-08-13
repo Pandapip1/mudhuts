@@ -320,7 +320,11 @@ pub fn advance_drag(state: &mut State, pos: Point<f64, Physical>) {
 
     if let Some(window) = state.find_window_by_surface(&surface) {
         let logical = pos.to_logical(Scale::from(state.output_scale())).to_i32_round();
-        state.space.map_element(window, logical, true);
+        state
+            .stack
+            .focused_mut()
+            .space
+            .map_element(crate::space_element::HutSpaceElement::Window(window), logical, true);
     }
 }
 
@@ -341,7 +345,12 @@ pub fn finish_drag(state: &mut State) {
     let Some(window) = state.find_window_by_surface(&drag.surface) else {
         return;
     };
-    let Some(location) = state.space.element_location(&window) else {
+    let Some(location) = state
+        .stack
+        .focused()
+        .space
+        .element_location(&crate::space_element::HutSpaceElement::Window(window.clone()))
+    else {
         return;
     };
     let size = window.geometry().size;

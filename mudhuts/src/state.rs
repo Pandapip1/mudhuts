@@ -6,7 +6,7 @@ use std::sync::Arc;
 use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::winit::WinitGraphicsBackend;
-use smithay::desktop::{PopupManager, Space, Window, WindowSurfaceType, layer_map_for_output};
+use smithay::desktop::{PopupManager, Window, WindowSurfaceType, layer_map_for_output};
 use smithay::input::pointer::CursorImageStatus;
 use smithay::input::{Seat, SeatState};
 use smithay::output::Output;
@@ -58,19 +58,16 @@ pub struct State {
     pub socket_name: OsString,
     pub display_handle: DisplayHandle,
 
-    /// Client windows. Phase 1 does not yet organize these into the ConsoleHut's
-    /// Main Windows (that's Phase 4) — they're just composited on top.
-    pub space: Space<Window>,
-    /// The real, physical `Output` — decoupled from `space` (composable Hut
-    /// hierarchy RFC migration step 5 sub-step 2, piece 1): once each
-    /// `ConsoleHut` gets its own `Space<HutSpaceElement>` bound to a
-    /// *synthetic* output, something still needs to hold the one real
-    /// output for everything that only ever needed to reach it (layer-shell
-    /// placement, screen capture, `usable_area`'s size, ...), never a
-    /// window. Set once by whichever backend creates the output
-    /// (`winit_backend.rs`/`udev_backend.rs`), never reassigned after
-    /// (mudhuts is single-output, no runtime hot-swap). `None` only before
-    /// the first output exists.
+    /// The real, physical `Output`. Every ConsoleHut owns its own
+    /// `Space<HutSpaceElement>` (`ConsoleHut::space`, bound to a *synthetic*
+    /// output sized to its own content — composable Hut hierarchy RFC
+    /// migration step 5 sub-step 2) for actual window composition; this
+    /// field exists for everything that only ever needs to reach the real
+    /// output itself (layer-shell placement, screen capture, `usable_area`'s
+    /// size, ...), never a window. Set once by whichever backend creates
+    /// the output (`winit_backend.rs`/`udev_backend.rs`), never reassigned
+    /// after (mudhuts is single-output, no runtime hot-swap). `None` only
+    /// before the first output exists.
     pub output: Option<Output>,
     pub loop_signal: LoopSignal,
 
@@ -398,7 +395,6 @@ impl State {
         seat.add_keyboard(Default::default(), 200, 25)?;
         seat.add_pointer();
 
-        let space = Space::default();
         let (listening_socket, socket_name) = socket;
         Self::init_wayland_listener(display, event_loop, listening_socket)?;
         let loop_signal = event_loop.get_signal();
@@ -407,7 +403,6 @@ impl State {
             start_time,
             socket_name,
             display_handle: dh,
-            space,
             output: None,
             loop_signal,
             compositor_state,
@@ -853,11 +848,22 @@ impl State {
             }
         }
 
-        if let Some(hit) = self.space.element_under(pos).and_then(|(window, location)| {
-            window
-                .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
-                .map(|(s, p)| (s, (p + location).to_f64()))
-        }) {
+        if let Some(hit) = self
+            .stack
+            .focused()
+            .space
+            .element_under(pos)
+            .and_then(|(element, location)| match element {
+                HutSpaceElement::Window(window) => window
+                    .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
+                    .map(|(s, p)| (s, (p + location).to_f64())),
+                // No underlying surface to click into — nothing maps a
+                // `Composited` element into this Space yet (that starts
+                // once a Hut-tree node other than a bare ConsoleHut can be
+                // this Hut's own child — see the RFC's later sub-steps).
+                HutSpaceElement::Composited(_) => None,
+            })
+        {
             return Some(hit);
         }
 

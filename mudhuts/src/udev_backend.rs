@@ -710,7 +710,6 @@ fn connector_connected(
         }
     };
 
-    state.space.map_output(&output, (0, 0));
     state.output = Some(output.clone());
     state.output_size = (wl_mode.size.w, wl_mode.size.h);
     // Catches up the initial ConsoleHut (spawned in `main.rs` before this
@@ -773,11 +772,10 @@ fn connector_disconnected(
     }
     let removed = inner_mut.surfaces.remove(&crtc);
     drop(inner_mut);
-    if let Some(surface) = removed {
-        state.space.unmap_output(&surface.output);
-        if state.output.as_ref() == Some(&surface.output) {
-            state.output = None;
-        }
+    if let Some(surface) = removed
+        && state.output.as_ref() == Some(&surface.output)
+    {
+        state.output = None;
     }
 }
 
@@ -900,15 +898,19 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
     // *incoming* client requests — nothing anywhere else flushes
     // *outgoing* protocol messages (configures, frame callbacks, ...) to
     // client sockets under this backend.
-    state.space.elements().for_each(|window| {
-        window.send_frame(
-            &output,
-            state.start_time.elapsed(),
-            Some(std::time::Duration::ZERO),
-            |_, _| Some(output.clone()),
-        )
+    let elapsed = state.start_time.elapsed();
+    let hut = state.stack.focused_mut();
+    hut.space.elements().for_each(|element| {
+        if let crate::space_element::HutSpaceElement::Window(window) = element {
+            window.send_frame(
+                &output,
+                elapsed,
+                Some(std::time::Duration::ZERO),
+                |_, _| Some(output.clone()),
+            );
+        }
     });
-    state.space.refresh();
+    hut.space.refresh();
     state.popups.cleanup();
     // `session_destroyed` only removes mudhuts' own owned `Session`s
     // (`state.image_copy_sessions`) — it doesn't touch `ImageCopyCaptureState`'s

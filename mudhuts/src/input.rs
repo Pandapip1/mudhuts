@@ -468,8 +468,14 @@ impl State {
                     return;
                 };
                 let window = self
+                    .stack
+                    .focused()
                     .space
                     .elements()
+                    .filter_map(|e| match e {
+                        crate::space_element::HutSpaceElement::Window(w) => Some(w),
+                        crate::space_element::HutSpaceElement::Composited(_) => None,
+                    })
                     .find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == &focused))
                     .cloned();
                 if let Some(toplevel) = window.and_then(|w| w.toplevel().cloned()) {
@@ -836,12 +842,20 @@ impl State {
                     if docks::start_drag(self, self.to_physical(pos)) {
                         // Handled as a docked handle's drag-start instead
                         // of a normal click-to-focus below.
-                    } else if let Some((window, _loc)) = self
+                    } else if let Some(window) = self
+                        .stack
+                        .focused()
                         .space
                         .element_under(pos)
-                        .map(|(w, l)| (w.clone(), l))
+                        .and_then(|(e, _loc)| match e {
+                            crate::space_element::HutSpaceElement::Window(w) => Some(w.clone()),
+                            crate::space_element::HutSpaceElement::Composited(_) => None,
+                        })
                     {
-                        self.space.raise_element(&window, true);
+                        self.stack.focused_mut().space.raise_element(
+                            &crate::space_element::HutSpaceElement::Window(window.clone()),
+                            true,
+                        );
                         if let (Some(keyboard), Some(toplevel)) =
                             (self.seat.get_keyboard(), window.toplevel())
                         {

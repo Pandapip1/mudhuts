@@ -55,8 +55,11 @@ impl PointerGrab<State> for MoveSurfaceGrab {
 
         let delta = event.location - self.start_data.location;
         let new_location = self.initial_window_location.to_f64() + delta;
-        data.space
-            .map_element(self.window.clone(), new_location.to_i32_round(), true);
+        data.stack.focused_mut().space.map_element(
+            crate::space_element::HutSpaceElement::Window(self.window.clone()),
+            new_location.to_i32_round(),
+            true,
+        );
     }
 
     fn relative_motion(
@@ -181,7 +184,12 @@ impl PointerGrab<State> for MoveSurfaceGrab {
     /// would snap the window right back to wherever it was before the
     /// drag.
     fn unset(&mut self, data: &mut State) {
-        let Some(location) = data.space.element_location(&self.window) else {
+        let Some(location) = data
+            .stack
+            .focused()
+            .space
+            .element_location(&crate::space_element::HutSpaceElement::Window(self.window.clone()))
+        else {
             return;
         };
 

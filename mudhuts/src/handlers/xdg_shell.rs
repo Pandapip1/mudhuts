@@ -176,7 +176,12 @@ impl XdgShellHandler for State {
         let Some(window) = self.find_window_by_surface(&wl_surface) else {
             return;
         };
-        let Some(initial_window_location) = self.space.element_location(&window) else {
+        let Some(initial_window_location) = self
+            .stack
+            .focused()
+            .space
+            .element_location(&crate::space_element::HutSpaceElement::Window(window.clone()))
+        else {
             return;
         };
 

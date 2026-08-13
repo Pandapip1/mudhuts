@@ -71,7 +71,6 @@ pub fn init_winit(
         Some((0, 0).into()),
     );
     output.set_preferred(mode);
-    state.space.map_output(&output, (0, 0));
     state.output = Some(output.clone());
 
     let mut damage_tracker = OutputDamageTracker::from_output(&output);
@@ -200,16 +199,19 @@ pub fn init_winit(
                         }
                     }
 
-                    state.space.elements().for_each(|window| {
-                        window.send_frame(
-                            &output,
-                            state.start_time.elapsed(),
-                            Some(std::time::Duration::ZERO),
-                            |_, _| Some(output.clone()),
-                        )
+                    let elapsed = state.start_time.elapsed();
+                    let hut = state.stack.focused_mut();
+                    hut.space.elements().for_each(|element| {
+                        if let crate::space_element::HutSpaceElement::Window(window) = element {
+                            window.send_frame(
+                                &output,
+                                elapsed,
+                                Some(std::time::Duration::ZERO),
+                                |_, _| Some(output.clone()),
+                            );
+                        }
                     });
-
-                    state.space.refresh();
+                    hut.space.refresh();
                     state.popups.cleanup();
                     // `session_destroyed` only removes mudhuts' own owned
                     // `Session`s (`state.image_copy_sessions`) — it doesn't
