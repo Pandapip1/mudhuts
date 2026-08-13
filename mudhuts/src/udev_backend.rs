@@ -58,7 +58,7 @@ use smithay::backend::renderer::ImportDma;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{self, UdevBackend, UdevEvent};
-use smithay::input::pointer::{CursorImageAttributes, CursorImageStatus};
+use smithay::input::pointer::{CursorIcon, CursorImageAttributes, CursorImageStatus};
 use smithay::output::{Mode as WlMode, Output, PhysicalProperties};
 use smithay::reexports::calloop::ping::PingSource;
 use smithay::reexports::calloop::{EventLoop, LoopHandle};
@@ -103,10 +103,16 @@ struct Inner {
     drm_output_manager: OutputManager,
     drm_scanner: DrmScanner,
     surfaces: HashMap<crtc::Handle, SurfaceData>,
-    /// The loaded Xcursor theme (see `cursor.rs`) and the last-seen
-    /// `CursorImageStatus`'s composited render state — both persist
+    /// The loaded Xcursor theme images (see `cursor.rs`), one `Cursor` per
+    /// distinct shape a client has actually requested so far (via
+    /// `wl_pointer.set_cursor`'s `CursorImageStatus::default_named()` or,
+    /// now, `cursor-shape-v1`'s `set_shape`) — lazily populated in
+    /// `build_cursor_elements` rather than eagerly loading every
+    /// `CursorIcon` variant up front, since most sessions only ever touch
+    /// a handful (`Default`, `Text`, `Pointer`, ...). Plus the last-seen
+    /// `CursorImageStatus`'s composited render state, which persists
     /// across frames rather than being rebuilt each render pass.
-    pointer_image: Cursor,
+    pointer_images: HashMap<CursorIcon, Cursor>,
     pointer_element: PointerElement,
     /// Caches one uploaded `MemoryRenderBuffer` per distinct xcursor
     /// frame `Image` (an animated cursor theme has only a handful of
@@ -268,7 +274,7 @@ pub fn init_udev(
         drm_output_manager,
         drm_scanner: DrmScanner::new(),
         surfaces: HashMap::new(),
-        pointer_image: Cursor::load(),
+        pointer_images: HashMap::new(),
         pointer_element: PointerElement::default(),
         pointer_image_cache: Vec::new(),
     }));
@@ -519,7 +525,7 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
     let Inner {
         renderer,
         surfaces,
-        pointer_image,
+        pointer_images,
         pointer_element,
         pointer_image_cache,
         ..
@@ -570,7 +576,7 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
     let cursor_elements = build_cursor_elements(
         state,
         renderer,
-        pointer_image,
+        pointer_images,
         pointer_element,
         pointer_image_cache,
     );
@@ -636,7 +642,7 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
 fn build_cursor_elements(
     state: &mut State,
     renderer: &mut GlesRenderer,
-    pointer_image: &Cursor,
+    pointer_images: &mut HashMap<CursorIcon, Cursor>,
     pointer_element: &mut PointerElement,
     pointer_image_cache: &mut Vec<(xcursor::parser::Image, MemoryRenderBuffer)>,
 ) -> Vec<Elements> {
@@ -658,29 +664,40 @@ fn build_cursor_elements(
                 .map(|guard| guard.hotspot)
                 .unwrap_or_default()
         }),
-        _ => match pointer_image.frame(1, state.start_time.elapsed()) {
-            Some(image) => {
-                let buffer = pointer_image_cache
-                    .iter()
-                    .find(|(cached, _)| cached == image)
-                    .map(|(_, buffer)| buffer.clone())
-                    .unwrap_or_else(|| {
-                        let buffer = MemoryRenderBuffer::from_slice(
-                            &image.pixels_rgba,
-                            Fourcc::Argb8888,
-                            (image.width as i32, image.height as i32),
-                            1,
-                            Transform::Normal,
-                            None,
-                        );
-                        pointer_image_cache.push((image.clone(), buffer.clone()));
-                        buffer
-                    });
-                pointer_element.set_buffer(buffer);
-                Point::from((image.xhot as i32, image.yhot as i32))
+        CursorImageStatus::Hidden => Point::from((0, 0)),
+        // `wl_pointer.set_cursor`'s implicit default, or an explicit
+        // `cursor-shape-v1` `set_shape` request (see `handlers/mod.rs`'s
+        // `SeatHandler::cursor_image` — both funnel into `state.cursor_status`
+        // the same way). Each distinct shape gets its own lazily-loaded
+        // `Cursor` here rather than the single always-`Default` one this
+        // used to always render, so e.g. `Text`/`Grab`/resize shapes
+        // actually look different from the plain arrow.
+        CursorImageStatus::Named(icon) => {
+            let pointer_image = pointer_images.entry(*icon).or_insert_with(|| Cursor::load(*icon));
+            match pointer_image.frame(1, state.start_time.elapsed()) {
+                Some(image) => {
+                    let buffer = pointer_image_cache
+                        .iter()
+                        .find(|(cached, _)| cached == image)
+                        .map(|(_, buffer)| buffer.clone())
+                        .unwrap_or_else(|| {
+                            let buffer = MemoryRenderBuffer::from_slice(
+                                &image.pixels_rgba,
+                                Fourcc::Argb8888,
+                                (image.width as i32, image.height as i32),
+                                1,
+                                Transform::Normal,
+                                None,
+                            );
+                            pointer_image_cache.push((image.clone(), buffer.clone()));
+                            buffer
+                        });
+                    pointer_element.set_buffer(buffer);
+                    Point::from((image.xhot as i32, image.yhot as i32))
+                }
+                None => Point::from((0, 0)),
             }
-            None => Point::from((0, 0)),
-        },
+        }
     };
 
     pointer_element.set_status(state.cursor_status.clone());

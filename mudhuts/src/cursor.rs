@@ -22,7 +22,7 @@ use smithay::backend::renderer::element::surface::{
 };
 use smithay::backend::renderer::element::{AsRenderElements, Kind};
 use smithay::backend::renderer::{ImportAll, ImportMem, Renderer, Texture};
-use smithay::input::pointer::CursorImageStatus;
+use smithay::input::pointer::{CursorIcon, CursorImageStatus};
 use smithay::utils::{Physical, Point, Scale};
 use xcursor::CursorTheme;
 use xcursor::parser::{Image, parse_xcursor};
@@ -66,10 +66,10 @@ fn fallback_image() -> Image {
     }
 }
 
-fn load_icon(theme: &CursorTheme) -> Result<Vec<Image>, String> {
+fn load_icon(theme: &CursorTheme, icon_name: &str) -> Result<Vec<Image>, String> {
     let icon_path = theme
-        .load_icon("default")
-        .ok_or_else(|| "theme has no default cursor".to_string())?;
+        .load_icon(icon_name)
+        .ok_or_else(|| format!("theme has no {icon_name:?} cursor"))?;
     let cursor_data = std::fs::read(&icon_path).map_err(|err| format!("{icon_path:?}: {err}"))?;
     parse_xcursor(&cursor_data).ok_or_else(|| "failed to parse Xcursor file".to_string())
 }
@@ -81,20 +81,45 @@ pub struct Cursor {
 }
 
 impl Cursor {
-    pub fn load() -> Self {
-        let name = std::env::var("XCURSOR_THEME").unwrap_or_else(|_| "default".to_string());
+    /// Loads the theme's image set for a single named shape (a
+    /// `cursor-shape-v1` request, or the `Default` shape any freshly
+    /// created pointer starts with per `CursorImageStatus::default_named`).
+    ///
+    /// `icon.name()` is the canonical W3C/CSS name (e.g. `"pointer"`,
+    /// `"text"`) that current Xcursor themes ship under, but plenty of
+    /// themes still only carry the legacy X11 names (`"hand2"`,
+    /// `"xterm"`, ...) `icon.alt_names()` lists — tried in order so a
+    /// theme only needs to provide *one* of them. If the configured
+    /// theme has none of the names for this particular shape (common for
+    /// small/incomplete themes — most ship `"default"` but not every
+    /// resize cursor), this falls back to the tiny built-in arrow rather
+    /// than leaving the shape unrendered.
+    pub fn load(icon: CursorIcon) -> Self {
+        let theme_name = std::env::var("XCURSOR_THEME").unwrap_or_else(|_| "default".to_string());
         let size = std::env::var("XCURSOR_SIZE")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(24);
 
-        let theme = CursorTheme::load(&name);
-        let icons = load_icon(&theme).unwrap_or_else(|err| {
-            tracing::warn!(
-                "failed to load Xcursor theme {name:?}, using a built-in fallback cursor: {err}"
-            );
-            vec![fallback_image()]
-        });
+        let theme = CursorTheme::load(&theme_name);
+        let mut tried = Vec::new();
+        let icons = std::iter::once(icon.name())
+            .chain(icon.alt_names().iter().copied())
+            .find_map(|name| match load_icon(&theme, name) {
+                Ok(icons) => Some(icons),
+                Err(err) => {
+                    tried.push(format!("{name:?}: {err}"));
+                    None
+                }
+            })
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    "failed to load any of {icon}'s xcursor names from theme {theme_name:?}, \
+                     using a built-in fallback cursor ({})",
+                    tried.join("; ")
+                );
+                vec![fallback_image()]
+            });
 
         Self { icons, size }
     }
