@@ -3,6 +3,10 @@ pub(crate) mod layer_shell;
 pub(crate) mod shell;
 pub(crate) mod xdg_shell;
 
+use std::io::Write;
+use std::os::fd::OwnedFd;
+use std::sync::Arc;
+
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::renderer::ImportDma;
 use smithay::input::dnd::DndGrabHandler;
@@ -18,10 +22,14 @@ use smithay::wayland::keyboard_shortcuts_inhibit::{
 };
 use smithay::wayland::output::OutputHandler;
 use smithay::wayland::pointer_constraints::PointerConstraintsHandler;
-use smithay::wayland::selection::SelectionHandler;
 use smithay::wayland::selection::data_device::{
     DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler, set_data_device_focus,
 };
+use smithay::wayland::selection::ext_data_control::{DataControlHandler, DataControlState};
+use smithay::wayland::selection::primary_selection::{
+    PrimarySelectionHandler, PrimarySelectionState, set_primary_focus,
+};
+use smithay::wayland::selection::{SelectionHandler, SelectionTarget};
 
 use crate::State;
 
@@ -41,17 +49,66 @@ impl SeatHandler for State {
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
         let dh = &self.display_handle;
         let client = focused.and_then(|s| dh.get_client(s.id()).ok());
-        set_data_device_focus(dh, seat, client);
+        set_data_device_focus(dh, seat, client.clone());
+        set_primary_focus(dh, seat, client);
     }
 }
 
+/// `SelectionUserData` is `Arc<String>` (rather than `()`) so a
+/// compositor-set selection — the terminal's own text selection, set via
+/// `set_data_device_selection`/`set_primary_selection` in `input.rs` — can
+/// carry the actual selected text through to [`Self::send_selection`]
+/// below, which is what actually hands it to a reading client. One type
+/// shared by both the clipboard and primary targets: they're the same kind
+/// of compositor-owned offer, just advertised on a different protocol.
 impl SelectionHandler for State {
-    type SelectionUserData = ();
+    type SelectionUserData = Arc<String>;
+
+    /// Fires for *any* reading client regardless of which protocol it used
+    /// (`wl_data_device`, `zwp_primary_selection_v1`, or `ext_data_control`)
+    /// — mudhuts only ever offers plain-text mime types (see the callers of
+    /// `set_data_device_selection`/`set_primary_selection`), so the
+    /// requested `mime_type` doesn't need inspecting here.
+    ///
+    /// Writing `fd` is spawned onto its own thread rather than done inline:
+    /// this runs synchronously inside the main event-dispatch path, and a
+    /// slow/stalled reader plus a selection bigger than a pipe's `PIPE_BUF`
+    /// (64 KiB) could otherwise block the whole compositor on the write.
+    /// Smithay has no async write helper for this, and a short-lived thread
+    /// is the simplest way to avoid that without one.
+    fn send_selection(
+        &mut self,
+        _ty: SelectionTarget,
+        _mime_type: String,
+        fd: OwnedFd,
+        _seat: Seat<Self>,
+        user_data: &Self::SelectionUserData,
+    ) {
+        let text = Arc::clone(user_data);
+        std::thread::spawn(move || {
+            let mut file = std::fs::File::from(fd);
+            if let Err(err) = file.write_all(text.as_bytes()) {
+                tracing::warn!("failed to write selection contents to reading client: {err}");
+            }
+        });
+    }
 }
 
 impl DataDeviceHandler for State {
     fn data_device_state(&mut self) -> &mut DataDeviceState {
         &mut self.data_device_state
+    }
+}
+
+impl PrimarySelectionHandler for State {
+    fn primary_selection_state(&mut self) -> &mut PrimarySelectionState {
+        &mut self.primary_selection_state
+    }
+}
+
+impl DataControlHandler for State {
+    fn data_control_state(&mut self) -> &mut DataControlState {
+        &mut self.data_control_state
     }
 }
 

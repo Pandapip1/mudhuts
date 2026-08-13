@@ -237,9 +237,11 @@ impl Terminal {
         self.term.lock().selection.is_some()
     }
 
-    /// The currently selected text, if any. Not yet wired to the Wayland
-    /// clipboard (mudhuts has no primary-selection source implementation
-    /// yet) — for now this just backs the visual highlight.
+    /// The currently selected text, if any. Backs both the visual
+    /// highlight and mudhuts' Wayland clipboard/primary-selection sources
+    /// (see `input.rs`'s `PointerButton` handler and `Action::CopySelection`,
+    /// which call this to hand the completed selection to
+    /// `set_primary_selection`/`set_data_device_selection`).
     pub fn selection_text(&self) -> Option<String> {
         self.term.lock().selection_to_string()
     }

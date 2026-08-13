@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use mudhuts_term::keys::{Key, Mods, NamedKey};
 use smithay::backend::input::{
     AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
@@ -9,12 +11,25 @@ use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, SERIAL_COUNTER, Serial};
 use smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitorSeat;
+use smithay::wayland::selection::data_device::set_data_device_selection;
+use smithay::wayland::selection::primary_selection::set_primary_selection;
 use smithay::wayland::shell::wlr_layer::{KeyboardInteractivity, Layer as WlrLayer};
 
 use crate::State;
 use crate::keybindings::Action;
 use crate::village::{Village, pane_rects};
 use crate::{chrome, docks, village_chrome};
+
+/// Mime types mudhuts advertises for every selection it sets itself
+/// (clipboard or primary) — it only ever offers plain text, so this fixed
+/// list is enough; no real format negotiation needed.
+fn text_mime_types() -> Vec<String> {
+    vec![
+        "text/plain;charset=utf-8".to_string(),
+        "UTF8_STRING".to_string(),
+        "text/plain".to_string(),
+    ]
+}
 
 /// Translate a raw xkb keysym into mudhuts-term's neutral [`Key`], or
 /// `None` for keys that don't map to a PTY-input action on their own
@@ -474,6 +489,21 @@ impl State {
                 self.sync_visible_main_window();
                 self.request_redraw();
             }
+            Action::CopySelection => {
+                // Deliberately separate from the primary-selection commit
+                // in the `PointerButton` handler below: X11 convention
+                // keeps the two independent — every drag-selection updates
+                // primary immediately, but only an explicit copy touches
+                // the regular clipboard.
+                if let Some(text) = self.stack.focused().terminal.selection_text() {
+                    set_data_device_selection::<Self>(
+                        &self.display_handle,
+                        &self.seat,
+                        text_mime_types(),
+                        Arc::new(text),
+                    );
+                }
+            }
         }
     }
 
@@ -658,6 +688,20 @@ impl State {
                             self.text_selecting = false;
                             if !self.text_selection_dragged {
                                 self.stack.focused().terminal.clear_selection();
+                            } else if let Some(text) = self.stack.focused().terminal.selection_text()
+                            {
+                                // X11 convention: a completed drag-
+                                // selection commits to the primary
+                                // selection automatically, with no
+                                // explicit copy action needed — see
+                                // `Action::CopySelection` for the separate,
+                                // explicit path to the regular clipboard.
+                                set_primary_selection::<Self>(
+                                    &self.display_handle,
+                                    &self.seat,
+                                    text_mime_types(),
+                                    Arc::new(text),
+                                );
                             }
                         }
                     }
