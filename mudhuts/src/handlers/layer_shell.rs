@@ -48,7 +48,7 @@ impl WlrLayerShellHandler for State {
         let output = wl_output
             .as_ref()
             .and_then(Output::from_resource)
-            .or_else(|| self.space.outputs().next().cloned());
+            .or_else(|| self.output.clone());
         let Some(output) = output else {
             tracing::warn!("new layer surface but no output exists yet, dropping it");
             return;
@@ -62,7 +62,7 @@ impl WlrLayerShellHandler for State {
     }
 
     fn layer_destroyed(&mut self, surface: smithay::wayland::shell::wlr_layer::LayerSurface) {
-        let found = self.space.outputs().find_map(|o| {
+        let found = self.output.as_ref().and_then(|o| {
             let map = layer_map_for_output(o);
             map.layers()
                 .find(|l| l.layer_surface() == &surface)
@@ -84,9 +84,9 @@ impl WlrLayerShellHandler for State {
 /// from `handlers/compositor.rs`'s `commit()`.
 pub fn handle_commit(state: &mut State, surface: &WlSurface) {
     let Some(output) = state
-        .space
-        .outputs()
-        .find(|o| {
+        .output
+        .as_ref()
+        .filter(|o| {
             layer_map_for_output(o)
                 .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
                 .is_some()

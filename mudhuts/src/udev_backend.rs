@@ -711,6 +711,7 @@ fn connector_connected(
     };
 
     state.space.map_output(&output, (0, 0));
+    state.output = Some(output.clone());
     state.output_size = (wl_mode.size.w, wl_mode.size.h);
     // Catches up the initial ConsoleHut (spawned in `main.rs` before this
     // backend existed, at scale 1.0) and remembers `scale` for every ConsoleHut
@@ -774,6 +775,9 @@ fn connector_disconnected(
     drop(inner_mut);
     if let Some(surface) = removed {
         state.space.unmap_output(&surface.output);
+        if state.output.as_ref() == Some(&surface.output) {
+            state.output = None;
+        }
     }
 }
 

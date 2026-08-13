@@ -38,7 +38,7 @@ impl XdgShellHandler for State {
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Activated);
         });
-        if self.space.outputs().next().is_some() {
+        if self.output.is_some() {
             // Sized to the *usable* area, not the raw output geometry —
             // shrunk by any layer-shell surface's exclusive zone (a
             // status bar, say) — see `State::usable_area`'s doc comment.
@@ -337,10 +337,7 @@ impl State {
             return;
         };
 
-        let Some(output) = self.space.outputs().next() else {
-            return;
-        };
-        let Some(output_geo) = self.space.output_geometry(output) else {
+        let Some(output_geo) = self.real_output_geometry() else {
             return;
         };
 

@@ -9,6 +9,7 @@ use smithay::backend::winit::WinitGraphicsBackend;
 use smithay::desktop::{PopupManager, Space, Window, WindowSurfaceType, layer_map_for_output};
 use smithay::input::pointer::CursorImageStatus;
 use smithay::input::{Seat, SeatState};
+use smithay::output::Output;
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::ping::Ping;
 use smithay::reexports::calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction};
@@ -16,7 +17,7 @@ use smithay::reexports::wayland_protocols::ext::session_lock::v1::server::ext_se
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Display, DisplayHandle};
-use smithay::utils::{Logical, Point};
+use smithay::utils::{Logical, Point, Rectangle};
 use smithay::wayland::compositor::{CompositorClientState, CompositorState};
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
@@ -59,6 +60,17 @@ pub struct State {
     /// Client windows. Phase 1 does not yet organize these into the ConsoleHut's
     /// Main Windows (that's Phase 4) — they're just composited on top.
     pub space: Space<Window>,
+    /// The real, physical `Output` — decoupled from `space` (composable Hut
+    /// hierarchy RFC migration step 5 sub-step 2, piece 1): once each
+    /// `ConsoleHut` gets its own `Space<HutSpaceElement>` bound to a
+    /// *synthetic* output, something still needs to hold the one real
+    /// output for everything that only ever needed to reach it (layer-shell
+    /// placement, screen capture, `usable_area`'s size, ...), never a
+    /// window. Set once by whichever backend creates the output
+    /// (`winit_backend.rs`/`udev_backend.rs`), never reassigned after
+    /// (mudhuts is single-output, no runtime hot-swap). `None` only before
+    /// the first output exists.
+    pub output: Option<Output>,
     pub loop_signal: LoopSignal,
 
     pub compositor_state: CompositorState,
@@ -395,6 +407,7 @@ impl State {
             socket_name,
             display_handle: dh,
             space,
+            output: None,
             loop_signal,
             compositor_state,
             xdg_shell_state,
@@ -566,11 +579,29 @@ impl State {
     /// fresh from the `Output` each time it's needed, rather than cached
     /// anywhere.
     pub fn output_scale(&self) -> f64 {
-        self.space
-            .outputs()
-            .next()
+        self.output
+            .as_ref()
             .map(|o| o.current_scale().fractional_scale())
             .unwrap_or(1.0)
+    }
+
+    /// [`Self::output`]'s geometry — always at `(0, 0)` (mudhuts is
+    /// single-output and both backends unconditionally `map_output` there),
+    /// so this is really just "the current mode's size, transformed and
+    /// scale-divided" — the exact math `Space::output_geometry` itself uses
+    /// (`.../desktop/space/mod.rs`'s `output_geometry`, confirmed against
+    /// the pinned Smithay checkout), reproduced here now that `output` is
+    /// decoupled from any particular `Space`.
+    pub fn real_output_geometry(&self) -> Option<Rectangle<i32, Logical>> {
+        let output = self.output.as_ref()?;
+        let mode = output.current_mode()?;
+        let size = output
+            .current_transform()
+            .transform_size(mode.size)
+            .to_f64()
+            .to_logical(output.current_scale().fractional_scale())
+            .to_i32_ceil();
+        Some(Rectangle::new((0, 0).into(), size))
     }
 
     /// The rectangle (physical pixels, output-relative) that ConsoleHut/Main-
@@ -598,7 +629,7 @@ impl State {
     /// is the *other* half: the same zone, unconverted, for the couple of
     /// call sites that configure real Wayland clients instead.
     pub fn usable_area(&self) -> (i32, i32, i32, i32) {
-        let Some(output) = self.space.outputs().next() else {
+        let Some(output) = self.output.as_ref() else {
             return (0, 0, self.output_size.0, self.output_size.1);
         };
         let zone = layer_map_for_output(output).non_exclusive_zone();
@@ -620,7 +651,7 @@ impl State {
     /// matters before the first output exists, when physical and logical
     /// aren't meaningfully different yet anyway.
     pub fn usable_area_logical(&self) -> (i32, i32, i32, i32) {
-        let Some(output) = self.space.outputs().next() else {
+        let Some(output) = self.output.as_ref() else {
             return (0, 0, self.output_size.0, self.output_size.1);
         };
         let zone = layer_map_for_output(output).non_exclusive_zone();
@@ -637,10 +668,7 @@ impl State {
     /// near an edge. Falls back to `self.output_size` with no output
     /// mapped yet, same reasoning as `usable_area_logical`.
     pub fn output_size_logical(&self) -> (i32, i32) {
-        let Some(output) = self.space.outputs().next() else {
-            return self.output_size;
-        };
-        match self.space.output_geometry(output) {
+        match self.real_output_geometry() {
             Some(geo) => (geo.size.w, geo.size.h),
             None => self.output_size,
         }
@@ -787,7 +815,7 @@ impl State {
         smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
         Point<f64, Logical>,
     )> {
-        let output = self.space.outputs().next();
+        let output = self.output.as_ref();
 
         if let Some(output) = output {
             let layers = layer_map_for_output(output);

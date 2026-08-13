@@ -365,7 +365,7 @@ impl State {
     /// for Bottom/Background (checked only once nothing else — chrome,
     /// Top/Overlay, normal content — already claimed the click).
     fn try_click_layer_surface(&mut self, pos: Point<f64, Logical>, serial: Serial, above: bool) -> bool {
-        let Some(output) = self.space.outputs().next().cloned() else {
+        let Some(output) = self.output.clone() else {
             return false;
         };
         let focus_target = {
@@ -409,7 +409,7 @@ impl State {
     /// `.smithay-ref/anvil`'s own `keyboard_key_to_action` reference
     /// behavior).
     fn exclusive_layer_surface(&self) -> Option<WlSurface> {
-        let output = self.space.outputs().next()?;
+        let output = self.output.as_ref()?;
         let layers = layer_map_for_output(output);
         layers
             .layers()
@@ -742,10 +742,7 @@ impl State {
                 self.handle_pointer_motion(new_location, event.time_msec());
             }
             InputEvent::PointerMotionAbsolute { event, .. } => {
-                let Some(output) = self.space.outputs().next() else {
-                    return;
-                };
-                let Some(output_geo) = self.space.output_geometry(output) else {
+                let Some(output_geo) = self.real_output_geometry() else {
                     return;
                 };
 

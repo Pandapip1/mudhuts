@@ -63,7 +63,7 @@ impl BufferHandler for State {
 /// answer here — every surface gets the one output's scale, full stop.
 impl FractionalScaleHandler for State {
     fn new_fractional_scale(&mut self, surface: WlSurface) {
-        let Some(output) = self.space.outputs().next() else {
+        let Some(output) = self.output.as_ref() else {
             return;
         };
         let scale = output.current_scale().fractional_scale();

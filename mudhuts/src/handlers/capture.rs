@@ -119,7 +119,7 @@ impl State {
     /// this compositor (see the module doc), so unconditionally pushing the
     /// same constraints to every live session is correct.
     pub fn refresh_capture_constraints(&mut self) {
-        let Some(mode) = self.space.outputs().next().and_then(Output::current_mode) else {
+        let Some(mode) = self.output.as_ref().and_then(Output::current_mode) else {
             return;
         };
         let constraints = buffer_constraints_for_mode(mode);
@@ -140,7 +140,7 @@ impl State {
         // key off of than the source already validated via
         // `capture_constraints` — only its `user_data()` (the per-session
         // damage tracker below) is actually needed here.
-        let output = self.space.outputs().next().cloned().ok_or(FailureReason::Unknown)?;
+        let output = self.output.clone().ok_or(FailureReason::Unknown)?;
         let mode = output.current_mode().ok_or(FailureReason::Unknown)?;
         let size = (mode.size.w, mode.size.h);
 

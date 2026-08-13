@@ -208,7 +208,7 @@ fn layer_elements(
     state: &State,
     renderer: &mut GlesRenderer,
 ) -> (Vec<Element>, Vec<Element>) {
-    let Some(output) = state.space.outputs().next() else {
+    let Some(output) = state.output.as_ref() else {
         return (Vec::new(), Vec::new());
     };
     // Layer geometry (`layer_geometry`) is genuinely Logical (see
