@@ -5,7 +5,7 @@
 //! between, so no chrome to draw (matches `Ctrl+`` being a no-op there
 //! too).
 
-use smithay::backend::renderer::{Renderer, Texture};
+use smithay::backend::renderer::Renderer;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
@@ -206,8 +206,6 @@ pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer, y: i32, scale: f64) -> 
 
         match label_texture {
             Ok((texture, snapshot)) => {
-                let texture_size = texture.size();
-                let logical_size = crate::render::physical_element_size(texture_size.w, texture_size.h, scale);
                 let text = TextureRenderElement::from_texture_with_damage(
                     text_ids[i].clone(),
                     renderer.context_id(),
@@ -216,11 +214,11 @@ pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer, y: i32, scale: f64) -> 
                         (rect.loc.y + TAB_PADDING) as f64,
                     ),
                     texture,
-                    1,
+                    crate::render::texture_buffer_scale(scale),
                     Transform::Normal,
                     None,
                     None,
-                    Some(logical_size),
+                    None,
                     None,
                     snapshot,
                     Kind::Unspecified,

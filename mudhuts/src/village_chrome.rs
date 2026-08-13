@@ -13,7 +13,7 @@
 //! practice this never happens, since [`Village::collapse_if_singleton`]
 //! unwraps it immediately.
 
-use smithay::backend::renderer::{Renderer, Texture};
+use smithay::backend::renderer::Renderer;
 use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
@@ -189,8 +189,6 @@ pub fn build(
         let (text_id, bg_id) = tab.tab_ids[i].clone();
         match texture {
             Ok((texture, snapshot)) => {
-                let texture_size = texture.size();
-                let logical_size = crate::render::physical_element_size(texture_size.w, texture_size.h, scale);
                 let text = TextureRenderElement::from_texture_with_damage(
                     text_id,
                     renderer.context_id(),
@@ -199,11 +197,11 @@ pub fn build(
                         (rect.loc.y + TAB_PADDING) as f64,
                     ),
                     texture,
-                    1,
+                    crate::render::texture_buffer_scale(scale),
                     Transform::Normal,
                     None,
                     None,
-                    Some(logical_size),
+                    None,
                     None,
                     snapshot,
                     Kind::Unspecified,

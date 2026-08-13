@@ -23,7 +23,7 @@
 //! match `self.space`'s own contract — see [`advance_drag`]/[`finish_drag`]
 //! for exactly where that conversion happens.
 
-use smithay::backend::renderer::{Renderer, Texture};
+use smithay::backend::renderer::Renderer;
 use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
@@ -170,8 +170,6 @@ pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer, output_size: (i32, i32)
         };
 
         if let Some((text_id, texture, snapshot)) = rendered {
-            let texture_size = texture.size();
-            let logical_size = crate::render::physical_element_size(texture_size.w, texture_size.h, scale);
             let text = TextureRenderElement::from_texture_with_damage(
                 text_id,
                 renderer.context_id(),
@@ -180,11 +178,11 @@ pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer, output_size: (i32, i32)
                     (handle.rect.loc.y + 6) as f64,
                 ),
                 texture,
-                1,
+                crate::render::texture_buffer_scale(scale),
                 Transform::Normal,
                 None,
                 None,
-                Some(logical_size),
+                None,
                 None,
                 snapshot,
                 Kind::Unspecified,

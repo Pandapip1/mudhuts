@@ -17,25 +17,55 @@ use crate::State;
 use crate::village::{Village, pane_rects};
 use crate::{chrome, docks, switcher, village_chrome};
 
-/// Convert a texture's real physical-pixel dimensions into the `Logical`
-/// destination `size` a [`TextureRenderElement`] needs so that
-/// [`smithay::backend::renderer::element::Element::geometry`] — called
-/// every frame by `space_render_elements`/`DrmCompositor` with the
-/// *output's* scale — reports the element's actual on-screen size instead
-/// of re-applying that scale a second time on top of an already-physical
-/// texture. Smithay computes `physical_size(scale) =
-/// logical_size.to_physical(scale)`; passing this function's result as
-/// the element's explicit `size` argument (instead of leaving it `None`,
-/// which falls back to `texture.size()` treated as if `buffer_scale`
-/// were 1 — i.e. already-physical pixels reinterpreted as logical ones)
-/// makes that round-trip land back on `(physical_w, physical_h)`
-/// regardless of the output's real scale. Needed at every call site in
-/// this crate that composites a texture rendered pixel-native at
-/// physical resolution (mudhuts' own chrome/terminal/thumbnails — see
-/// this module's other doc comments on that design) now that output
-/// scale is real (`87adb1c`) instead of always 1 — this was the actual
-/// bug behind "everything renders fuzzy, only the top-left of the panel
-/// is visible" once a HiDPI output was detected.
+/// The [`TextureRenderElement`] buffer-scale ([`Element::src`]/
+/// [`Element::geometry`]'s shared `self.scale: i32`) that makes a texture
+/// rendered pixel-native at real *physical* resolution (mudhuts' own
+/// chrome/terminal — see this module's other doc comments on that
+/// design) composite at its true on-screen size once the output's scale
+/// is non-1.0.
+///
+/// **This has to be the buffer-scale argument, not an explicit `size`
+/// override** — a first attempt at this fix passed `size:
+/// Some(logical_size)` instead and looked identical to the original bug
+/// (fuzzy, only the top-left corner visible) despite fixing
+/// `geometry()`'s *destination* size correctly, because
+/// `TextureRenderElement::src()` *also* derives the sampled *source*
+/// region from `logical_size()` whenever `src` is left `None` — see
+/// `.../src/backend/renderer/element/texture.rs`'s `Element::src` impl:
+/// `self.src().to_buffer(self.scale as f64, transform, &logical_size)`.
+/// Shrinking `logical_size` via an explicit `size` while leaving
+/// `self.scale` (buffer-scale) at its default of 1 shrinks the *sampled*
+/// region to match — only the top-left corner of the real texture gets
+/// sampled, then stretched back up to fill the (correctly-sized now)
+/// destination rect. Passing this as the buffer-scale argument instead
+/// fixes both halves of the same underlying contract at once: `src()`
+/// un-scales by it (recovering the *full* texture as the sample region)
+/// and `geometry()` re-scales by it (landing back on the texture's real
+/// physical size) — the mechanism Smithay actually designed for exactly
+/// this "buffer is N× the surface's logical size" case.
+///
+/// Rounds to the nearest whole number (`detect_output_scale` in
+/// `udev_backend.rs` only ever produces one anyway) — `scale: i32` is a
+/// hard Smithay API constraint here, so a genuinely fractional host scale
+/// (winit) loses sub-pixel precision at this specific call site; a real
+/// fractional-native fix would need an explicit `src` *and* `size`
+/// together (mirroring how `switcher.rs`'s thumbnail already sets both),
+/// not attempted here since it's out of scope for the bug this exists to
+/// fix.
+pub(crate) fn texture_buffer_scale(scale: f64) -> i32 {
+    scale.round().max(1.0) as i32
+}
+
+/// Convert a physical-pixel destination size into the `Logical` `size`
+/// override a [`TextureRenderElement`] needs when it *also* sets an
+/// explicit `src` covering the texture's full real pixel dimensions (see
+/// `switcher.rs`'s thumbnail, the one call site that needs this) — safe
+/// specifically because an explicit `src` makes `Element::src()` ignore
+/// `logical_size()`/`self.size` entirely, so shrinking `size` here only
+/// affects `geometry()`'s destination rect, not the sampled region (see
+/// [`texture_buffer_scale`]'s doc comment for the call sites where that
+/// isn't true, and why they need the buffer-scale argument instead of
+/// this).
 pub(crate) fn physical_element_size(
     physical_w: i32,
     physical_h: i32,
@@ -381,22 +411,20 @@ pub fn build_frame_elements(
             // an element with no damage tracking at all (see
             // `Hut::damage_tracker`'s doc comment).
             //
-            // `size` is explicit (not `None`) — see
-            // `physical_element_size`'s doc comment for why leaving it to
-            // fall back on `texture.size()` alone double-applies the
-            // output's scale once it's non-1.0.
-            let texture_size = texture.size();
-            let logical_size = physical_element_size(texture_size.w, texture_size.h, scale);
+            // Buffer scale, not an explicit `size` — see
+            // `texture_buffer_scale`'s doc comment for why leaving this
+            // `1` double-applies the output's scale once it's non-1.0,
+            // and why an explicit `size` alone isn't the right fix either.
             let element = TextureRenderElement::from_texture_with_damage(
                 hut.element_id.clone(),
                 renderer.context_id(),
                 (0.0, 0.0),
                 texture,
-                1,
+                texture_buffer_scale(scale),
                 Transform::Normal,
                 None,
                 None,
-                Some(logical_size),
+                None,
                 None,
                 hut.element_damage_snapshot(),
                 Kind::Unspecified,
@@ -482,18 +510,16 @@ fn build_tile_elements(
         let Some(texture) = hut.redraw(renderer) else {
             continue;
         };
-        let texture_size = texture.size();
-        let logical_size = physical_element_size(texture_size.w, texture_size.h, scale);
         let element = TextureRenderElement::from_texture_with_damage(
             hut.element_id.clone(),
             renderer.context_id(),
             (x as f64, y as f64),
             texture,
-            1,
+            texture_buffer_scale(scale),
             Transform::Normal,
             None,
             None,
-            Some(logical_size),
+            None,
             None,
             hut.element_damage_snapshot(),
             Kind::Unspecified,
