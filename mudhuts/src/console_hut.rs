@@ -12,6 +12,8 @@ use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::utils::{CommitCounter, DamageBag, DamageSnapshot};
 use smithay::desktop::Window;
+use smithay::desktop::space::Space;
+use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Buffer, Rectangle};
 
@@ -21,6 +23,7 @@ use mudhuts_term::palette::Rgb;
 use crate::gpu_term::{GpuTermRenderer, LabelRenderer};
 use crate::main_window::MainWindowEntry;
 use crate::render::{ChangeTracker, LabelCache};
+use crate::space_element::{HutSpaceElement, synthetic_output};
 
 /// Initial grid size used before the real output size is known.
 const INITIAL_COLS: usize = 80;
@@ -123,6 +126,18 @@ pub struct ConsoleHut {
     /// least one line) matters for continuous-scroll devices like a
     /// trackpad, which send many small events per swipe.
     pub scroll_accum: f64,
+
+    /// This ConsoleHut's own `Space<HutSpaceElement>` (composable Hut
+    /// hierarchy RFC migration step 5 sub-step 2) — replaces the old single
+    /// global `state.space: Space<Window>`'s window-composition role,
+    /// scoped per-instance instead. Bound to [`Self::space_output`], a
+    /// synthetic output sized to [`Self::pixel_size`] (kept in sync by
+    /// [`Self::resize_to_pixels`]), not the real one — see
+    /// `docs/rfcs/composable-hut-hierarchy.md`'s Q1. Structural only for
+    /// now: nothing populates or reads this yet (the next migration piece
+    /// wires `State::sync_visible_main_window`/`render.rs` to it).
+    pub space: Space<HutSpaceElement>,
+    space_output: Output,
 }
 
 impl ConsoleHut {
@@ -162,6 +177,10 @@ impl ConsoleHut {
             (INITIAL_LINES * cell_size.1 as usize) as i32,
         );
 
+        let space_output = synthetic_output("console-hut-space", pixel_size);
+        let mut space = Space::default();
+        space.map_output(&space_output, (0, 0));
+
         Ok((
             ConsoleHut {
                 id,
@@ -171,6 +190,8 @@ impl ConsoleHut {
                 gpu: None,
                 last_texture: None,
                 pixel_size,
+                space,
+                space_output,
                 element_id: Id::new(),
                 terminal_tab_text_id: Id::new(),
                 terminal_tab_bg_id: Id::new(),
@@ -426,6 +447,19 @@ impl ConsoleHut {
             return;
         }
         self.pixel_size = (width, height);
+        // Keep `space_output`'s mode in lockstep — `Self::space`'s content
+        // is always exactly this ConsoleHut's own pixel size (see
+        // `Self::space`'s doc comment). Deletes the old mode first so
+        // repeated resizes (a resizable nested winit window) don't leave
+        // `space_output`'s mode list growing forever — harmless either way
+        // (nothing ever enumerates it; this output is never globalized),
+        // just tidy.
+        if let Some(old_mode) = self.space_output.current_mode() {
+            self.space_output.delete_mode(old_mode);
+        }
+        let mode = smithay::output::Mode { size: (width, height).into(), refresh: 60_000 };
+        self.space_output.change_current_state(Some(mode), None, None, None);
+        self.space_output.set_preferred(mode);
 
         let cell_w = self.glyphs.cell_width().max(1);
         let cell_h = self.glyphs.cell_height().max(1);

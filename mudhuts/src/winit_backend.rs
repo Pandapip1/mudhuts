@@ -157,13 +157,6 @@ pub fn init_winit(
                                 (size.w, size.h),
                             );
 
-                            // Composable Hut hierarchy RFC migration step 3
-                            // (see `hut_space.rs`'s module doc) — a
-                            // comparison-only second render pass, a no-op
-                            // unless explicitly enabled via env var. Never
-                            // touches `elements`/the real framebuffer below.
-                            crate::hut_space::compare_against_existing_path(state, renderer);
-
                             match damage_tracker.render_output(
                                 renderer,
                                 &mut framebuffer,
