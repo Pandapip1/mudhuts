@@ -8,11 +8,50 @@
 //! Scoped to a single GPU, single seat, single output for v1 (matches
 //! mudhuts' existing single-output assumptions throughout — see the
 //! plan's Phase 7 notes for the full list of what's deliberately
-//! deferred: multi-GPU `GpuManager`/`MultiRenderer`, DRM leasing,
-//! explicit GPU sync via drm-syncobj, 10-bit color, dmabuf client-buffer
-//! import). Cursor rendering (`cursor.rs`) is no longer on that list —
-//! implemented once real GUI clients confirmed the rest of the backend
-//! actually worked.
+//! deferred: multi-GPU `GpuManager`/`MultiRenderer`, explicit GPU sync
+//! via drm-syncobj, 10-bit color, dmabuf client-buffer import). Cursor
+//! rendering (`cursor.rs`) and DRM leasing (`drm-lease-v1`, below) are no
+//! longer on that list — implemented once real GUI clients confirmed the
+//! rest of the backend actually worked / once VR use was actually on the
+//! table.
+//!
+//! ## DRM leasing (`wp_drm_lease_v1`)
+//!
+//! Lets a client (Monado, SteamVR, ...) take exclusive KMS control of a
+//! connector away from this compositor — the standard way a VR runtime
+//! gets a direct, low-latency path to a headset's display rather than
+//! going through normal desktop compositing. A connector is classified
+//! as leasable, instead of becoming a normal desktop `Output`, in
+//! `connector_connected` using the kernel's own "non-desktop" DRM
+//! property (the same signal wlroots/KWin/cosmic-comp use — driver-set,
+//! usually derived from EDID) *plus* a defense-in-depth denylist on
+//! `connector::Interface` (eDP/LVDS/DSI/DPI — the "always internal
+//! panel" interface types): `non-desktop` alone depends on driver/EDID
+//! correctness, and the built-in Apple Silicon panel must never become
+//! leasable even if a driver ever mis-reports it. Real VR headsets set
+//! `non-desktop` deliberately to get leased by exactly this class of
+//! compositor, so the extra denylist doesn't break real leasing — it
+//! only ever excludes the one connector that must never be touched.
+//!
+//! Setting up the `wp_drm_lease_device_v1` global (`DrmLeaseState::new`)
+//! is non-fatal on failure (logged, not propagated) — see `init_udev`:
+//! DRM leasing is optional, the desktop output must always come up
+//! regardless of whether this device supports/permits it. Once up, the
+//! actual per-request accept/reject/build logic lives in this module's
+//! `DrmLeaseHandler` impl below, following anvil's reference behavior
+//! (`anvil/src/udev.rs`) adapted to mudhuts' single-GPU/single-node
+//! shape (no `HashMap<DrmNode, BackendData>` indirection needed — there
+//! is only ever the one `node`/`DrmNode` this whole module manages).
+//! `DrmLeaseState` itself lives directly on `State` (`drm_leasing_global`),
+//! not inside this module's private `Inner` — `DrmLeaseHandler::
+//! drm_lease_state` has to hand back a `&mut DrmLeaseState` tied to
+//! `&mut self`, which isn't possible for anything reached through
+//! `Rc<RefCell<_>>` (a `RefMut`'s borrow can't outlive the temporary that
+//! produced it); everything else this protocol needs (the DRM device
+//! handle, the non-desktop connector list, the active-lease list) has no
+//! such constraint and stays in `Inner` as normal, reached via
+//! `State::udev_inner` the same way `dmabuf_renderer` reaches the
+//! renderer.
 //!
 //! Rendering is demand-driven, same principle as `winit_backend.rs`'s use
 //! of `redraw_ping`/`request_redraw()`: nothing here polls on a timer.
@@ -62,12 +101,15 @@ use smithay::input::pointer::{CursorImageAttributes, CursorImageStatus};
 use smithay::output::{Mode as WlMode, Output, PhysicalProperties};
 use smithay::reexports::calloop::ping::PingSource;
 use smithay::reexports::calloop::{EventLoop, LoopHandle};
-use smithay::reexports::drm::control::{ModeTypeFlags, connector, crtc};
+use smithay::reexports::drm::control::{Device as _, ModeTypeFlags, connector, crtc};
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::utils::{DeviceFd, IsAlive, Point, Scale, Transform};
 use smithay::wayland::compositor::with_states;
 use smithay::wayland::dmabuf::DmabufFeedbackBuilder;
+use smithay::wayland::drm_lease::{
+    DrmLease, DrmLeaseBuilder, DrmLeaseHandler, DrmLeaseRequest, DrmLeaseState, LeaseRejected,
+};
 use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 
 use crate::State;
@@ -93,7 +135,11 @@ struct SurfaceData {
     frame_pending: bool,
 }
 
-struct Inner {
+/// `pub(crate)` (not module-private) solely so `state.rs` can name this
+/// type for `State::udev_inner`'s `Rc<RefCell<Inner>>` — see this
+/// module's doc and `dmabuf_renderer`'s identical precedent. Every field
+/// stays private; nothing outside this module ever reaches inside.
+pub(crate) struct Inner {
     /// `Rc<RefCell<_>>`, not owned outright — `State::dmabuf_renderer`
     /// holds a clone of the same renderer so `DmabufHandler::dmabuf_imported`
     /// (`handlers/mod.rs`) can attempt a client buffer import, since
@@ -114,6 +160,20 @@ struct Inner {
     /// the same pixel data to a fresh GPU texture even when the cursor's
     /// visible frame hasn't changed since the last one.
     pointer_image_cache: Vec<(xcursor::parser::Image, MemoryRenderBuffer)>,
+    /// Connectors currently classified as leasable (see the module doc's
+    /// DRM-leasing section) together with the CRTC `rescan_connectors`
+    /// found for them. Never gets a desktop `Output`/`SurfaceData` entry
+    /// at all — tracked here purely so `DrmLeaseHandler::lease_request`
+    /// (below) knows which CRTC a client-requested connector maps to.
+    non_desktop_connectors: Vec<(connector::Handle, crtc::Handle)>,
+    /// Leases currently handed out to clients. Dropping an entry revokes
+    /// it (see `DrmLease`'s own `Drop` impl) — populated by
+    /// `DrmLeaseHandler::new_active_lease`, drained one at a time by
+    /// `lease_destroyed`, and drained wholesale on session pause (VT
+    /// switch away), matching anvil's own hard-revoke-on-pause behavior
+    /// rather than trying to preserve a lease through a switch that's
+    /// about to take DRM master away regardless.
+    active_leases: Vec<DrmLease>,
 }
 
 pub fn init_udev(
@@ -271,7 +331,29 @@ pub fn init_udev(
         pointer_image: Cursor::load(),
         pointer_element: PointerElement::default(),
         pointer_image_cache: Vec::new(),
+        non_desktop_connectors: Vec::new(),
+        active_leases: Vec::new(),
     }));
+    // Shared with `DrmLeaseHandler`'s trait methods (`&mut self` on
+    // `State`, dispatched by Smithay's own protocol code with no access
+    // to anything captured in this function's closures) — same reasoning
+    // as `state.dmabuf_renderer` above. `None` under `winit_backend.rs`,
+    // which never calls this function at all.
+    state.udev_inner = Some(inner.clone());
+
+    // DRM leasing (`wp_drm_lease_v1`) — see the module doc. Non-fatal on
+    // failure: `DrmLeaseState::new` does a one-shot open+drop-master
+    // probe against this node's own device path before creating the
+    // global, which can fail on an unusual permission setup — matches
+    // anvil's own `.inspect_err(...).ok()` exactly. The desktop output
+    // must come up regardless of whether this succeeds.
+    state.drm_leasing_global = DrmLeaseState::new::<State>(&state.display_handle, &node)
+        .inspect_err(|err| {
+            tracing::warn!(
+                "failed to initialize the drm-lease global, DRM leasing (VR headsets, etc.) will be unavailable this session: {err}"
+            );
+        })
+        .ok();
 
     let loop_handle = event_loop.handle();
 
@@ -316,11 +398,24 @@ pub fn init_udev(
                 SessionEvent::PauseSession => {
                     tracing::info!("session paused (VT switched away)");
                     inner.borrow_mut().drm_output_manager.pause();
+                    // Hard-revoke every active lease rather than trying to
+                    // soft-suspend it: losing the VT means DRM master
+                    // itself is about to be taken away, so whatever a
+                    // leased client thinks it can still do with its
+                    // planes/CRTC is moot regardless — matches anvil's own
+                    // `active_leases.clear()` here.
+                    inner.borrow_mut().active_leases.clear();
+                    if let Some(leasing_global) = state.drm_leasing_global.as_mut() {
+                        leasing_global.suspend();
+                    }
                 }
                 SessionEvent::ActivateSession => {
                     tracing::info!("session resumed (VT switched back)");
                     if let Err(err) = inner.borrow_mut().drm_output_manager.lock().activate(false) {
                         tracing::warn!("failed to reactivate the DRM device: {err}");
+                    }
+                    if let Some(leasing_global) = state.drm_leasing_global.as_mut() {
+                        leasing_global.resume::<State>();
                     }
                     // Nothing else re-kicks rendering after a resume —
                     // explicitly force a fresh pass on every crtc.
@@ -425,6 +520,51 @@ fn connector_connected(
     let output_name = format!("{}-{}", connector.interface().as_str(), connector.interface_id());
     tracing::info!("setting up connector {output_name} on {crtc:?}");
 
+    // Leasable ("non-desktop") vs. desktop connector — see the module
+    // doc's DRM-leasing section. Checked before any desktop `Output`
+    // setup below: a leasable connector never gets one at all.
+    let is_leasable = {
+        let inner_ref = inner.borrow();
+        let drm_device = inner_ref.drm_output_manager.device();
+        let non_desktop = drm_device
+            .get_properties(connector.handle())
+            .ok()
+            .and_then(|props| {
+                let (info, value) = props
+                    .into_iter()
+                    .filter_map(|(handle, value)| {
+                        let info = drm_device.get_property(handle).ok()?;
+                        Some((info, value))
+                    })
+                    .find(|(info, _)| info.name().to_str() == Ok("non-desktop"))?;
+                info.value_type().convert_value(value).as_boolean()
+            })
+            .unwrap_or(false);
+        // Defense-in-depth: `non-desktop` alone depends on driver/EDID
+        // correctness, and the built-in panel must never be leasable
+        // regardless — see the module doc.
+        non_desktop
+            && !matches!(
+                connector.interface(),
+                connector::Interface::EmbeddedDisplayPort
+                    | connector::Interface::LVDS
+                    | connector::Interface::DSI
+                    | connector::Interface::DPI
+            )
+    };
+
+    if is_leasable {
+        tracing::info!(
+            "connector {output_name} is non-desktop, offering it for DRM leasing instead of desktop use"
+        );
+        let mut inner_mut = inner.borrow_mut();
+        inner_mut.non_desktop_connectors.push((connector.handle(), crtc));
+        if let Some(leasing_global) = state.drm_leasing_global.as_mut() {
+            leasing_global.add_connector::<State>(connector.handle(), output_name.clone(), output_name);
+        }
+        return;
+    }
+
     let mode_id = connector
         .modes()
         .iter()
@@ -506,10 +646,26 @@ fn connector_connected(
 fn connector_disconnected(
     state: &mut State,
     inner: &Rc<RefCell<Inner>>,
-    _connector: connector::Info,
+    connector: connector::Info,
     crtc: crtc::Handle,
 ) {
-    let removed = inner.borrow_mut().surfaces.remove(&crtc);
+    let mut inner_mut = inner.borrow_mut();
+    if let Some(pos) = inner_mut
+        .non_desktop_connectors
+        .iter()
+        .position(|(handle, _)| *handle == connector.handle())
+    {
+        // Was leasable, never had a desktop `Output`/`SurfaceData` entry
+        // to tear down — see `connector_connected`'s classification.
+        inner_mut.non_desktop_connectors.remove(pos);
+        drop(inner_mut);
+        if let Some(leasing_global) = state.drm_leasing_global.as_mut() {
+            leasing_global.withdraw_connector(connector.handle());
+        }
+        return;
+    }
+    let removed = inner_mut.surfaces.remove(&crtc);
+    drop(inner_mut);
     if let Some(surface) = removed {
         state.space.unmap_output(&surface.output);
     }
@@ -713,4 +869,106 @@ fn frame_finish(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Handl
     }
 
     render_surface(state, inner, crtc);
+}
+
+/// DRM leasing (`wp_drm_lease_v1`) — see the module doc's DRM-leasing
+/// section for the overall design. `node` is never looked up against
+/// anything: mudhuts is single-GPU/single-seat (module doc), so it's
+/// always the one `DrmNode` this whole module manages, unlike anvil's
+/// `HashMap<DrmNode, BackendData>` indirection.
+impl DrmLeaseHandler for State {
+    fn drm_lease_state(&mut self, _node: DrmNode) -> &mut DrmLeaseState {
+        // The trait forces an unconditional `&mut DrmLeaseState` return
+        // with no `Option`/`Result` to signal absence through — and
+        // nothing here can substitute a fallback value, so this really
+        // is the one spot in this protocol's implementation where a
+        // documented `.expect()` (not a silent `.unwrap()`) is the only
+        // option, matching anvil's own `.leasing_global.as_mut().unwrap()`
+        // for the identical reason. It's provably safe: this method is
+        // only ever called by Smithay's own drm_lease dispatch code
+        // (`handlers/mod.rs`'s blanket `delegate_dispatch2!(State)`),
+        // which is only reachable once a client has bound the
+        // `wp_drm_lease_device_v1` global — and that global is only ever
+        // created by `init_udev` in the same place that sets this field,
+        // right after a successful `DrmLeaseState::new`. If that call
+        // had failed, the global was never registered, so no client
+        // request could ever reach this method in the first place.
+        self.drm_leasing_global
+            .as_mut()
+            .expect("drm_lease_state is only reachable after init_udev's DrmLeaseState::new succeeded")
+    }
+
+    fn lease_request(
+        &mut self,
+        _node: DrmNode,
+        request: DrmLeaseRequest,
+    ) -> Result<DrmLeaseBuilder, LeaseRejected> {
+        // Unlike `drm_lease_state` above, this method has a real `Result`
+        // to signal failure through — so an absent `udev_inner` (should
+        // never happen for the same reason as `drm_lease_state`'s doc
+        // comment, but there's no reason to risk a panic when rejecting
+        // the lease costs nothing) just denies the request instead.
+        let Some(udev_inner) = self.udev_inner.as_ref() else {
+            tracing::warn!("lease_request with no udev backend state, denying");
+            return Err(LeaseRejected::default());
+        };
+        let inner = udev_inner.borrow();
+        let drm_device = inner.drm_output_manager.device();
+        let mut builder = DrmLeaseBuilder::new(drm_device);
+        for conn in request.connectors {
+            let Some((_, crtc)) = inner
+                .non_desktop_connectors
+                .iter()
+                .find(|(handle, _)| *handle == conn)
+            else {
+                tracing::warn!(?conn, "lease requested for a desktop connector, denying");
+                return Err(LeaseRejected::default());
+            };
+            builder.add_connector(conn);
+            builder.add_crtc(*crtc);
+            // At least the primary plane (required to actually drive the
+            // CRTC) plus the cursor plane if one is free — matches
+            // anvil's own `lease_request` exactly; the plane-claiming
+            // mechanism (`DrmDevice::claim_plane`) is the same one
+            // `DrmOutputManager`/`DrmCompositor` use internally for
+            // desktop rendering, so this can't double-claim a plane
+            // that's already in use there.
+            let planes = drm_device.planes(crtc).map_err(LeaseRejected::with_cause)?;
+            let Some((primary_plane, primary_claim)) = planes.primary.iter().find_map(|plane| {
+                drm_device
+                    .claim_plane(plane.handle, *crtc)
+                    .map(|claim| (plane, claim))
+            }) else {
+                tracing::warn!(?conn, "no free primary plane available to lease, denying");
+                return Err(LeaseRejected::default());
+            };
+            builder.add_plane(primary_plane.handle, primary_claim);
+            if let Some((cursor_plane, cursor_claim)) = planes.cursor.iter().find_map(|plane| {
+                drm_device
+                    .claim_plane(plane.handle, *crtc)
+                    .map(|claim| (plane, claim))
+            }) {
+                builder.add_plane(cursor_plane.handle, cursor_claim);
+            }
+        }
+        Ok(builder)
+    }
+
+    fn new_active_lease(&mut self, _node: DrmNode, lease: DrmLease) {
+        let Some(udev_inner) = self.udev_inner.as_ref() else {
+            // Should never happen (see `drm_lease_state`'s doc comment) —
+            // but there's nowhere to stash this lease without `Inner`, so
+            // just let it drop immediately, which revokes it.
+            tracing::warn!("new_active_lease with no udev backend state, revoking the lease immediately");
+            return;
+        };
+        udev_inner.borrow_mut().active_leases.push(lease);
+    }
+
+    fn lease_destroyed(&mut self, _node: DrmNode, lease_id: u32) {
+        let Some(udev_inner) = self.udev_inner.as_ref() else {
+            return;
+        };
+        udev_inner.borrow_mut().active_leases.retain(|lease| lease.id() != lease_id);
+    }
 }
