@@ -547,5 +547,18 @@ impl State {
             }
             _ => {}
         }
+
+        // Forwarding a key/button/axis event to a client (`wl_keyboard`/
+        // `wl_pointer`) only queues the protocol message in its outgoing
+        // buffer — nothing else flushes client sockets between redraw
+        // passes (see `udev_backend.rs`'s `render_surface`, the only other
+        // `flush_clients()` call site). Flushing here is deliberately
+        // decoupled from `request_redraw()`: forcing a full render pass
+        // (damage check, GPU composite) just to deliver bytes already
+        // sitting in a buffer would be real, avoidable work for something
+        // that's really just "finish this write()". Under winit this is a
+        // harmless no-op call (its own event loop iteration already
+        // flushes via the host's normal dispatch cycle).
+        let _ = self.display_handle.flush_clients();
     }
 }

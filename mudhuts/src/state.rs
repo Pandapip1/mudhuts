@@ -263,6 +263,15 @@ impl State {
                 if let Err(err) = unsafe { display.get_mut().dispatch_clients(state) } {
                     tracing::warn!("error dispatching wayland clients: {err}");
                 }
+                // Dispatching a client's request can itself queue a
+                // response (an initial configure, an ack'd commit's
+                // buffer-release, ...) — same reasoning as
+                // `input.rs`'s `process_input_event`: nothing else
+                // flushes client sockets between redraw passes, so
+                // without this a client wouldn't see its own request's
+                // response until some unrelated redraw happened to flush
+                // it.
+                let _ = state.display_handle.flush_clients();
                 Ok(PostAction::Continue)
             },
         )?;
