@@ -761,7 +761,21 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
             if !result.is_empty {
                 tracing::debug!("render_surface: damage found for {crtc:?}, queuing frame");
                 match surface.drm_output.queue_frame(()) {
-                    Ok(()) => surface.frame_pending = true,
+                    Ok(()) => {
+                        surface.frame_pending = true;
+                        // Only now — a locked frame has actually been
+                        // built (via `render.rs`'s early-return guard) and
+                        // successfully queued for real presentation — is
+                        // it safe to tell the locking client its lock
+                        // succeeded. See `handlers/session_lock.rs`'s
+                        // `lock` doc comment for why this can't happen any
+                        // earlier (e.g. synchronously inside that handler).
+                        if state.locked
+                            && let Some(confirmation) = state.pending_lock.take()
+                        {
+                            confirmation.lock();
+                        }
+                    }
                     Err(err) => tracing::warn!("failed to queue DRM frame: {err}"),
                 }
             } else {

@@ -371,6 +371,44 @@ impl State {
             .map(|l| l.wl_surface().clone())
     }
 
+    /// Where every input event goes while `self.locked` (see
+    /// `handlers/session_lock.rs`) — checked as the very first thing in
+    /// [`Self::process_input_event`], ahead of even
+    /// [`Self::exclusive_layer_surface`] (a lock wins over an `exclusive`
+    /// layer-shell surface too, the same way it wins over everything
+    /// else). A keyboard event is forwarded to the lock surface's own
+    /// `wl_surface` if one exists and is still alive (focusing it first —
+    /// harmless to repeat every event, since `set_focus` is a no-op once
+    /// already focused there); every other event, including *every*
+    /// pointer variant and any keyboard event with no lock surface to
+    /// receive it, is dropped outright — no keymap lookup, no
+    /// `try_click_chrome`, no terminal mouse-report/selection, no
+    /// `space.element_under`, nothing.
+    fn process_locked_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
+        let InputEvent::Keyboard { event } = event else {
+            return;
+        };
+        let Some(surface) = self
+            .lock_surface
+            .as_ref()
+            .filter(|s| s.alive())
+            .map(|s| s.wl_surface().clone())
+        else {
+            return;
+        };
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
+        let serial = SERIAL_COUNTER.next_serial();
+        let time = Event::time_msec(&event);
+        let keycode = event.key_code();
+        let key_state = event.state();
+        keyboard.set_focus(self, Some(surface), serial);
+        keyboard.input::<(), _>(self, keycode, key_state, serial, time, |_, _, _| {
+            FilterResult::Forward
+        });
+    }
+
     fn handle_action(&mut self, action: Action) {
         match action {
             Action::CloseFocused => {
@@ -508,6 +546,20 @@ impl State {
     }
 
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
+        if self.locked {
+            // Checked before the match below even starts, not threaded
+            // into each of its arms individually — see
+            // `Self::process_locked_input_event`'s doc comment for why a
+            // locked session has to sit above literally everything else
+            // this function does, including `exclusive_layer_surface()`'s
+            // own check further down (which only ever runs for the
+            // Keyboard arm, and only once we already know we're not
+            // locked).
+            self.process_locked_input_event(event);
+            let _ = self.display_handle.flush_clients();
+            return;
+        }
+
         match event {
             InputEvent::Keyboard { event } => {
                 let serial = SERIAL_COUNTER.next_serial();
