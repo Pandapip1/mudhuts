@@ -9,6 +9,7 @@ mod input;
 mod keybindings;
 mod main_window;
 mod ownership;
+mod redraw;
 mod render;
 mod stack;
 mod state;

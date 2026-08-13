@@ -22,6 +22,14 @@
 //! its position need to cross over into genuinely `Logical` space to
 //! match `self.space`'s own contract — see [`advance_drag`]/[`finish_drag`]
 //! for exactly where that conversion happens.
+//!
+//! First real adopter of `crate::redraw`'s `Redrawable`/`HitTestable`
+//! traits (composable Hut hierarchy RFC, migration step 1) — chosen as
+//! the proof point since its render/hit-test rect math ([`handle_layout`])
+//! was already shared between drawing and clicking before either trait
+//! existed. [`DockDrag`] holds a `RedrawHandle` instead of `finish_drag`
+//! calling `State::request_redraw()` by hand; [`DockHandles`] wraps
+//! `handle_layout` behind `HitTestable` for [`start_drag`]'s own hit-test.
 
 use smithay::backend::renderer::Renderer;
 use smithay::backend::renderer::element::Id;
@@ -36,9 +44,10 @@ use smithay::utils::{Buffer, Physical, Point, Rectangle, Scale, Size, Transform}
 
 use crate::State;
 use crate::chrome::{to_color32f, window_title};
-use crate::grabs::nearest_edge_within_threshold;
 use crate::console_hut::ConsoleHut;
+use crate::grabs::nearest_edge_within_threshold;
 use crate::main_window::{Dock, Edge};
+use crate::redraw::{Hit, HitTestable, Redrawable, RedrawHandle};
 use crate::render::OutputRenderElements;
 
 /// Base sizes (scale 1.0) — scaled via `crate::render::scaled` (or, for
@@ -75,6 +84,16 @@ pub struct DockDrag {
     /// drag — once true, further motion just repositions it directly,
     /// same as a real floating-window move.
     pub detached: bool,
+    /// Set via [`Redrawable::attach_redraw_handle`] right after this
+    /// `DockDrag` is constructed in [`start_drag`] — `None` only for the
+    /// instant between the two, never observed by anything else.
+    redraw: Option<RedrawHandle>,
+}
+
+impl Redrawable for DockDrag {
+    fn attach_redraw_handle(&mut self, handle: RedrawHandle) {
+        self.redraw = Some(handle);
+    }
 }
 
 /// One docked handle's clickable/drawable rectangle, plus which surface
@@ -127,6 +146,26 @@ pub fn handle_layout(hut: &ConsoleHut, output_size: (i32, i32), scale: f64) -> V
         }
     }
     handles
+}
+
+/// Borrowed view over the focused ConsoleHut's currently-docked handles,
+/// for hit-testing a click against them — see [`start_drag`]. Exists so
+/// that hit-test (this impl) and rendering ([`build`]) both go through
+/// [`handle_layout`], the same way `chrome::tab_layout`/`build` already
+/// share layout — never two independently-derived rect computations.
+struct DockHandles<'a> {
+    hut: &'a ConsoleHut,
+    output_size: (i32, i32),
+    scale: f64,
+}
+
+impl HitTestable for DockHandles<'_> {
+    fn hit_test(&self, point: Point<i32, Physical>) -> Option<Hit> {
+        handle_layout(self.hut, self.output_size, self.scale)
+            .into_iter()
+            .find(|h| h.rect.contains(point))
+            .map(|h| Hit::DockHandle(h.surface))
+    }
 }
 
 fn truncate(title: &str) -> String {
@@ -227,15 +266,23 @@ pub fn build(hut: &mut ConsoleHut, renderer: &mut GlesRenderer, output_size: (i3
 /// physical, like [`Handle::rect`] — `input.rs` converts the seat's
 /// (genuinely Logical) pointer position before calling this.
 pub fn start_drag(state: &mut State, pos: Point<f64, Physical>) -> bool {
-    let handles = handle_layout(state.stack.focused(), state.output_size, state.output_scale());
-    let Some(handle) = handles.into_iter().find(|h| h.rect.to_f64().contains(pos)) else {
+    let handles = DockHandles {
+        hut: state.stack.focused(),
+        output_size: state.output_size,
+        scale: state.output_scale(),
+    };
+    let point = Point::from((pos.x.round() as i32, pos.y.round() as i32));
+    let Some(Hit::DockHandle(surface)) = handles.hit_test(point) else {
         return false;
     };
-    state.dock_drag = Some(DockDrag {
-        surface: handle.surface,
+    let mut drag = DockDrag {
+        surface,
         start: pos,
         detached: false,
-    });
+        redraw: None,
+    };
+    drag.attach_redraw_handle(state.redraw_handle());
+    state.dock_drag = Some(drag);
     true
 }
 
@@ -311,5 +358,9 @@ pub fn finish_drag(state: &mut State) {
         };
     }
     state.sync_visible_main_window();
-    state.request_redraw();
+    // Via the handle attached in `start_drag`, not `state.request_redraw()`
+    // directly — see `crate::redraw`'s module doc.
+    if let Some(redraw) = &drag.redraw {
+        redraw.mark_dirty();
+    }
 }

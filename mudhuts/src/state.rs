@@ -450,6 +450,13 @@ impl State {
         self.redraw_ping.ping();
     }
 
+    /// A cloneable handle onto the same ping [`Self::request_redraw`] uses,
+    /// for anything implementing [`crate::redraw::Redrawable`] that isn't
+    /// `State` itself — see that module's doc comment.
+    pub fn redraw_handle(&self) -> crate::redraw::RedrawHandle {
+        crate::redraw::RedrawHandle::new(self.redraw_ping.clone())
+    }
+
     /// Route a `TermEvent` from one of The Stack's Huts (identified by
     /// `id`, stable across the Stack's own reordering/discarding) to the
     /// right place.
