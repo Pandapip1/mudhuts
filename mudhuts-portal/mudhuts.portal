@@ -1,0 +1,16 @@
+# xdg-desktop-portal backend descriptor for mudhuts-portal.
+#
+# Install to: $DATADIR/xdg-desktop-portal/portals/mudhuts.portal
+# (typically /usr/share/xdg-desktop-portal/portals/mudhuts.portal, or
+# /etc/xdg-desktop-portal/portals/mudhuts.portal for a local override).
+#
+# This tells the xdg-desktop-portal daemon that a backend named "mudhuts"
+# exists, which D-Bus interfaces it implements, and which well-known bus
+# name activates it (see mudhuts-portal.service in this same directory).
+# It does NOT by itself make xdg-desktop-portal prefer this backend for
+# anything — that's portals.conf's job (see mudhuts-portals.conf).
+
+[portal]
+DBusName=org.freedesktop.impl.portal.desktop.mudhuts
+Interfaces=org.freedesktop.impl.portal.Settings;org.freedesktop.impl.portal.Screenshot;org.freedesktop.impl.portal.ScreenCast;
+UseIn=mudhuts

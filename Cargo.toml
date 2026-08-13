@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["mudhuts", "mudhuts-term", "mudhuts-protocols", "mudhuts-test-client", "mudhuts-authority-helper"]
+members = ["mudhuts", "mudhuts-term", "mudhuts-protocols", "mudhuts-test-client", "mudhuts-authority-helper", "mudhuts-portal"]
 
 [workspace.package]
 edition = "2024"
