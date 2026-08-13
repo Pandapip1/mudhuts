@@ -820,7 +820,7 @@ impl State {
     /// checked in the same front-to-back z-order `render.rs`'s
     /// `build_frame_elements` actually draws: a `wlr-layer-shell` Top or
     /// Overlay surface first (drawn above normal content — see
-    /// `layer_elements`'s doc comment), then whatever's mapped in
+    /// `composite_normal_content`'s doc comment), then whatever's mapped in
     /// `self.space` (the focused ConsoleHut's visible Main Window/Floating Windows/
     /// Alerts), then a Bottom or Background layer surface last. Doesn't
     /// need to special-case the terminal-visible branch: while the
@@ -839,10 +839,8 @@ impl State {
 
         if let Some(output) = output {
             let layers = layer_map_for_output(output);
-            if let Some(hit) = layers
-                .layer_under(WlrLayer::Overlay, pos)
-                .or_else(|| layers.layer_under(WlrLayer::Top, pos))
-                .and_then(|layer| Self::under_layer(&layers, layer, pos))
+            if let Some(hit) = layer_surface_under(&layers, pos, true)
+                .and_then(|layer| under_layer(&layers, layer, pos))
             {
                 return Some(hit);
             }
@@ -869,29 +867,53 @@ impl State {
 
         let output = output?;
         let layers = layer_map_for_output(output);
+        layer_surface_under(&layers, pos, false).and_then(|layer| under_layer(&layers, layer, pos))
+    }
+}
+
+/// Find whichever `wlr-layer-shell` surface (if any) is under `pos`,
+/// restricted to either the "above normal content" half (Top + Overlay,
+/// `above = true`) or the "below" half (Background + Bottom,
+/// `above = false`) — the same split `render.rs`'s layer-shell compositing
+/// already uses. Composable Hut hierarchy RFC migration step 5 sub-step 4
+/// (Q2)'s hit-test consolidation: this exact upper/lower split used to be
+/// re-derived independently by `State::surface_under` and
+/// `input.rs::try_click_layer_surface`, one for spatial hit-testing, one
+/// for click routing — now shared by both, alongside [`under_layer`] for
+/// the "resolve the actual surface within that layer" half each of them
+/// also used to duplicate.
+pub(crate) fn layer_surface_under(
+    layers: &smithay::desktop::LayerMap,
+    pos: Point<f64, Logical>,
+    above: bool,
+) -> Option<&smithay::desktop::LayerSurface> {
+    if above {
+        layers
+            .layer_under(WlrLayer::Overlay, pos)
+            .or_else(|| layers.layer_under(WlrLayer::Top, pos))
+    } else {
         layers
             .layer_under(WlrLayer::Bottom, pos)
             .or_else(|| layers.layer_under(WlrLayer::Background, pos))
-            .and_then(|layer| Self::under_layer(&layers, layer, pos))
     }
+}
 
-    /// Shared tail of a layer-surface hit test: resolve `layer`'s own
-    /// surface (or a subsurface/popup of it) under `pos`, given `pos` is
-    /// still in output-relative coordinates (not yet offset by the
-    /// layer's own on-screen location).
-    fn under_layer(
-        layers: &smithay::desktop::LayerMap,
-        layer: &smithay::desktop::LayerSurface,
-        pos: Point<f64, Logical>,
-    ) -> Option<(
-        smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
-        Point<f64, Logical>,
-    )> {
-        let layer_loc = layers.layer_geometry(layer)?.loc;
-        layer
-            .surface_under(pos - layer_loc.to_f64(), WindowSurfaceType::ALL)
-            .map(|(s, p)| (s, (p + layer_loc).to_f64()))
-    }
+/// Shared tail of a layer-surface hit test: resolve `layer`'s own surface
+/// (or a subsurface/popup of it) under `pos`, given `pos` is still in
+/// output-relative coordinates (not yet offset by the layer's own
+/// on-screen location).
+pub(crate) fn under_layer(
+    layers: &smithay::desktop::LayerMap,
+    layer: &smithay::desktop::LayerSurface,
+    pos: Point<f64, Logical>,
+) -> Option<(
+    smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+    Point<f64, Logical>,
+)> {
+    let layer_loc = layers.layer_geometry(layer)?.loc;
+    layer
+        .surface_under(pos - layer_loc.to_f64(), WindowSurfaceType::ALL)
+        .map(|(s, p)| (s, (p + layer_loc).to_f64()))
 }
 
 /// Data associated with a wayland client that connects to mudhuts.

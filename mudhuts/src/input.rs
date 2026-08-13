@@ -5,7 +5,7 @@ use smithay::backend::input::{
     AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
     KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
 };
-use smithay::desktop::{WindowSurfaceType, layer_map_for_output};
+use smithay::desktop::layer_map_for_output;
 use smithay::input::keyboard::{FilterResult, KeysymHandle, ModifiersState, keysyms};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -361,34 +361,25 @@ impl State {
     ///
     /// `above` picks which half of the layer stack to check: `true` for
     /// Top/Overlay (checked *before* normal terminal/window content, since
-    /// those render above it — see `render.rs`'s `layer_elements`), `false`
-    /// for Bottom/Background (checked only once nothing else — chrome,
-    /// Top/Overlay, normal content — already claimed the click).
+    /// those render above it — see `render.rs`'s `composite_normal_content`),
+    /// `false` for Bottom/Background (checked only once nothing else —
+    /// chrome, Top/Overlay, normal content — already claimed the click).
+    ///
+    /// Shares `state.rs`'s `layer_surface_under`/`under_layer` with
+    /// `State::surface_under` (composable Hut hierarchy RFC migration step
+    /// 5 sub-step 4's hit-test consolidation) — this used to independently
+    /// re-derive the exact same upper/lower split and per-layer surface
+    /// resolution by hand.
     fn try_click_layer_surface(&mut self, pos: Point<f64, Logical>, serial: Serial, above: bool) -> bool {
         let Some(output) = self.output.clone() else {
             return false;
         };
         let focus_target = {
             let layers = layer_map_for_output(&output);
-            let hit = if above {
-                layers
-                    .layer_under(WlrLayer::Overlay, pos)
-                    .or_else(|| layers.layer_under(WlrLayer::Top, pos))
-            } else {
-                layers
-                    .layer_under(WlrLayer::Bottom, pos)
-                    .or_else(|| layers.layer_under(WlrLayer::Background, pos))
-            };
-            let Some(layer) = hit else {
+            let Some(layer) = crate::state::layer_surface_under(&layers, pos, above) else {
                 return false;
             };
-            let Some(layer_loc) = layers.layer_geometry(layer).map(|geo| geo.loc) else {
-                return false;
-            };
-            if layer
-                .surface_under(pos - layer_loc.to_f64(), WindowSurfaceType::ALL)
-                .is_none()
-            {
+            if crate::state::under_layer(&layers, layer, pos).is_none() {
                 return false;
             }
             layer.can_receive_keyboard_focus().then(|| layer.wl_surface().clone())
