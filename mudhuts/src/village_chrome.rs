@@ -13,7 +13,7 @@
 //! practice this never happens, since [`Village::collapse_if_singleton`]
 //! unwraps it immediately.
 
-use smithay::backend::renderer::Renderer;
+use smithay::backend::renderer::{Renderer, Texture};
 use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
@@ -134,7 +134,14 @@ pub fn handle_click(village: &mut Village, pos: (i32, i32), y: i32, cell_w: usiz
 /// isn't a Tab-Village with 2+ children. Returns the elements plus the Y
 /// where whatever's next (a deeper level, or `chrome.rs`'s own strip)
 /// should start.
-pub fn build(village: &mut Village, renderer: &mut GlesRenderer, y: i32, cell_w: usize, cell_h: i32) -> (Vec<Element>, i32) {
+pub fn build(
+    village: &mut Village,
+    renderer: &mut GlesRenderer,
+    y: i32,
+    cell_w: usize,
+    cell_h: i32,
+    scale: f64,
+) -> (Vec<Element>, i32) {
     let Village::Tab(tab) = village else {
         return (Vec::new(), y);
     };
@@ -182,6 +189,8 @@ pub fn build(village: &mut Village, renderer: &mut GlesRenderer, y: i32, cell_w:
         let (text_id, bg_id) = tab.tab_ids[i].clone();
         match texture {
             Ok((texture, snapshot)) => {
+                let texture_size = texture.size();
+                let logical_size = crate::render::physical_element_size(texture_size.w, texture_size.h, scale);
                 let text = TextureRenderElement::from_texture_with_damage(
                     text_id,
                     renderer.context_id(),
@@ -194,7 +203,7 @@ pub fn build(village: &mut Village, renderer: &mut GlesRenderer, y: i32, cell_w:
                     Transform::Normal,
                     None,
                     None,
-                    None,
+                    Some(logical_size),
                     None,
                     snapshot,
                     Kind::Unspecified,
@@ -209,7 +218,14 @@ pub fn build(village: &mut Village, renderer: &mut GlesRenderer, y: i32, cell_w:
         elements.push(Element::from(background));
     }
 
-    let (deeper_elements, next_y) = build(&mut tab.children[tab.active], renderer, y + tab_h(cell_h), cell_w, cell_h);
+    let (deeper_elements, next_y) = build(
+        &mut tab.children[tab.active],
+        renderer,
+        y + tab_h(cell_h),
+        cell_w,
+        cell_h,
+        scale,
+    );
     elements.extend(deeper_elements);
     (elements, next_y)
 }

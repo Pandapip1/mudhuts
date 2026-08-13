@@ -23,7 +23,7 @@
 //! match `self.space`'s own contract — see [`advance_drag`]/[`finish_drag`]
 //! for exactly where that conversion happens.
 
-use smithay::backend::renderer::Renderer;
+use smithay::backend::renderer::{Renderer, Texture};
 use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
@@ -132,7 +132,7 @@ fn truncate(title: &str) -> String {
 
 /// Build the docked-handle chrome's render elements, or an empty list if
 /// there's nothing docked right now.
-pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer, output_size: (i32, i32)) -> Vec<Element> {
+pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer, output_size: (i32, i32), scale: f64) -> Vec<Element> {
     let handles = handle_layout(hut, output_size);
     let mut elements = Vec::new();
 
@@ -170,6 +170,8 @@ pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer, output_size: (i32, i32)
         };
 
         if let Some((text_id, texture, snapshot)) = rendered {
+            let texture_size = texture.size();
+            let logical_size = crate::render::physical_element_size(texture_size.w, texture_size.h, scale);
             let text = TextureRenderElement::from_texture_with_damage(
                 text_id,
                 renderer.context_id(),
@@ -182,7 +184,7 @@ pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer, output_size: (i32, i32)
                 Transform::Normal,
                 None,
                 None,
-                None,
+                Some(logical_size),
                 None,
                 snapshot,
                 Kind::Unspecified,

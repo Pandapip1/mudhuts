@@ -5,7 +5,7 @@
 //! between, so no chrome to draw (matches `Ctrl+`` being a no-op there
 //! too).
 
-use smithay::backend::renderer::Renderer;
+use smithay::backend::renderer::{Renderer, Texture};
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
@@ -144,7 +144,7 @@ pub fn tab_layout(hut: &Hut, y: i32) -> Vec<TabRect> {
 /// Build the tab strip's render elements in front-to-back order, starting
 /// at physical-pixel row `y`, or an empty list if the focused Hut has no
 /// Main Windows.
-pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer, y: i32) -> Vec<Element> {
+pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer, y: i32, scale: f64) -> Vec<Element> {
     let rects = tab_layout(hut, y);
     if rects.is_empty() {
         return Vec::new();
@@ -206,6 +206,8 @@ pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer, y: i32) -> Vec<Element>
 
         match label_texture {
             Ok((texture, snapshot)) => {
+                let texture_size = texture.size();
+                let logical_size = crate::render::physical_element_size(texture_size.w, texture_size.h, scale);
                 let text = TextureRenderElement::from_texture_with_damage(
                     text_ids[i].clone(),
                     renderer.context_id(),
@@ -218,7 +220,7 @@ pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer, y: i32) -> Vec<Element>
                     Transform::Normal,
                     None,
                     None,
-                    None,
+                    Some(logical_size),
                     None,
                     snapshot,
                     Kind::Unspecified,

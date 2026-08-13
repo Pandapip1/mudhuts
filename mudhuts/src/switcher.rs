@@ -28,7 +28,7 @@ type Element = OutputRenderElements<GlesRenderer, WaylandSurfaceRenderElement<Gl
 /// `winit_backend.rs`, which pushes these ahead of the normal background
 /// elements — index 0 renders on top), or an empty list if no preview
 /// session is open.
-pub fn build(stack: &HutStack, output_size: (i32, i32), renderer: &GlesRenderer) -> Vec<Element> {
+pub fn build(stack: &HutStack, output_size: (i32, i32), renderer: &GlesRenderer, scale: f64) -> Vec<Element> {
     if !stack.is_previewing() {
         return Vec::new();
     }
@@ -62,6 +62,14 @@ pub fn build(stack: &HutStack, output_size: (i32, i32), renderer: &GlesRenderer)
             // wraps the same ever-changing terminal content as the main
             // render element (see `Hut::damage_tracker`'s doc comment),
             // just scaled down.
+            // `THUMB_SIZE` is a physical-pixel on-screen size (see this
+            // module's other constants) — divided by `scale` here for the
+            // same reason `render.rs`'s `physical_element_size` exists:
+            // `Element::geometry(scale)` re-applies the output's scale to
+            // whatever `size` this element is given, so passing
+            // `THUMB_SIZE` directly would render the thumbnail at
+            // `THUMB_SIZE * scale` physical pixels instead.
+            let thumb_size = crate::render::physical_element_size(THUMB_SIZE.0, THUMB_SIZE.1, scale);
             let element = TextureRenderElement::from_texture_with_damage(
                 hut.thumbnail_id.clone(),
                 renderer.context_id(),
@@ -71,7 +79,7 @@ pub fn build(stack: &HutStack, output_size: (i32, i32), renderer: &GlesRenderer)
                 Transform::Normal,
                 None,
                 Some(src),
-                Some(Size::from(THUMB_SIZE)),
+                Some(thumb_size),
                 None,
                 hut.element_damage_snapshot(),
                 Kind::Unspecified,

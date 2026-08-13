@@ -17,6 +17,36 @@ use crate::State;
 use crate::village::{Village, pane_rects};
 use crate::{chrome, docks, switcher, village_chrome};
 
+/// Convert a texture's real physical-pixel dimensions into the `Logical`
+/// destination `size` a [`TextureRenderElement`] needs so that
+/// [`smithay::backend::renderer::element::Element::geometry`] — called
+/// every frame by `space_render_elements`/`DrmCompositor` with the
+/// *output's* scale — reports the element's actual on-screen size instead
+/// of re-applying that scale a second time on top of an already-physical
+/// texture. Smithay computes `physical_size(scale) =
+/// logical_size.to_physical(scale)`; passing this function's result as
+/// the element's explicit `size` argument (instead of leaving it `None`,
+/// which falls back to `texture.size()` treated as if `buffer_scale`
+/// were 1 — i.e. already-physical pixels reinterpreted as logical ones)
+/// makes that round-trip land back on `(physical_w, physical_h)`
+/// regardless of the output's real scale. Needed at every call site in
+/// this crate that composites a texture rendered pixel-native at
+/// physical resolution (mudhuts' own chrome/terminal/thumbnails — see
+/// this module's other doc comments on that design) now that output
+/// scale is real (`87adb1c`) instead of always 1 — this was the actual
+/// bug behind "everything renders fuzzy, only the top-left of the panel
+/// is visible" once a HiDPI output was detected.
+pub(crate) fn physical_element_size(
+    physical_w: i32,
+    physical_h: i32,
+    scale: f64,
+) -> smithay::utils::Size<i32, smithay::utils::Logical> {
+    smithay::utils::Size::from((
+        ((physical_w as f64) / scale).round() as i32,
+        ((physical_h as f64) / scale).round() as i32,
+    ))
+}
+
 /// Tracks whether some comparable value changed since the last check,
 /// bumping a [`CommitCounter`] when it has. Backs real damage tracking for
 /// render elements whose *content* (not geometry) can change while kept at
@@ -273,6 +303,7 @@ pub fn build_frame_elements(
     }
 
     let show_terminal = state.showing_terminal_effective();
+    let scale = state.output_scale();
     let mut elements = Vec::new();
 
     // Only the focused Hut normally gets redrawn (see Phase 2.6's
@@ -291,7 +322,7 @@ pub fn build_frame_elements(
     // elements in front-to-back order) so the popup sits on top of
     // whatever's below, regardless of whether that's the terminal or a
     // client window; empty when no preview session is open.
-    elements.extend(switcher::build(&state.stack, size, renderer));
+    elements.extend(switcher::build(&state.stack, size, renderer, scale));
 
     // Tile-Village (Phase 6) — bypasses the normal single-Hut chrome/
     // docks/terminal-or-space pipeline entirely: every pane is visible
@@ -317,20 +348,20 @@ pub fn build_frame_elements(
     let cell_w = state.stack.focused().glyphs.cell_width().max(1);
     let cell_h = state.stack.focused().glyphs.cell_height().max(1) as i32;
     let (village_tab_elements, next_y) =
-        village_chrome::build(state.stack.focused_village_mut(), renderer, 0, cell_w, cell_h);
+        village_chrome::build(state.stack.focused_village_mut(), renderer, 0, cell_w, cell_h, scale);
     elements.extend(village_tab_elements);
 
     // Tab-strip chrome (Phase 4) — pushed below any Village-level strips
     // above it, still on top of the terminal/window content and still
     // below the Alt-Tab popup above. Empty when the focused Hut has no
     // Main Windows.
-    elements.extend(chrome::build(state.stack.focused_mut(), renderer, next_y));
+    elements.extend(chrome::build(state.stack.focused_mut(), renderer, next_y, scale));
 
     // Docked Sub-Window handles (Phase 5) — same z-order slot as the tab
     // strip, only shown alongside the Main Window they belong to (never
     // while the terminal itself is the visible view).
     if !show_terminal {
-        elements.extend(docks::build(state.stack.focused_mut(), renderer, size));
+        elements.extend(docks::build(state.stack.focused_mut(), renderer, size, scale));
     }
 
     if show_terminal {
@@ -341,6 +372,7 @@ pub fn build_frame_elements(
         // `layer_elements`'s doc comment).
         let (layer_upper, layer_lower) = layer_elements(state, renderer);
         elements.extend(layer_upper);
+        let scale = state.output_scale();
         let hut = state.stack.focused_mut();
         if let Some(texture) = hut.redraw(renderer) {
             // `from_texture_with_damage`, not `from_static_texture` — the
@@ -348,6 +380,13 @@ pub fn build_frame_elements(
             // `from_static_texture` is documented by Smithay as creating
             // an element with no damage tracking at all (see
             // `Hut::damage_tracker`'s doc comment).
+            //
+            // `size` is explicit (not `None`) — see
+            // `physical_element_size`'s doc comment for why leaving it to
+            // fall back on `texture.size()` alone double-applies the
+            // output's scale once it's non-1.0.
+            let texture_size = texture.size();
+            let logical_size = physical_element_size(texture_size.w, texture_size.h, scale);
             let element = TextureRenderElement::from_texture_with_damage(
                 hut.element_id.clone(),
                 renderer.context_id(),
@@ -357,7 +396,7 @@ pub fn build_frame_elements(
                 Transform::Normal,
                 None,
                 None,
-                None,
+                Some(logical_size),
                 None,
                 hut.element_damage_snapshot(),
                 Kind::Unspecified,
@@ -395,6 +434,7 @@ fn build_tile_elements(
     renderer: &mut GlesRenderer,
 ) -> Vec<OutputRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> {
     let (area_x, area_y, area_w, area_h) = state.usable_area();
+    let scale = state.output_scale();
     let Village::Tile(tile) = state.stack.focused_village_mut() else {
         return Vec::new();
     };
@@ -442,6 +482,8 @@ fn build_tile_elements(
         let Some(texture) = hut.redraw(renderer) else {
             continue;
         };
+        let texture_size = texture.size();
+        let logical_size = physical_element_size(texture_size.w, texture_size.h, scale);
         let element = TextureRenderElement::from_texture_with_damage(
             hut.element_id.clone(),
             renderer.context_id(),
@@ -451,7 +493,7 @@ fn build_tile_elements(
             Transform::Normal,
             None,
             None,
-            None,
+            Some(logical_size),
             None,
             hut.element_damage_snapshot(),
             Kind::Unspecified,
