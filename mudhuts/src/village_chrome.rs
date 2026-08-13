@@ -17,7 +17,6 @@ use smithay::backend::renderer::Renderer;
 use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
-use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Physical, Point, Rectangle, Size, Transform};
@@ -27,6 +26,7 @@ use mudhuts_term::palette::Rgb;
 use crate::chrome::{to_color32f, window_title};
 use crate::render::{ChangeTracker, LabelCache, OutputRenderElements};
 use crate::hut::Hut;
+use crate::space_element::HutSpaceRenderElement;
 
 /// Base sizes (scale 1.0) — scaled via `crate::render::scaled` wherever
 /// they're actually used, matching `chrome.rs`'s own constants.
@@ -40,7 +40,7 @@ const BG_ACTIVE: Rgb = [140, 90, 191];
 const FG_INACTIVE: Rgb = [190, 190, 190];
 const BG_INACTIVE: Rgb = [40, 30, 50];
 
-type Element = OutputRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>;
+type Element = OutputRenderElements<GlesRenderer, HutSpaceRenderElement>;
 
 /// One tab's clickable/drawable rectangle within a single Tab-Hut
 /// level, plus which child it is (an index into that level's `children`).

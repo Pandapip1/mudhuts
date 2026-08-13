@@ -38,6 +38,7 @@ use smithay::utils::{IsAlive, Logical, Physical, Point, Rectangle, Scale, Size, 
 /// always `true` and [`PartialEq`] compares by a fresh per-instance marker
 /// rather than pixel content (two *different* `CompositedTexture`s should
 /// never compare equal; an instance is never compared against itself here).
+#[derive(Clone)]
 pub struct CompositedTexture {
     id: Id,
     texture: GlesTexture,
@@ -129,6 +130,7 @@ smithay::backend::renderer::element::render_elements! {
 
 /// What a Hut-tree node's own [`Space`](smithay::desktop::space::Space) can
 /// hold — see this module's doc comment.
+#[derive(Clone)]
 pub enum HutSpaceElement {
     Window(Window),
     Composited(CompositedTexture),

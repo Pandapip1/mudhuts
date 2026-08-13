@@ -94,7 +94,6 @@ use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::renderer::element::AsRenderElements;
 use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
-use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::ImportDma;
 use smithay::backend::session::libseat::LibSeatSession;
@@ -128,12 +127,13 @@ use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 use crate::State;
 use crate::cursor::{Cursor, PointerElement};
 use crate::render::{self, OutputRenderElements};
+use crate::space_element::HutSpaceRenderElement;
 
 type Allocator = GbmAllocator<DrmDeviceFd>;
 type Exporter = GbmFramebufferExporter<DrmDeviceFd>;
 type OutputManager = DrmOutputManager<Allocator, Exporter, (), DrmDeviceFd>;
 type CrtcOutput = DrmOutput<Allocator, Exporter, (), DrmDeviceFd>;
-type Elements = OutputRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>;
+type Elements = OutputRenderElements<GlesRenderer, HutSpaceRenderElement>;
 
 struct SurfaceData {
     output: Output,
@@ -832,7 +832,7 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
         state.showing_terminal_effective(),
     );
 
-    let mut elements = render::build_frame_elements(state, renderer, &output, size);
+    let mut elements = render::build_frame_elements(state, renderer, size);
 
     // Prepended, not appended — elements render front-to-back (index 0
     // on top, per the same convention `switcher::build`'s doc comment

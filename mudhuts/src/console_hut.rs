@@ -137,7 +137,7 @@ pub struct ConsoleHut {
     /// now: nothing populates or reads this yet (the next migration piece
     /// wires `State::sync_visible_main_window`/`render.rs` to it).
     pub space: Space<HutSpaceElement>,
-    space_output: Output,
+    pub(crate) space_output: Output,
 }
 
 impl ConsoleHut {
@@ -486,6 +486,20 @@ impl ConsoleHut {
         self.glyphs = GlyphCache::new(scale)?;
         self.gpu = None;
         self.label_renderer = None;
+
+        // `space_output`'s own reported scale (not just its mode/pixel
+        // size) has to track the real one too — `space_render_elements`
+        // derives the scale it renders `Self::space`'s contents at from
+        // whatever output it's given (`Output::current_scale`), not from
+        // `space_render_elements`'s own `alpha` parameter (its only other
+        // input) — a mismatch here would silently mis-scale every Main
+        // Window/Floating Window/Alert once the real display isn't 1.0.
+        self.space_output.change_current_state(
+            None,
+            None,
+            Some(smithay::output::Scale::Fractional(scale)),
+            None,
+        );
 
         let (width, height) = self.pixel_size;
         let cell_w = self.glyphs.cell_width().max(1);

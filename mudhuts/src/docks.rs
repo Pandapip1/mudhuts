@@ -35,7 +35,6 @@ use smithay::backend::renderer::Renderer;
 use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
-use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::utils::{CommitCounter, DamageSnapshot};
@@ -49,6 +48,7 @@ use crate::grabs::nearest_edge_within_threshold;
 use crate::main_window::{Dock, Edge};
 use crate::redraw::{Hit, HitTestable, Redrawable, RedrawHandle};
 use crate::render::OutputRenderElements;
+use crate::space_element::HutSpaceRenderElement;
 
 /// Base sizes (scale 1.0) — scaled via `crate::render::scaled` (or, for
 /// the `f64` threshold, a plain multiply) wherever they're actually used,
@@ -69,7 +69,7 @@ const BG: mudhuts_term::palette::Rgb = [50, 50, 60];
 /// into a floating window, rather than being read as just a click.
 const DETACH_THRESHOLD: f64 = 12.0;
 
-type Element = OutputRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>;
+type Element = OutputRenderElements<GlesRenderer, HutSpaceRenderElement>;
 
 /// Tracks a click-and-drag on a docked Floating Window's handle. Lives in
 /// `State::dock_drag`; not a `PointerGrab` — see the module doc.

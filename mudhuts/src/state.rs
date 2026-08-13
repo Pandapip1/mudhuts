@@ -39,6 +39,7 @@ use smithay::wayland::socket::ListeningSocketSource;
 use smithay::wayland::viewporter::ViewporterState;
 
 use crate::keybindings::Keymap;
+use crate::space_element::HutSpaceElement;
 use crate::stack::MruStackHut;
 use crate::hut::Hut;
 
@@ -733,9 +734,9 @@ impl State {
         self.stack.focused_top_level().leaf_absolute_rect(root, self.usable_area())
     }
 
-    /// Make `self.space` match what the focused ConsoleHut should currently be
-    /// showing: unmap whatever's mapped (harmless if nothing was), then map
-    /// the focused ConsoleHut's active Main Window (if it isn't showing its
+    /// Make the focused ConsoleHut's own `space` match what it should
+    /// currently be showing: unmap whatever's mapped (harmless if nothing
+    /// was), then map its active Main Window (if it isn't showing its
     /// terminal) plus every currently-floating Floating Window and every Alert
     /// belonging to that Main Window — docked Floating Windows stay unmapped
     /// (`docks.rs` draws a handle instead), Alerts are mapped last so they
@@ -743,33 +744,57 @@ impl State {
     /// is focused or which view a ConsoleHut is showing (Alt-Tab commit,
     /// `ToggleTerminal`, `TabNext`/`TabPrev`, a new toplevel auto-switching
     /// in, a toplevel closing).
+    ///
+    /// Composable Hut hierarchy RFC migration step 5 sub-step 2: this used
+    /// to rebuild the single global `state.space`; now rebuilds whichever
+    /// ConsoleHut is focused's own `space` instead — every other Hut's
+    /// `space` is simply left as it was (a background ConsoleHut never has
+    /// anything mapped in its own `space` in the first place, so there's
+    /// nothing to unmap there).
     pub fn sync_visible_main_window(&mut self) {
-        let mapped: Vec<_> = self.space.elements().cloned().collect();
+        // Computed before taking `hut`'s mutable borrow below — `usable_area`
+        // needs `&self` as a whole, which the borrow checker won't allow
+        // alongside an active `&mut self.stack` borrow.
+        let (area_x, area_y, _, _) = self.usable_area();
+
+        let hut = self.stack.focused_mut();
+        let mapped: Vec<_> = hut.space.elements().cloned().collect();
         for window in mapped {
-            self.space.unmap_elem(&window);
+            hut.space.unmap_elem(&window);
         }
-        let hut = self.stack.focused();
         if hut.showing_terminal {
             return;
         }
         let Some(entry) = hut.active_main_window_entry() else {
             return;
         };
+        // Cloned out into owned locals before touching `hut.space` again —
+        // `entry` borrows `hut` immutably, which can't coexist with the
+        // `hut.space.map_element` calls below (a mutable borrow of the same
+        // struct) the way it could when `space` was `state`'s own separate
+        // field rather than `ConsoleHut`'s.
+        let main_window = entry.window.clone();
+        let floating: Vec<_> = entry
+            .floating_windows
+            .iter()
+            .filter_map(|sub| match sub.dock {
+                crate::main_window::Dock::Floating(pos) => Some((sub.window.clone(), pos)),
+                crate::main_window::Dock::Docked(_) => None,
+            })
+            .collect();
+        let alerts: Vec<_> = entry.alerts.iter().map(|a| (a.window.clone(), a.position)).collect();
+
         // Positioned at the usable area's own origin, not literally
         // (0, 0) — matters once a layer-shell surface reserves part of
         // the output (e.g. a left-anchored panel) — see
         // `Self::usable_area`'s doc comment.
-        let (area_x, area_y, _, _) = self.usable_area();
-        self.space
-            .map_element(entry.window.clone(), (area_x, area_y), false);
-        for sub in &entry.floating_windows {
-            if let crate::main_window::Dock::Floating(pos) = sub.dock {
-                self.space.map_element(sub.window.clone(), pos, false);
-            }
+        hut.space
+            .map_element(HutSpaceElement::Window(main_window), (area_x, area_y), false);
+        for (window, pos) in floating {
+            hut.space.map_element(HutSpaceElement::Window(window), pos, false);
         }
-        for alert in &entry.alerts {
-            self.space
-                .map_element(alert.window.clone(), alert.position, false);
+        for (window, pos) in alerts {
+            hut.space.map_element(HutSpaceElement::Window(window), pos, false);
         }
     }
 

@@ -162,10 +162,10 @@ impl State {
 
         let pixels = if let Some(renderer) = self.dmabuf_renderer.clone() {
             let mut renderer = renderer.borrow_mut();
-            self.render_capture(&mut renderer, &output, size, fourcc, tracker)?
+            self.render_capture(&mut renderer, size, fourcc, tracker)?
         } else if let Some(backend) = self.winit_backend.clone() {
             let mut backend = backend.borrow_mut();
-            self.render_capture(backend.renderer(), &output, size, fourcc, tracker)?
+            self.render_capture(backend.renderer(), size, fourcc, tracker)?
         } else {
             // Shouldn't happen — one of the two is always set once either
             // backend has finished starting up — but stay panic-free.
@@ -186,12 +186,11 @@ impl State {
     fn render_capture(
         &mut self,
         renderer: &mut GlesRenderer,
-        output: &Output,
         size: (i32, i32),
         fourcc: Fourcc,
         tracker: &RefCell<OutputDamageTracker>,
     ) -> Result<Vec<u8>, FailureReason> {
-        let elements = render::build_frame_elements(self, renderer, output, size);
+        let elements = render::build_frame_elements(self, renderer, size);
 
         let buffer_size: Size<i32, BufferCoord> = (size.0, size.1).into();
         let mut texture = Offscreen::<GlesTexture>::create_buffer(renderer, fourcc, buffer_size)

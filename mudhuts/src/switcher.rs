@@ -9,12 +9,12 @@
 use smithay::backend::renderer::{Renderer, Texture};
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
-use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
 
 use crate::render::OutputRenderElements;
+use crate::space_element::HutSpaceRenderElement;
 use crate::stack::MruStackHut;
 
 /// Base sizes (scale 1.0) — scaled via `crate::render::scaled` wherever
@@ -25,7 +25,7 @@ const GAP: i32 = 20;
 const PADDING: i32 = 24;
 const HIGHLIGHT_MARGIN: i32 = 6;
 
-type Element = OutputRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>;
+type Element = OutputRenderElements<GlesRenderer, HutSpaceRenderElement>;
 
 /// Build the popup's render elements in front-to-back order (see
 /// `winit_backend.rs`, which pushes these ahead of the normal background

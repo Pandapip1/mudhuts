@@ -8,13 +8,13 @@ use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::utils::{CommitCounter, DamageBag, DamageSnapshot};
 use smithay::backend::renderer::{ImportAll, ImportMem, RendererSuper};
 use smithay::desktop::space::{SpaceRenderElements, space_render_elements};
-use smithay::desktop::{Window, layer_map_for_output};
-use smithay::output::Output;
+use smithay::desktop::layer_map_for_output;
 use smithay::utils::{Buffer, Rectangle, Scale, Transform};
 use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
 
 use crate::State;
 use crate::hut::Hut;
+use crate::space_element::{HutSpaceElement, HutSpaceRenderElement};
 use crate::{chrome, docks, switcher, village_chrome};
 
 /// The [`TextureRenderElement`] buffer-scale ([`Element::src`]/
@@ -188,7 +188,7 @@ smithay::backend::renderer::element::render_elements! {
     Pointer = crate::cursor::PointerRenderElement<R>,
 }
 
-type Element = OutputRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>;
+type Element = OutputRenderElements<GlesRenderer, HutSpaceRenderElement>;
 
 /// This output's layer-shell surfaces (`handlers/layer_shell.rs`), split
 /// into the same two halves Smithay's own `space_render_elements` splits
@@ -308,9 +308,8 @@ fn lock_screen_elements(
 pub fn build_frame_elements(
     state: &mut State,
     renderer: &mut GlesRenderer,
-    output: &Output,
     size: (i32, i32),
-) -> Vec<OutputRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> {
+) -> Vec<OutputRenderElements<GlesRenderer, HutSpaceRenderElement>> {
     // Checked before every other branch below (switcher, Hut chrome,
     // terminal/window content): a locked session must render *nothing*
     // else, not even layered underneath a lock surface — see
@@ -422,7 +421,20 @@ pub fn build_frame_elements(
         }
         elements.extend(layer_lower);
     } else {
-        match space_render_elements::<_, Window, _>(renderer, [&state.space], output, 1.0) {
+        // Composable Hut hierarchy RFC migration step 5 sub-step 2: the
+        // focused ConsoleHut's own `Space<HutSpaceElement>` + synthetic
+        // `space_output`, not the old global `state.space` + the real
+        // output — `space_output` is always mapped at `(0, 0)` within
+        // `hut.space` (see `ConsoleHut::spawn`), so every element's
+        // resulting location comes out identical to what mapping directly
+        // against the real output always produced (`render_location() -
+        // region.loc` in Smithay's own `render_elements_for_region`, with
+        // `region.loc` always zero here) — a real screen-relative physical
+        // position, pushed straight into `elements` with no further
+        // translation needed, exactly like the terminal-visible branch
+        // above already does for its own texture.
+        let hut = state.stack.focused_mut();
+        match space_render_elements::<_, HutSpaceElement, _>(renderer, [&hut.space], &hut.space_output, 1.0) {
             Ok(space_elements) => {
                 elements.extend(space_elements.into_iter().map(OutputRenderElements::from))
             }
@@ -451,7 +463,7 @@ pub fn build_frame_elements(
 fn build_tile_elements(
     state: &mut State,
     renderer: &mut GlesRenderer,
-) -> Vec<OutputRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> {
+) -> Vec<OutputRenderElements<GlesRenderer, HutSpaceRenderElement>> {
     let area = state.usable_area();
     let scale = state.output_scale();
     let Hut::Tile(tile) = state.stack.focused_top_level_mut() else {

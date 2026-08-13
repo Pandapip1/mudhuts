@@ -8,7 +8,6 @@
 use smithay::backend::renderer::Renderer;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
-use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::desktop::Window;
@@ -20,6 +19,7 @@ use mudhuts_term::palette::Rgb;
 
 use crate::console_hut::ConsoleHut;
 use crate::render::OutputRenderElements;
+use crate::space_element::HutSpaceRenderElement;
 
 /// Base sizes (scale 1.0) — scaled via `crate::render::scaled` wherever
 /// they're actually used, so this chrome stays the same apparent size
@@ -34,7 +34,7 @@ const BG_ACTIVE: Rgb = [64, 115, 191];
 const FG_INACTIVE: Rgb = [190, 190, 190];
 const BG_INACTIVE: Rgb = [30, 30, 30];
 
-type Element = OutputRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>;
+type Element = OutputRenderElements<GlesRenderer, HutSpaceRenderElement>;
 
 /// Read a toplevel's title live (not cached/event-driven), falling back
 /// to its app_id, then a placeholder — the same `with_states`/

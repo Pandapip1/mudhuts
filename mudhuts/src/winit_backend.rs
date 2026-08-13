@@ -153,7 +153,6 @@ pub fn init_winit(
                             let elements = render::build_frame_elements(
                                 state,
                                 renderer,
-                                &output,
                                 (size.w, size.h),
                             );
 
