@@ -232,6 +232,14 @@ impl State {
                             smithay::utils::SERIAL_COUNTER.next_serial(),
                         );
                     }
+                    // Missing until now — under winit this was masked by
+                    // that backend's own "redraw on every input event
+                    // regardless" behavior (see `handle_pointer_motion`'s
+                    // doc comment), but the udev backend is purely
+                    // demand-driven: without this, toggling never
+                    // actually repaints until some unrelated redraw comes
+                    // along.
+                    self.request_redraw();
                 }
             }
             Action::StackNext => {
