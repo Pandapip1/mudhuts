@@ -591,25 +591,68 @@ primitives against low-blast-radius targets before touching the load-bearing `Vi
    side with (not replacing) `state.space`/`sync_visible_main_window`, gated (env var, off by
    default) so it can be compared against the existing path's output before anything is
    removed. See Open Question 1's resolution below for what this actually found.
-4. Only once 1–3 are validated, replace `Village`'s `Tab`/`Tile` enum variants and `HutStack`'s
-   bespoke MRU bookkeeping with real generic Hut-tree node kinds (an `MruStackHut`, `TileHut`,
-   `TabbedHut`, and the renamed Console Hut) implementing the traits proven out above. Be
-   honest that this step is inherently large by itself: today's `Village::Tab`/`Village::Tile`
-   match arms are inlined across `stack.rs`, `render.rs`, `input.rs`, and `village_chrome.rs`
-   simultaneously (e.g. `village.rs::pane_rects` alone has three independent call sites across
-   three files, per Q3's findings above), so there is no way to swap *only* `village.rs` and
-   leave the others on the old model mid-flight without a temporary compatibility shim uglier
-   than just doing the swap in one step. This is the one place a genuinely large single
-   change is realistic and shouldn't be pretended otherwise.
-5. The Layer-Shell Root Hut (Q2) last — it depends on nothing else in the tree and can land
-   either alongside step 4 or after it; until it lands, `layer_elements` can stay as-is as a
-   temporary bridge.
+4. **Done (2026-08-13, narrowed scope — decided the same day, see below for why).** Replaced
+   `Hut`'s `Tab`/`Tile` variant *structs* (`TabVillage`/`TileVillage`) with real, clearly-named
+   types (`TabbedHut`/`TileHut` — the rename the plan doc's own step-1 notes already flagged as
+   deliberately deferred to here) and `Stack` with `MruStackHut` (the tree diagram's own name for
+   that node) — `Hut` itself **stayed a closed enum**, not a type-erased `Box<dyn HutNode>` tree,
+   since `render.rs`/`state.rs`/`input.rs` all rely on exhaustive `matches!(hut, Hut::Tile(tile)
+   if tile.children.len() >= 2)`-style matching with direct field access, which a fully-erased
+   tree would only make more awkward (downcasting) for no benefit at this step. Gave `Hut`
+   (`TabbedHut`/`TileHut`) a real `Redrawable` impl (`Hut::attach_redraw_handle`, recursing to
+   every descendant; `TabbedHut::set_active`/`TileHut::set_active` mark it dirty themselves),
+   removing the hand-wired `self.request_redraw()` calls in `input.rs`'s
+   `Action::TabNext`/`TabPrev`/`WrapTab`/`WrapTile` and `try_click_chrome`'s Tile-pane-hit and
+   Hut-level Tab-hit branches that followed a `Hut`-tree mutation specifically (the
+   ConsoleHut-internal `cycle_tab`/Main-Window-tab-click branches still request their own —
+   `ConsoleHut` was deliberately not brought into this step's Redrawable wiring, see below).
+   Consolidated Q3's flagged triplicated rect math — `state.rs::active_pane_offset`,
+   `render.rs::build_tile_elements`'s pane positioning, and `input.rs::try_click_chrome`'s
+   Tile-pane-hit branch each independently re-derived "`usable_area()` + this Tile-Hut's active
+   pane's offset" via `hut::pane_rects` — into one shared `TileHut::absolute_pane_rects`. A pure,
+   behavior-preserving refactor: same textures, same pixel positions, verified by the existing
+   50-test suite plus 2 new `hut.rs` unit tests and a live nested-mudhuts smoke test against
+   `cosmic-term` (clean start, no panics) — **did not** touch how anything is actually composited
+   (still today's hand-rolled texture compositing, not `Space<HutSpaceElement>`).
+
+   **Two deliberate departures from the original sketch, worth recording:** `HitTestable` was
+   **not** implemented on `Hut` — the only concrete need this step actually had (the Tile-pane
+   and Hut-tab click branches) was already satisfied by `TileHut::absolute_pane_rects` +
+   `TabbedHut::set_active`/`TileHut::set_active` directly, and inventing a `Hit` variant with no
+   second consumer yet would have been speculative. And the rect-math consolidation landed as one
+   plain shared method (`TileHut::absolute_pane_rects`), not a fully generic, recursive
+   `render`/`hit_test` trait pair dispatched per node kind — the concrete triplication Q3 flagged
+   only ever involved one node kind (`TileHut`), so building the general polymorphic version now
+   would have been undemonstrated abstraction; that fuller pattern is still exactly what Q3
+   describes and remains the natural shape *if/when* step 5 gives every node kind its own
+   independent render (at which point per-kind dispatch stops being optional). Both are `hut.rs`
+   additions, not new files, so revisiting either later is a small, contained change.
+
+   **Why the step itself was narrowed**: the RFC originally scoped step 4 as also "implementing
+   the traits proven out above," which could be read as including Q1's per-node
+   `Space<HutSpaceElement>` design (proven out for one scope in step 3), not just
+   `Redrawable`/`HitTestable`. Decided against that reading: Open Questions 2 (per-node
+   `Space`/`Output`/`LayerMap` cost at real nesting depth unmeasured), 3 (popup positioning for a
+   non-fullscreen leaf undesigned), and 6 (Sub-Window/Alert modeling still a sketch) are all real
+   prerequisites for swapping the actual compositing mechanism over, and none of them have been
+   spiked the way Q1's `Composited` variant risk was in step 3 — attempting that swap now would
+   mean resolving them on the fly, against the RFC's own risk-staging intent, rather than a step
+   deliberately proving out one narrow, already-derisked piece before committing further.
+5. **Absorbs the deferred remainder of step 4** (the actual `Space<HutSpaceElement>`/synthetic-
+   `Output` swap, for every node, not just the one scope step 3 already validated) **together
+   with the Layer-Shell Root Hut (Q2)** — the latter was always going to depend on the former (Q2's
+   entire design *is* "one more `space_render_elements` call, against the real output, over
+   whatever `Space` the tree's real nodes already produce"), so there's no longer a reason to
+   treat them as two separate steps the way the original draft did. Blocked on first resolving
+   Open Questions 2, 3, and 6 above — not attempted until each has a real answer, not just a
+   plausible one.
 
 **Honest overall assessment**: mostly incremental — the traits and per-scope `Space` design get
-real, independent validation before the highest-risk step — but step 4 is unavoidably a large,
-mostly-atomic change given how entangled the current `Village`/`HutStack` types already are
-with every render/input call site. Calling the whole effort "incremental" would undersell that
-one step's real size and risk.
+real, independent validation before the highest-risk step — but step 5 (now carrying both the
+real per-node `Space` swap and the Layer-Shell Root Hut collapse) is unavoidably a large,
+mostly-atomic change given how entangled the current `Hut`/`Stack` types already are with every
+render/input call site. Calling the whole effort "incremental" would undersell that one step's
+real size and risk.
 
 ## Open Questions Still Unresolved
 
