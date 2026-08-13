@@ -7,6 +7,7 @@ use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::renderer::ImportDma;
 use smithay::input::dnd::DndGrabHandler;
 use smithay::input::pointer::CursorImageStatus;
+use smithay::input::tablet::TabletSeatHandler;
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -60,6 +61,19 @@ impl DndGrabHandler for State {}
 impl WaylandDndGrabHandler for State {}
 
 impl OutputHandler for State {}
+
+/// mudhuts has no tablet input of its own, but `cursor-shape-v1`'s internal
+/// `Dispatch2<CursorShapeDevice, D>` impl (`smithay::wayland::cursor_shape`)
+/// requires `D: TabletSeatHandler` unconditionally — a `wp_cursor_shape_device_v1`
+/// can be created from a `zwp_tablet_tool_v2` just as easily as from a
+/// `wl_pointer`, so Smithay bounds the whole dispatch impl on it even for
+/// compositors, like this one, that never advertise the tablet protocol at
+/// all. `WlSurface` already implements the required `TabletToolTarget` via
+/// Smithay's own blanket impl, so the default (no-op) trait methods are all
+/// that's needed here.
+impl TabletSeatHandler for State {
+    type ToolFocus = WlSurface;
+}
 
 /// Client-buffer dmabuf import (`zwp_linux_dmabuf_v1`) — lets a client hand
 /// over a GPU buffer directly instead of a plain SHM buffer mudhuts would

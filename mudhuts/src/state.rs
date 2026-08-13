@@ -15,6 +15,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Display, DisplayHandle};
 use smithay::utils::{Logical, Point};
 use smithay::wayland::compositor::{CompositorClientState, CompositorState};
+use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
 use smithay::wayland::foreign_toplevel_list::ForeignToplevelListState;
 use smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitState;
@@ -98,6 +99,15 @@ pub struct State {
     /// cursor from this (see `cursor.rs`'s module doc); the winit backend
     /// relies on its host compositor's own cursor and never reads it.
     pub cursor_status: CursorImageStatus,
+    /// `cursor-shape-v1` (`wp_cursor_shape_manager_v1`) — lets a client ask
+    /// the compositor to draw a *named* cursor shape (`"pointer"`, `"text"`,
+    /// `"grab"`, ...) instead of uploading its own cursor surface pixels.
+    /// Its requests route straight into `SeatHandler::cursor_image`
+    /// (`handlers/mod.rs`), the same entry point `wl_pointer.set_cursor`
+    /// already uses, so `cursor_status` above needs no changes at all —
+    /// only stored here (like every other `*State`) to keep its global
+    /// registered for the compositor's lifetime.
+    pub cursor_shape_manager_state: CursorShapeManagerState,
 
     /// dmabuf client-buffer import (`zwp_linux_dmabuf_v1`) — lets clients
     /// hand over a GPU buffer directly instead of a plain SHM buffer that
@@ -176,6 +186,7 @@ impl State {
         let popups = PopupManager::default();
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
         let data_device_state = DataDeviceState::new::<Self>(&dh);
+        let cursor_shape_manager_state = CursorShapeManagerState::new::<Self>(&dh);
         dh.create_global::<Self, mudhuts_protocols::server::mudhuts_shell_v1::MudhutsShellV1, _>(
             2,
             smithay::wayland::GlobalData,
@@ -221,6 +232,7 @@ impl State {
             dock_drag: None,
             pointer_location: Point::from((0.0, 0.0)),
             cursor_status: CursorImageStatus::default_named(),
+            cursor_shape_manager_state,
             dmabuf_state: DmabufState::new(),
             dmabuf_global: None,
             dmabuf_renderer: None,
