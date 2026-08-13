@@ -7,15 +7,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use smithay::backend::renderer::Texture;
 use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
-use smithay::backend::renderer::utils::{DamageBag, DamageSnapshot};
+use smithay::backend::renderer::utils::{CommitCounter, DamageBag, DamageSnapshot};
 use smithay::desktop::Window;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Buffer, Rectangle};
+use smithay::utils::{Buffer, Rectangle, Size};
 
 use mudhuts_term::{GlyphCache, TermEvent, Terminal};
 
 use crate::gpu_term::{GpuTermRenderer, LabelRenderer};
 use crate::main_window::MainWindowEntry;
+use crate::render::{ChangeTracker, TextureChangeTracker};
 
 /// Initial grid size used before the real output size is known.
 const INITIAL_COLS: usize = 80;
@@ -67,6 +68,11 @@ pub struct Hut {
     /// there).
     pub terminal_tab_text_id: Id,
     pub terminal_tab_bg_id: Id,
+    /// Real damage tracking for the "Terminal" tab's text/background,
+    /// bumped only when its active/inactive state actually flips — see
+    /// `render::ChangeTracker`'s doc comment.
+    terminal_tab_text_tracker: TextureChangeTracker<bool>,
+    terminal_tab_bg_tracker: ChangeTracker<bool>,
     /// Stable identities for this Hut's own thumbnail/highlight in the
     /// Alt-Tab preview popup (`switcher.rs`) — same reasoning as above.
     pub thumbnail_id: Id,
@@ -145,6 +151,8 @@ impl Hut {
                 element_id: Id::new(),
                 terminal_tab_text_id: Id::new(),
                 terminal_tab_bg_id: Id::new(),
+                terminal_tab_text_tracker: TextureChangeTracker::new(),
+                terminal_tab_bg_tracker: ChangeTracker::new(),
                 thumbnail_id: Id::new(),
                 thumbnail_highlight_id: Id::new(),
                 damage_tracker: DamageBag::default(),
@@ -179,6 +187,26 @@ impl Hut {
 
     pub fn main_windows(&self) -> &[MainWindowEntry] {
         &self.main_windows
+    }
+
+    pub fn main_windows_mut(&mut self) -> &mut [MainWindowEntry] {
+        &mut self.main_windows
+    }
+
+    /// A snapshot for the "Terminal" tab's text-label element, marking it
+    /// damaged only if `active` differs from last frame's.
+    pub fn terminal_tab_text_snapshot(
+        &mut self,
+        active: bool,
+        texture_size: Size<i32, Buffer>,
+    ) -> DamageSnapshot<i32, Buffer> {
+        self.terminal_tab_text_tracker.snapshot(active, texture_size)
+    }
+
+    /// A commit counter for the "Terminal" tab's background element,
+    /// bumped only if `active` differs from last frame's.
+    pub fn terminal_tab_bg_commit(&mut self, active: bool) -> CommitCounter {
+        self.terminal_tab_bg_tracker.commit(active)
     }
 
     pub fn main_window_count(&self) -> usize {

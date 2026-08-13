@@ -2,9 +2,12 @@
 //! see the plan's Phase 5 notes and the Nomenclature table.
 
 use smithay::backend::renderer::element::Id;
+use smithay::backend::renderer::utils::{CommitCounter, DamageSnapshot};
 use smithay::desktop::Window;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Logical, Point};
+use smithay::utils::{Buffer, Logical, Point, Size};
+
+use crate::render::{ChangeTracker, TextureChangeTracker};
 
 /// Which screen edge a docked Sub-Window is minimized to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +31,17 @@ pub enum Dock {
 pub struct SubWindow {
     pub window: Window,
     pub dock: Dock,
+    /// Stable identities for this Sub-Window's docked handle in
+    /// `docks.rs` (its title-label text and background) — same reasoning
+    /// as `MainWindowEntry::tab_text_id`/`tab_bg_id`.
+    pub handle_text_id: Id,
+    pub handle_bg_id: Id,
+    /// Real damage tracking for the handle's title text, bumped only
+    /// when the title actually changes — see `render::ChangeTracker`'s
+    /// doc comment. The handle's background color never changes (no
+    /// active/inactive state, unlike a tab), so it stays genuinely static
+    /// and needs no equivalent tracker.
+    handle_text_tracker: TextureChangeTracker<String>,
 }
 
 impl SubWindow {
@@ -39,6 +53,9 @@ impl SubWindow {
         Self {
             window,
             dock: Dock::Docked(Edge::Right),
+            handle_text_id: Id::new(),
+            handle_bg_id: Id::new(),
+            handle_text_tracker: TextureChangeTracker::new(),
         }
     }
 
@@ -46,6 +63,16 @@ impl SubWindow {
         self.window
             .toplevel()
             .is_some_and(|t| t.wl_surface() == surface)
+    }
+
+    /// A snapshot for this handle's text-label element, marking it
+    /// damaged only if `title` differs from last frame's.
+    pub fn handle_text_snapshot(
+        &mut self,
+        title: &str,
+        texture_size: Size<i32, Buffer>,
+    ) -> DamageSnapshot<i32, Buffer> {
+        self.handle_text_tracker.snapshot(title.to_string(), texture_size)
     }
 }
 
@@ -92,6 +119,14 @@ pub struct MainWindowEntry {
     /// fresh `Id::new()` per frame is a real correctness bug, not cosmetic.
     pub tab_text_id: Id,
     pub tab_bg_id: Id,
+    /// Real damage tracking for the tab's text/background, bumped only
+    /// when the title or active/inactive state actually changes — see
+    /// `render::ChangeTracker`'s doc comment for why a fixed
+    /// `CommitCounter`/`DamageSnapshot` (reused every frame regardless of
+    /// content) would mean the outer tracker never sees this tab's color
+    /// or label change again after the first frame it's drawn.
+    tab_text_tracker: TextureChangeTracker<(String, bool)>,
+    tab_bg_tracker: ChangeTracker<bool>,
 }
 
 impl MainWindowEntry {
@@ -102,6 +137,8 @@ impl MainWindowEntry {
             alerts: Vec::new(),
             tab_text_id: Id::new(),
             tab_bg_id: Id::new(),
+            tab_text_tracker: TextureChangeTracker::new(),
+            tab_bg_tracker: ChangeTracker::new(),
         }
     }
 
@@ -109,5 +146,23 @@ impl MainWindowEntry {
         self.window
             .toplevel()
             .is_some_and(|t| t.wl_surface() == surface)
+    }
+
+    /// A snapshot for this tab's text-label element, marking it damaged
+    /// only if `title`/`active` differ from last frame's.
+    pub fn tab_text_snapshot(
+        &mut self,
+        title: &str,
+        active: bool,
+        texture_size: Size<i32, Buffer>,
+    ) -> DamageSnapshot<i32, Buffer> {
+        self.tab_text_tracker
+            .snapshot((title.to_string(), active), texture_size)
+    }
+
+    /// A commit counter for this tab's background element, bumped only if
+    /// `active` differs from last frame's.
+    pub fn tab_bg_commit(&mut self, active: bool) -> CommitCounter {
+        self.tab_bg_tracker.commit(active)
     }
 }

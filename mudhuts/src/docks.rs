@@ -13,14 +13,14 @@
 //! not a full `PointerGrab`, since there's no client surface/serial to
 //! grab in the first place until the window is actually mapped.
 
-use smithay::backend::renderer::Renderer;
+use smithay::backend::renderer::{Renderer, Texture};
 use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::gles::GlesRenderer;
-use smithay::backend::renderer::utils::CommitCounter;
+use smithay::backend::renderer::utils::{CommitCounter, DamageSnapshot};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
 
@@ -125,10 +125,25 @@ pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer, output_size: (i32, i32)
     let mut elements = Vec::new();
 
     for handle in &handles {
-        match hut.render_label(renderer, &truncate(&handle.title), FG, BG) {
+        let title = truncate(&handle.title);
+        match hut.render_label(renderer, &title, FG, BG) {
             Ok(texture) => {
-                let text = TextureRenderElement::from_static_texture(
-                    Id::new(),
+                // Stable id + real damage tracking, not a fresh `Id::new()`
+                // wrapped in a never-tracked `from_static_texture` — the
+                // handle's title text can change (the Sub-Window's own
+                // title updates), so it needs the same treatment as
+                // `chrome.rs`'s tab labels (see
+                // `render::TextureChangeTracker`'s doc comment).
+                let texture_size = texture.size();
+                let (text_id, snapshot) = match hut.sub_window_mut(&handle.surface) {
+                    Some(sub) => (
+                        sub.handle_text_id.clone(),
+                        sub.handle_text_snapshot(&title, texture_size),
+                    ),
+                    None => (Id::new(), DamageSnapshot::empty()),
+                };
+                let text = TextureRenderElement::from_texture_with_damage(
+                    text_id,
                     renderer.context_id(),
                     (
                         (handle.rect.loc.x + 6) as f64,
@@ -141,6 +156,7 @@ pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer, output_size: (i32, i32)
                     None,
                     None,
                     None,
+                    snapshot,
                     Kind::Unspecified,
                 );
                 elements.push(Element::from(text));
@@ -148,8 +164,17 @@ pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer, output_size: (i32, i32)
             Err(err) => tracing::warn!("failed to render dock handle label: {err}"),
         }
 
+        // The handle's background color never changes (no active/
+        // inactive state, unlike a tab) — genuinely static content, so a
+        // fixed commit is correct here; it just needs a stable id (a
+        // fresh one every frame would otherwise look "new" to the outer
+        // tracker every time, forcing needless redraws).
+        let bg_id = hut
+            .sub_window_mut(&handle.surface)
+            .map(|sub| sub.handle_bg_id.clone())
+            .unwrap_or_else(Id::new);
         let background = SolidColorRenderElement::new(
-            Id::new(),
+            bg_id,
             handle.rect.to_f64().to_physical(1.0).to_i32_round(),
             CommitCounter::default(),
             to_color32f(BG),

@@ -4,14 +4,86 @@ use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::utils::{CommitCounter, DamageBag, DamageSnapshot};
 use smithay::backend::renderer::{ImportAll, ImportMem, RendererSuper};
 use smithay::desktop::Window;
 use smithay::desktop::space::{SpaceRenderElements, space_render_elements};
 use smithay::output::Output;
-use smithay::utils::Transform;
+use smithay::utils::{Buffer, Rectangle, Size, Transform};
 
 use crate::State;
 use crate::{chrome, docks, switcher};
+
+/// Tracks whether some comparable value changed since the last check,
+/// bumping a [`CommitCounter`] when it has. Backs real damage tracking for
+/// render elements whose *content* (not geometry) can change while kept at
+/// a stable `Id` — e.g. a tab's background flipping between active/
+/// inactive colors, or its label's text/color changing, all at a fixed
+/// on-screen position. Smithay's per-element damage tracker only learns
+/// about a content-only change via an explicit commit bump; a
+/// `CommitCounter` that never advances (e.g. `CommitCounter::default()`
+/// passed fresh every frame) means "never damaged again after the first
+/// frame" — the same class of bug as `TextureRenderElement::from_static_texture`
+/// (see `Hut::damage_tracker`'s doc comment), just for
+/// `SolidColorRenderElement`/hand-tracked content instead.
+pub(crate) struct ChangeTracker<T> {
+    last: Option<T>,
+    commit: CommitCounter,
+}
+
+impl<T: PartialEq> ChangeTracker<T> {
+    pub(crate) fn new() -> Self {
+        Self {
+            last: None,
+            commit: CommitCounter::default(),
+        }
+    }
+
+    /// Compare `value` against what was seen last time, bumping the
+    /// commit counter if it differs, and return the (possibly
+    /// just-bumped) counter to attach to this frame's render element.
+    pub(crate) fn commit(&mut self, value: T) -> CommitCounter {
+        if self.last.as_ref() != Some(&value) {
+            self.commit.increment();
+            self.last = Some(value);
+        }
+        self.commit
+    }
+}
+
+/// [`ChangeTracker`]'s counterpart for `TextureRenderElement`s, which need
+/// a full [`DamageSnapshot`] (via `from_texture_with_damage`) rather than a
+/// bare [`CommitCounter`] — e.g. a tab label's rendered-text texture,
+/// which is rebuilt fresh every call to `Hut::render_label` regardless of
+/// whether the title/color actually changed.
+pub(crate) struct TextureChangeTracker<T> {
+    last: Option<T>,
+    damage: DamageBag<i32, Buffer>,
+}
+
+impl<T: PartialEq> TextureChangeTracker<T> {
+    pub(crate) fn new() -> Self {
+        Self {
+            last: None,
+            damage: DamageBag::default(),
+        }
+    }
+
+    /// Compare `value` against what was seen last time, marking the whole
+    /// `texture_size` as damaged if it differs, and return a snapshot to
+    /// attach to this frame's render element.
+    pub(crate) fn snapshot(
+        &mut self,
+        value: T,
+        texture_size: Size<i32, Buffer>,
+    ) -> DamageSnapshot<i32, Buffer> {
+        if self.last.as_ref() != Some(&value) {
+            self.damage.add([Rectangle::from_size(texture_size)]);
+            self.last = Some(value);
+        }
+        self.damage.snapshot()
+    }
+}
 
 // Generic over the renderer `R` (matching the same pattern Smithay's own
 // `anvil` demo uses for its `OutputRenderElements`) so every variant is

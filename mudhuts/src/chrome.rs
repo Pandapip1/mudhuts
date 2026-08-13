@@ -5,13 +5,12 @@
 //! between, so no chrome to draw (matches `Ctrl+`` being a no-op there
 //! too).
 
-use smithay::backend::renderer::Renderer;
+use smithay::backend::renderer::{Renderer, Texture};
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::gles::GlesRenderer;
-use smithay::backend::renderer::utils::CommitCounter;
 use smithay::desktop::Window;
 use smithay::utils::{Physical, Point, Rectangle, Size, Transform};
 use smithay::wayland::compositor::with_states;
@@ -118,7 +117,19 @@ pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer) -> Vec<Element> {
 
         match hut.render_label(renderer, label, fg, bg) {
             Ok(texture) => {
-                let text = TextureRenderElement::from_static_texture(
+                // Real damage tracking, not a fixed default snapshot —
+                // this texture is rebuilt fresh every call regardless of
+                // whether `label`/`active` actually changed since last
+                // frame; without this, the outer tracker would never see
+                // this tab's text change again after its first frame (see
+                // `render::TextureChangeTracker`'s doc comment).
+                let texture_size = texture.size();
+                let snapshot = if i == 0 {
+                    hut.terminal_tab_text_snapshot(active, texture_size)
+                } else {
+                    hut.main_windows_mut()[i - 1].tab_text_snapshot(label, active, texture_size)
+                };
+                let text = TextureRenderElement::from_texture_with_damage(
                     text_ids[i].clone(),
                     renderer.context_id(),
                     ((x + TAB_PADDING) as f64, TAB_PADDING as f64),
@@ -129,6 +140,7 @@ pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer) -> Vec<Element> {
                     None,
                     None,
                     None,
+                    snapshot,
                     Kind::Unspecified,
                 );
                 elements.push(Element::from(text));
@@ -136,10 +148,18 @@ pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer) -> Vec<Element> {
             Err(err) => tracing::warn!("failed to render tab label {label:?}: {err}"),
         }
 
+        // Same reasoning as above: a fixed `CommitCounter::default()`
+        // would mean this tab's background never visibly updates again
+        // after its first frame, even when it flips active/inactive.
+        let bg_commit = if i == 0 {
+            hut.terminal_tab_bg_commit(active)
+        } else {
+            hut.main_windows_mut()[i - 1].tab_bg_commit(active)
+        };
         let background = SolidColorRenderElement::new(
             bg_ids[i].clone(),
             Rectangle::<i32, Physical>::new(Point::from((x, 0)), Size::from((tab_w, tab_h))),
-            CommitCounter::default(),
+            bg_commit,
             to_color32f(bg),
             Kind::Unspecified,
         );
