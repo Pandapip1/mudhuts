@@ -1,12 +1,12 @@
 //! Phase 5's docked-handle chrome: a small labeled tab near whichever
-//! edge each of the focused Hut's active Main Window's docked
-//! Sub-Windows is minimized to, plus the compositor-native drag that
+//! edge each of the focused ConsoleHut's active Main Window's docked
+//! Floating Windows is minimized to, plus the compositor-native drag that
 //! turns one into a floating window for the first time.
 //!
-//! A docked Sub-Window isn't mapped as a real surface at all — nothing to
+//! A docked Floating Window isn't mapped as a real surface at all — nothing to
 //! composite, and nothing for a client's own CSD to be dragged from — so
 //! there's no `xdg_toplevel.move` grab to hook into for *this* side of
-//! the interaction (see `grabs.rs` for the other side: once a Sub-Window
+//! the interaction (see `grabs.rs` for the other side: once a Floating Window
 //! is already floating, further drags go through a real `PointerGrab`).
 //! Instead, the drag from a handle is tracked directly in `State`, the
 //! same way `text_selecting` tracks a plain terminal-selection drag —
@@ -16,7 +16,7 @@
 //! Handle layout/hit-testing (this module) is genuinely [`Physical`] —
 //! the handle is mudhuts' own drawn chrome, pixel-native like
 //! `chrome.rs`'s tab strip, not a real surface Smithay's `Space` knows
-//! about. Only once a drag actually detaches and the Sub-Window becomes
+//! about. Only once a drag actually detaches and the Floating Window becomes
 //! a real mapped element (`Dock::Floating`, read/written by
 //! `sync_visible_main_window`/`grabs.rs`'s `MoveSurfaceGrab` too) does
 //! its position need to cross over into genuinely `Logical` space to
@@ -37,7 +37,7 @@ use smithay::utils::{Buffer, Physical, Point, Rectangle, Scale, Size, Transform}
 use crate::State;
 use crate::chrome::{to_color32f, window_title};
 use crate::grabs::nearest_edge_within_threshold;
-use crate::hut::Hut;
+use crate::console_hut::ConsoleHut;
 use crate::main_window::{Dock, Edge};
 use crate::render::OutputRenderElements;
 
@@ -62,7 +62,7 @@ const DETACH_THRESHOLD: f64 = 12.0;
 
 type Element = OutputRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>;
 
-/// Tracks a click-and-drag on a docked Sub-Window's handle. Lives in
+/// Tracks a click-and-drag on a docked Floating Window's handle. Lives in
 /// `State::dock_drag`; not a `PointerGrab` — see the module doc.
 pub struct DockDrag {
     pub surface: WlSurface,
@@ -88,11 +88,11 @@ pub struct Handle {
     pub title: String,
 }
 
-/// Compute where each of the focused Hut's active Main Window's docked
-/// Sub-Window handles currently are. Empty if the terminal is showing or
+/// Compute where each of the focused ConsoleHut's active Main Window's docked
+/// Floating Window handles currently are. Empty if the terminal is showing or
 /// there's no active Main Window — handles only make sense alongside the
 /// Main Window they belong to.
-pub fn handle_layout(hut: &Hut, output_size: (i32, i32), scale: f64) -> Vec<Handle> {
+pub fn handle_layout(hut: &ConsoleHut, output_size: (i32, i32), scale: f64) -> Vec<Handle> {
     let Some(entry) = hut.active_main_window_entry() else {
         return Vec::new();
     };
@@ -105,7 +105,7 @@ pub fn handle_layout(hut: &Hut, output_size: (i32, i32), scale: f64) -> Vec<Hand
     let mut handles = Vec::new();
     for edge in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom] {
         let docked_on_edge = entry
-            .sub_windows
+            .floating_windows
             .iter()
             .filter(|sub| matches!(sub.dock, Dock::Docked(e) if e == edge));
         for (n, sub) in docked_on_edge.enumerate() {
@@ -140,7 +140,7 @@ fn truncate(title: &str) -> String {
 
 /// Build the docked-handle chrome's render elements, or an empty list if
 /// there's nothing docked right now.
-pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer, output_size: (i32, i32), scale: f64) -> Vec<Element> {
+pub fn build(hut: &mut ConsoleHut, renderer: &mut GlesRenderer, output_size: (i32, i32), scale: f64) -> Vec<Element> {
     let handles = handle_layout(hut, output_size, scale);
     let text_inset = crate::render::scaled(6, scale);
     let mut elements = Vec::new();
@@ -150,18 +150,18 @@ pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer, output_size: (i32, i32)
 
         // Stable id + real damage tracking, not a fresh `Id::new()`
         // wrapped in a never-tracked `from_static_texture` — the
-        // handle's title text can change (the Sub-Window's own title
+        // handle's title text can change (the Floating Window's own title
         // updates). Also only actually re-renders (real GPU work) when
         // the title changed since last frame — see
         // `render::LabelCache`'s doc comment.
         let stale = hut
-            .sub_window_mut(&handle.surface)
+            .floating_window_mut(&handle.surface)
             .map(|sub| sub.handle_text_cache.is_stale(&title))
             .unwrap_or(true);
 
         let rendered: Option<(Id, GlesTexture, DamageSnapshot<i32, Buffer>)> = if stale {
             match hut.render_label(renderer, &title, FG, BG) {
-                Ok(texture) => hut.sub_window_mut(&handle.surface).map(|sub| {
+                Ok(texture) => hut.floating_window_mut(&handle.surface).map(|sub| {
                     let (texture, snapshot) = sub.handle_text_cache.store(title.clone(), texture);
                     (sub.handle_text_id.clone(), texture, snapshot)
                 }),
@@ -171,7 +171,7 @@ pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer, output_size: (i32, i32)
                 }
             }
         } else {
-            hut.sub_window_mut(&handle.surface).and_then(|sub| {
+            hut.floating_window_mut(&handle.surface).and_then(|sub| {
                 sub.handle_text_cache
                     .cached()
                     .map(|(texture, snapshot)| (sub.handle_text_id.clone(), texture, snapshot))
@@ -205,7 +205,7 @@ pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer, output_size: (i32, i32)
         // fresh one every frame would otherwise look "new" to the outer
         // tracker every time, forcing needless redraws).
         let bg_id = hut
-            .sub_window_mut(&handle.surface)
+            .floating_window_mut(&handle.surface)
             .map(|sub| sub.handle_bg_id.clone())
             .unwrap_or_else(Id::new);
         let background = SolidColorRenderElement::new(
@@ -221,7 +221,7 @@ pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer, output_size: (i32, i32)
     elements
 }
 
-/// Start dragging `handle`'s Sub-Window out from its dock, if the pointer
+/// Start dragging `handle`'s Floating Window out from its dock, if the pointer
 /// just went down on it. Called from `input.rs`'s `PointerButton` press
 /// handling, before it falls through to normal click-to-focus. `pos` is
 /// physical, like [`Handle::rect`] — `input.rs` converts the seat's
@@ -240,7 +240,7 @@ pub fn start_drag(state: &mut State, pos: Point<f64, Physical>) -> bool {
 }
 
 /// Advance an in-progress handle drag on pointer motion: flips the
-/// Sub-Window to floating and maps it for the first time once the drag
+/// Floating Window to floating and maps it for the first time once the drag
 /// crosses [`DETACH_THRESHOLD`], then just repositions it directly on
 /// every motion after that. `pos` is physical (see [`start_drag`]) —
 /// converted to genuinely Logical right before it's written anywhere
@@ -261,7 +261,7 @@ pub fn advance_drag(state: &mut State, pos: Point<f64, Physical>) {
             return;
         }
         let logical = pos.to_logical(Scale::from(state.output_scale())).to_i32_round();
-        if let Some(sub) = state.stack.focused_mut().sub_window_mut(&surface) {
+        if let Some(sub) = state.stack.focused_mut().floating_window_mut(&surface) {
             sub.dock = Dock::Floating(logical);
         }
         if let Some(drag) = &mut state.dock_drag {
@@ -304,7 +304,7 @@ pub fn finish_drag(state: &mut State) {
     // distance check in the same space (see `State::output_size_logical`'s
     // doc comment).
     let redock_edge = nearest_edge_within_threshold(state.output_size_logical(), location, size);
-    if let Some(sub) = state.stack.focused_mut().sub_window_mut(&drag.surface) {
+    if let Some(sub) = state.stack.focused_mut().floating_window_mut(&drag.surface) {
         sub.dock = match redock_edge {
             Some(edge) => Dock::Docked(edge),
             None => Dock::Floating(location),

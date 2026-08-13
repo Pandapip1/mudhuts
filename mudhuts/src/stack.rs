@@ -1,17 +1,17 @@
-//! The Stack: the global MRU-ordered list of top-level Villages that
+//! The Stack: the global MRU-ordered list of top-level Huts that
 //! Alt+Tab cycles through (see the plan's Phase 3 notes, and the
-//! Nomenclature table). Each entry is a [`Village`] — a bare Hut, or a
-//! Tab-Village/Tile-Village combining several (Phase 6) — but the
+//! Nomenclature table). Each entry is a [`Hut`] — a bare ConsoleHut, or a
+//! Tab-Hut/Tile-Hut combining several (Phase 6) — but the
 //! MRU/discard machinery below is unchanged from Phase 3: it never cared
 //! *what* an entry was, only whether it's "been used"
-//! ([`Village::touched`]) and how to spawn a fresh placeholder past the
-//! end (still always a bare Hut — wrapping into a Village only ever
+//! ([`Hut::touched`]) and how to spawn a fresh placeholder past the
+//! end (still always a bare ConsoleHut — wrapping into a Hut only ever
 //! happens explicitly, via `wrap_tab`/`wrap_tile`).
 //!
 //! Cycling is a simple forward/backward walk, not a live-reshuffling MRU
 //! (nothing yet lets you jump to an arbitrary entry out of order — Alt+Tab
 //! is the only way to change focus). Moving forward past the last entry
-//! spawns a fresh Hut; an untouched, never-interacted-with entry being
+//! spawns a fresh ConsoleHut; an untouched, never-interacted-with entry being
 //! left behind (in either direction) is discarded rather than kept around
 //! as a dead entry.
 
@@ -22,31 +22,31 @@ use smithay::reexports::calloop::channel::{self, Channel};
 use mudhuts_term::TermEvent;
 
 use crate::State;
-use crate::hut::Hut;
-use crate::village::{Axis, Direction, Village};
+use crate::console_hut::ConsoleHut;
+use crate::hut::{Axis, Direction, Hut};
 
-pub struct HutStack {
-    villages: Vec<Village>,
+pub struct Stack {
+    huts: Vec<Hut>,
     current: usize,
     /// Set while a preview session (see the Phase 3.5 plan notes — the
     /// Alt-Tab-style popup, held open while a configured modifier stays
     /// down) is open: which index is currently highlighted. Distinct from
     /// `current`, which doesn't change until [`Self::commit_preview`] —
-    /// the visible/focused Hut stays frozen for the whole session.
+    /// the visible/focused ConsoleHut stays frozen for the whole session.
     preview: Option<usize>,
     /// Stable identity for `switcher.rs`'s single popup background panel
     /// element — created once here and reused across every frame's
-    /// `build()` call, matching `Hut::element_id`'s pattern (a fresh
+    /// `build()` call, matching `ConsoleHut::element_id`'s pattern (a fresh
     /// `Id::new()` per frame breaks the outer damage tracker's ability to
     /// recognize it as the same element between frames).
     panel_id: Id,
     loop_handle: LoopHandle<'static, State>,
-    /// Environment applied to every spawned Hut's shell (currently just
+    /// Environment applied to every spawned ConsoleHut's shell (currently just
     /// `WAYLAND_DISPLAY`, pointing it at mudhuts' own socket) — see
-    /// `Hut::spawn`'s doc comment for why this can't just be `main`'s own
+    /// `ConsoleHut::spawn`'s doc comment for why this can't just be `main`'s own
     /// process env.
     extra_env: Vec<(String, String)>,
-    /// The real output scale every *newly*-spawned Hut (`wrap_tab`/
+    /// The real output scale every *newly*-spawned ConsoleHut (`wrap_tab`/
     /// `wrap_tile`/`spawn_and_insert`) should start at. Starts at `1.0`
     /// (matching `main.rs`'s pre-backend initial spawn) and is updated
     /// once, by [`Self::rescale_all`], the moment the real value becomes
@@ -54,17 +54,17 @@ pub struct HutStack {
     scale: f64,
 }
 
-impl HutStack {
-    /// `first`/`first_events` must come from a single [`Hut::spawn`] call
+impl Stack {
+    /// `first`/`first_events` must come from a single [`ConsoleHut::spawn`] call
     /// using the same `extra_env` given here.
     pub fn new(
-        first: Hut,
+        first: ConsoleHut,
         first_events: Channel<TermEvent>,
         loop_handle: LoopHandle<'static, State>,
         extra_env: Vec<(String, String)>,
     ) -> Result<Self, String> {
         let stack = Self {
-            villages: vec![Village::Hut(Box::new(first))],
+            huts: vec![Hut::Console(Box::new(first))],
             current: 0,
             preview: None,
             panel_id: Id::new(),
@@ -72,92 +72,92 @@ impl HutStack {
             extra_env,
             scale: 1.0,
         };
-        let id = stack.villages[0].focused_hut().id;
+        let id = stack.huts[0].focused_hut().id;
         stack.insert_channel(id, first_events)?;
         Ok(stack)
     }
 
     pub fn len(&self) -> usize {
-        self.villages.len()
+        self.huts.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.villages.is_empty()
+        self.huts.is_empty()
     }
 
-    /// The Hut that currently has effective focus — walking down through
-    /// whichever child is active at each Tab/Tile-Village level, if the
-    /// focused top-level entry is one. Every pre-Village call site in the
-    /// codebase wants exactly this (the Hut whose terminal/Main Windows
+    /// The ConsoleHut that currently has effective focus — walking down through
+    /// whichever child is active at each Tab/Tile-Hut level, if the
+    /// focused top-level entry is one. Almost every call site in the
+    /// codebase wants exactly this (the ConsoleHut whose terminal/Main Windows
     /// should currently be visible/receiving input), not the raw
-    /// top-level Village — see [`Self::focused_village`] for that.
-    pub fn focused(&self) -> &Hut {
-        self.villages[self.current].focused_hut()
+    /// top-level Hut — see [`Self::focused_top_level`] for that.
+    pub fn focused(&self) -> &ConsoleHut {
+        self.huts[self.current].focused_hut()
     }
 
-    pub fn focused_mut(&mut self) -> &mut Hut {
-        self.villages[self.current].focused_hut_mut()
+    pub fn focused_mut(&mut self) -> &mut ConsoleHut {
+        self.huts[self.current].focused_hut_mut()
     }
 
-    /// The raw top-level Village at `current`, unresolved — for Phase 6's
-    /// own Village-tree-aware logic (Tile-Village rendering, the tab-strip
-    /// chrome for a Tab-Village) that needs to tell a bare Hut apart from
-    /// a wrapped Village, unlike [`Self::focused`].
-    pub fn focused_village(&self) -> &Village {
-        &self.villages[self.current]
+    /// The raw top-level Hut at `current`, unresolved — for Phase 6's
+    /// own Hut-tree-aware logic (Tile-Hut rendering, the tab-strip
+    /// chrome for a Tab-Hut) that needs to tell a bare ConsoleHut apart from
+    /// a wrapped Hut, unlike [`Self::focused`].
+    pub fn focused_top_level(&self) -> &Hut {
+        &self.huts[self.current]
     }
 
-    pub fn focused_village_mut(&mut self) -> &mut Village {
-        &mut self.villages[self.current]
+    pub fn focused_top_level_mut(&mut self) -> &mut Hut {
+        &mut self.huts[self.current]
     }
 
-    /// Find a Hut by id anywhere in the whole tree (not just a bare
+    /// Find a ConsoleHut by id anywhere in the whole tree (not just a bare
     /// top-level entry) — e.g. `handlers::xdg_shell`'s PID-ancestry
-    /// lookup, which only knows the owning Hut's id, not where in the
+    /// lookup, which only knows the owning ConsoleHut's id, not where in the
     /// tree it currently lives.
-    pub fn find_mut(&mut self, id: u64) -> Option<&mut Hut> {
-        self.villages.iter_mut().find_map(|v| v.find_hut_mut(id))
+    pub fn find_mut(&mut self, id: u64) -> Option<&mut ConsoleHut> {
+        self.huts.iter_mut().find_map(|v| v.find_hut_mut(id))
     }
 
-    /// Every Hut anywhere in the tree, recursively — not just whatever's
+    /// Every ConsoleHut anywhere in the tree, recursively — not just whatever's
     /// currently visible (see [`Self::top_level_huts`] for that) —
-    /// searches that need to reach a background/inactive Hut too
+    /// searches that need to reach a background/inactive ConsoleHut too
     /// (ownership's PID-ancestry walk, finding a window by surface,
     /// resizing every Main Window on output resize).
-    pub fn all_huts(&self) -> impl Iterator<Item = &Hut> {
-        self.villages.iter().flat_map(|v| v.all_huts())
+    pub fn all_huts(&self) -> impl Iterator<Item = &ConsoleHut> {
+        self.huts.iter().flat_map(|v| v.all_huts())
     }
 
-    pub fn all_huts_mut(&mut self) -> impl Iterator<Item = &mut Hut> {
-        self.villages.iter_mut().flat_map(|v| v.all_huts_mut())
+    pub fn all_huts_mut(&mut self) -> impl Iterator<Item = &mut ConsoleHut> {
+        self.huts.iter_mut().flat_map(|v| v.all_huts_mut())
     }
 
-    /// One Hut per top-level Stack entry — whichever is currently active/
-    /// visible within that entry's Village, if it's a Tab/Tile-Village.
+    /// One ConsoleHut per top-level Stack entry — whichever is currently active/
+    /// visible within that entry's Hut, if it's a Tab/Tile-Hut.
     /// For the Alt-Tab popup's thumbnails (`switcher.rs`) and redrawing
     /// what they show (`render.rs`) — each represents its whole entry,
-    /// same as when every entry was necessarily a bare Hut.
-    pub fn top_level_huts(&self) -> impl Iterator<Item = &Hut> {
-        self.villages.iter().map(|v| v.focused_hut())
+    /// same as when every entry was necessarily a bare ConsoleHut.
+    pub fn top_level_huts(&self) -> impl Iterator<Item = &ConsoleHut> {
+        self.huts.iter().map(|v| v.focused_hut())
     }
 
-    pub fn top_level_huts_mut(&mut self) -> impl Iterator<Item = &mut Hut> {
-        self.villages.iter_mut().map(|v| v.focused_hut_mut())
+    pub fn top_level_huts_mut(&mut self) -> impl Iterator<Item = &mut ConsoleHut> {
+        self.huts.iter_mut().map(|v| v.focused_hut_mut())
     }
 
-    /// Every Village's Hut(s) need to track the real output size even
+    /// Every Hut's ConsoleHut(s) need to track the real output size even
     /// while not focused/visible, so switching to one doesn't show a
     /// stale layout until the next actual resize.
     pub fn resize_all(&mut self, width: i32, height: i32) {
-        for village in &mut self.villages {
-            village.resize_to_pixels(width, height);
+        for hut in &mut self.huts {
+            hut.resize_to_pixels(width, height);
         }
     }
 
-    /// Catch every already-spawned Hut up to the real output scale, the
+    /// Catch every already-spawned ConsoleHut up to the real output scale, the
     /// first (and only) time it becomes known — `main.rs` spawns the
-    /// initial Hut before any backend/output exists, so it and anything
-    /// spawned before this call started at scale 1.0 (see `Hut::rescale`'s
+    /// initial ConsoleHut before any backend/output exists, so it and anything
+    /// spawned before this call started at scale 1.0 (see `ConsoleHut::rescale`'s
     /// doc comment). Called once, right after `winit_backend.rs`/
     /// `udev_backend.rs` learn the output's real scale, before the first
     /// real frame renders. Also remembered here so every *later*
@@ -171,21 +171,21 @@ impl HutStack {
         Ok(())
     }
 
-    /// Meta+Left/Right's bubble-up step, once the focused Hut's own Main
+    /// Meta+Left/Right's bubble-up step, once the focused ConsoleHut's own Main
     /// Window tabs have already been ruled out (fewer than 2 — see
-    /// `input.rs`) — see [`Village::cycle_innermost`].
+    /// `input.rs`) — see [`Hut::cycle_innermost`].
     pub fn cycle_innermost(&mut self, dir: Direction) -> bool {
-        self.villages[self.current].cycle_innermost(dir)
+        self.huts[self.current].cycle_innermost(dir)
     }
 
-    /// Spawn a fresh Hut and wrap it together with whatever's currently
-    /// focused into a new Tab-Village, *in place* — see
-    /// [`Village::wrap_focused`] for why this always reaches all the way
-    /// down to the actual focused Hut (whatever container it's already
+    /// Spawn a fresh ConsoleHut and wrap it together with whatever's currently
+    /// focused into a new Tab-Hut, *in place* — see
+    /// [`Hut::wrap_focused`] for why this always reaches all the way
+    /// down to the actual focused ConsoleHut (whatever container it's already
     /// inside, if any) rather than operating on top-level Stack entries:
-    /// wrapping a specific pane of an existing Tile-Village needs to
-    /// replace *just that pane*, leaving the Tile-Village itself and
-    /// every other pane completely untouched. Always creates a new Hut
+    /// wrapping a specific pane of an existing Tile-Hut needs to
+    /// replace *just that pane*, leaving the Tile-Hut itself and
+    /// every other pane completely untouched. Always creates a new ConsoleHut
     /// rather than merging in some other existing entry — pressing
     /// wrap-tab/wrap-tile is "make a new thing to put next to what I'm
     /// looking at," not "combine two things I already have open."
@@ -194,20 +194,20 @@ impl HutStack {
     /// `current` doesn't follow a preview session until it's committed).
     pub fn wrap_tab(&mut self) -> Result<(), String> {
         self.commit_preview();
-        let (hut, events) = Hut::spawn(self.extra_env.clone(), self.scale)?;
+        let (hut, events) = ConsoleHut::spawn(self.extra_env.clone(), self.scale)?;
         let id = hut.id;
-        self.villages[self.current].wrap_focused(|old| Village::wrap_tab(Village::Hut(Box::new(hut)), old));
+        self.huts[self.current].wrap_focused(|old| Hut::wrap_tab(Hut::Console(Box::new(hut)), old));
         self.insert_channel(id, events)
     }
 
     /// Same as [`Self::wrap_tab`], but into a new (horizontally split)
-    /// Tile-Village instead.
+    /// Tile-Hut instead.
     pub fn wrap_tile(&mut self) -> Result<(), String> {
         self.commit_preview();
-        let (hut, events) = Hut::spawn(self.extra_env.clone(), self.scale)?;
+        let (hut, events) = ConsoleHut::spawn(self.extra_env.clone(), self.scale)?;
         let id = hut.id;
-        self.villages[self.current]
-            .wrap_focused(|old| Village::wrap_tile(Village::Hut(Box::new(hut)), old, Axis::Horizontal));
+        self.huts[self.current]
+            .wrap_focused(|old| Hut::wrap_tile(Hut::Console(Box::new(hut)), old, Axis::Horizontal));
         self.insert_channel(id, events)
     }
 
@@ -223,10 +223,10 @@ impl HutStack {
     }
 
     fn spawn_and_insert(&mut self) -> Result<(), String> {
-        let (hut, events) = Hut::spawn(self.extra_env.clone(), self.scale)?;
+        let (hut, events) = ConsoleHut::spawn(self.extra_env.clone(), self.scale)?;
         let id = hut.id;
         self.insert_channel(id, events)?;
-        self.villages.push(Village::Hut(Box::new(hut)));
+        self.huts.push(Hut::Console(Box::new(hut)));
         Ok(())
     }
 
@@ -234,26 +234,26 @@ impl HutStack {
     /// the entry currently at `pos` is discarded (rather than kept
     /// alongside whatever's next) if it's never been touched, *unless*
     /// its index matches `protect` — used to keep the live, currently
-    /// displayed Hut safe from a preview session's cursor landing back on
+    /// displayed ConsoleHut safe from a preview session's cursor landing back on
     /// it before anything's actually been typed into it (see
     /// [`Self::preview_next`]); the plain instant-commit [`Self::next`]
     /// passes `None`, matching the original Phase 3 behavior exactly.
-    /// Spawns a fresh Hut if this runs past the end.
+    /// Spawns a fresh ConsoleHut if this runs past the end.
     fn advance_forward(&mut self, pos: &mut usize, protect: Option<usize>) -> Result<(), String> {
-        if self.villages.is_empty() {
+        if self.huts.is_empty() {
             // Should be unreachable (every path here maintains at least
             // one entry) — recover rather than index out of bounds.
             self.spawn_and_insert()?;
             *pos = 0;
             return Ok(());
         }
-        let keep = protect == Some(*pos) || self.villages[*pos].touched();
+        let keep = protect == Some(*pos) || self.huts[*pos].touched();
         if keep {
             *pos += 1;
         } else {
-            self.villages.remove(*pos);
+            self.huts.remove(*pos);
         }
-        if *pos >= self.villages.len() {
+        if *pos >= self.huts.len() {
             self.spawn_and_insert()?;
         }
         Ok(())
@@ -263,19 +263,19 @@ impl HutStack {
     /// [`Self::advance_forward`]. No-op at the start of the stack — there's
     /// nowhere further back, and only forward movement ever spawns.
     fn advance_backward(&mut self, pos: &mut usize, protect: Option<usize>) {
-        if *pos == 0 || self.villages.is_empty() {
+        if *pos == 0 || self.huts.is_empty() {
             return;
         }
-        let keep = protect == Some(*pos) || self.villages[*pos].touched();
+        let keep = protect == Some(*pos) || self.huts[*pos].touched();
         if !keep {
-            self.villages.remove(*pos);
+            self.huts.remove(*pos);
         }
         *pos -= 1;
     }
 
     /// Alt+Tab, instant-commit fallback for when no `stack-hold` modifier
     /// is configured (see the plan's Phase 3.5 notes) — no preview, no
-    /// popup, `current` (and so the visible Hut) changes immediately.
+    /// popup, `current` (and so the visible ConsoleHut) changes immediately.
     pub fn next(&mut self) -> Result<(), String> {
         let mut pos = self.current;
         self.advance_forward(&mut pos, None)?;
@@ -295,7 +295,7 @@ impl HutStack {
         self.preview.is_some()
     }
 
-    /// The Hut currently highlighted for the popup — the preview cursor
+    /// The ConsoleHut currently highlighted for the popup — the preview cursor
     /// if a session is open, else whatever's focused.
     pub fn preview_index(&self) -> usize {
         self.preview.unwrap_or(self.current)
@@ -308,7 +308,7 @@ impl HutStack {
     }
 
     /// Begin a preview session (peeking one step forward from the focused
-    /// Hut) if none is open, or advance an already-open one. Doesn't
+    /// ConsoleHut) if none is open, or advance an already-open one. Doesn't
     /// touch `current`/the visible background at all — see
     /// [`Self::commit_preview`].
     pub fn preview_next(&mut self) -> Result<(), String> {
@@ -326,7 +326,7 @@ impl HutStack {
                 self.advance_backward(&mut pos, Some(self.current));
                 pos
             }
-            None => self.villages.len().saturating_sub(1),
+            None => self.huts.len().saturating_sub(1),
         };
         self.preview = Some(pos);
     }
@@ -335,7 +335,7 @@ impl HutStack {
     /// front of the Stack (real MRU reordering, moving it to index 0) and
     /// `current` follows it. No-op if no session is open. Marks it
     /// touched — selecting it *is* using it, and matters if it was a
-    /// freshly-spawned Hut nothing's been typed into yet: the very next
+    /// freshly-spawned ConsoleHut nothing's been typed into yet: the very next
     /// preview session starts by peeking from `current`, and without
     /// this, that peek could discard the entry whose content is
     /// currently on screen for being "never touched."
@@ -343,30 +343,30 @@ impl HutStack {
         let Some(pos) = self.preview.take() else {
             return;
         };
-        if pos < self.villages.len() {
-            let mut village = self.villages.remove(pos);
-            village.mark_touched();
-            self.villages.insert(0, village);
+        if pos < self.huts.len() {
+            let mut hut = self.huts.remove(pos);
+            hut.mark_touched();
+            self.huts.insert(0, hut);
         }
         self.current = 0;
     }
 
-    /// A Hut's shell exited. Per the last-Hut rule, if it was the only
+    /// A ConsoleHut's shell exited. Per the last-ConsoleHut rule, if it was the only
     /// entry left in the whole Stack, a fresh replacement is spawned
     /// immediately rather than leaving the compositor with zero entries;
-    /// otherwise it's just dropped. A Hut nested inside a Tab/Tile-Village
+    /// otherwise it's just dropped. A ConsoleHut nested inside a Tab/Tile-Hut
     /// (rather than a bare top-level entry) is removed from within its
-    /// Village instead — see [`Village::remove_child_hut`] — collapsing
-    /// that Village back down to a bare child if only one survives, and
+    /// Hut instead — see [`Hut::remove_child_hut`] — collapsing
+    /// that Hut back down to a bare child if only one survives, and
     /// leaving the top-level entry count (and so `current`/`preview`'s
     /// indices) untouched either way.
     pub fn remove_exited(&mut self, id: u64) -> Result<(), String> {
         if let Some(idx) = self
-            .villages
+            .huts
             .iter()
-            .position(|v| matches!(v, Village::Hut(hut) if hut.id == id))
+            .position(|v| matches!(v, Hut::Console(hut) if hut.id == id))
         {
-            self.villages.remove(idx);
+            self.huts.remove(idx);
             if idx < self.current {
                 self.current -= 1;
             }
@@ -376,18 +376,18 @@ impl HutStack {
                 *preview -= 1;
             }
         } else {
-            for village in &mut self.villages {
-                if village.remove_child_hut(id) {
+            for hut in &mut self.huts {
+                if hut.remove_child_hut(id) {
                     break;
                 }
             }
         }
-        if self.villages.is_empty() {
+        if self.huts.is_empty() {
             self.spawn_and_insert()?;
         }
-        self.current = self.current.min(self.villages.len().saturating_sub(1));
+        self.current = self.current.min(self.huts.len().saturating_sub(1));
         if let Some(preview) = &mut self.preview {
-            *preview = (*preview).min(self.villages.len().saturating_sub(1));
+            *preview = (*preview).min(self.huts.len().saturating_sub(1));
         }
         Ok(())
     }
@@ -398,7 +398,7 @@ mod tests {
     use smithay::reexports::calloop::EventLoop;
 
     use super::*;
-    use crate::hut::Hut;
+    use crate::console_hut::ConsoleHut;
 
     /// A real `LoopHandle` (from a real, never-run `EventLoop`) — enough
     /// to register channels against, without needing to actually spawn a
@@ -411,9 +411,9 @@ mod tests {
         Box::leak(Box::new(event_loop)).handle()
     }
 
-    fn new_stack() -> HutStack {
-        let (hut, events) = Hut::spawn(std::iter::empty(), 1.0).unwrap();
-        HutStack::new(hut, events, loop_handle(), Vec::new()).unwrap()
+    fn new_stack() -> Stack {
+        let (hut, events) = ConsoleHut::spawn(std::iter::empty(), 1.0).unwrap();
+        Stack::new(hut, events, loop_handle(), Vec::new()).unwrap()
     }
 
     #[test]
@@ -431,9 +431,9 @@ mod tests {
         assert_eq!(
             stack.len(),
             1,
-            "untouched Hut should be replaced, not kept alongside a new one"
+            "untouched ConsoleHut should be replaced, not kept alongside a new one"
         );
-        assert_ne!(stack.focused().id, original_id, "should be a fresh Hut");
+        assert_ne!(stack.focused().id, original_id, "should be a fresh ConsoleHut");
     }
 
     #[test]
@@ -446,7 +446,7 @@ mod tests {
         assert_ne!(
             stack.focused().id,
             first_id,
-            "should have moved on to a new Hut"
+            "should have moved on to a new ConsoleHut"
         );
         assert!(!stack.focused().touched());
     }
@@ -464,7 +464,7 @@ mod tests {
         assert_eq!(
             stack.len(),
             3,
-            "moving back shouldn't discard a touched Hut"
+            "moving back shouldn't discard a touched ConsoleHut"
         );
         stack.next().unwrap(); // should move forward onto the existing 3rd entry, not spawn a 4th
         assert_eq!(stack.len(), 3);
@@ -485,12 +485,12 @@ mod tests {
         let mut stack = new_stack();
         let first_id = stack.focused().id;
         stack.focused_mut().mark_touched();
-        stack.next().unwrap(); // now at a fresh, untouched 2nd Hut
+        stack.next().unwrap(); // now at a fresh, untouched 2nd ConsoleHut
         stack.prev();
         assert_eq!(
             stack.len(),
             1,
-            "the never-touched 2nd Hut should be discarded, not kept"
+            "the never-touched 2nd ConsoleHut should be discarded, not kept"
         );
         assert_eq!(stack.focused().id, first_id);
     }
@@ -502,12 +502,12 @@ mod tests {
         stack.next().unwrap();
         stack.focused_mut().mark_touched();
         let second_id = stack.focused().id;
-        stack.next().unwrap(); // now at a fresh, untouched 3rd Hut
+        stack.next().unwrap(); // now at a fresh, untouched 3rd ConsoleHut
         stack.prev();
         assert_eq!(
             stack.len(),
             2,
-            "the touched 2nd Hut should survive being left"
+            "the touched 2nd ConsoleHut should survive being left"
         );
         assert_eq!(stack.focused().id, second_id);
     }
@@ -555,7 +555,7 @@ mod tests {
         let first_id = stack.focused().id;
         stack.preview_next().unwrap();
         assert!(stack.is_previewing());
-        assert_eq!(stack.len(), 2, "peeking forward should spawn a 2nd Hut");
+        assert_eq!(stack.len(), 2, "peeking forward should spawn a 2nd ConsoleHut");
         assert_eq!(stack.focused().id, first_id, "background must stay frozen");
         assert_ne!(
             stack.top_level_huts().nth(stack.preview_index()).unwrap().id,
@@ -618,7 +618,7 @@ mod tests {
         assert_ne!(
             stack.focused().id,
             first_id,
-            "sanity: committed to the newly-spawned Hut, pushing first_id to index 1"
+            "sanity: committed to the newly-spawned ConsoleHut, pushing first_id to index 1"
         );
 
         stack.preview_prev();
@@ -649,7 +649,7 @@ mod tests {
         assert_eq!(
             stack.len(),
             2,
-            "the Hut left behind (first_id) is kept, not discarded"
+            "the ConsoleHut left behind (first_id) is kept, not discarded"
         );
     }
 
@@ -685,11 +685,11 @@ mod tests {
         // at the same logical Huts.
         stack.remove_exited(a_id).unwrap();
 
-        assert_eq!(stack.focused().id, c_id, "current follows the same Hut");
+        assert_eq!(stack.focused().id, c_id, "current follows the same ConsoleHut");
         assert_eq!(
             stack.top_level_huts().nth(stack.preview_index()).unwrap().id,
             d_id,
-            "preview cursor follows the same Hut"
+            "preview cursor follows the same ConsoleHut"
         );
     }
 
@@ -710,15 +710,15 @@ mod tests {
             stack.focused().id,
             focused_id,
             "wrapping shouldn't change what's on screen — the pre-existing \
-             Hut stays active, the freshly spawned one is the other tab"
+             ConsoleHut stays active, the freshly spawned one is the other tab"
         );
         assert!(
-            matches!(stack.focused_village(), Village::Tab(_)),
-            "the wrapped entry is a Tab-Village"
+            matches!(stack.focused_top_level(), Hut::Tab(_)),
+            "the wrapped entry is a Tab-Hut"
         );
 
-        // The freshly spawned Hut should be reachable by cycling, and be
-        // a genuinely different (new) Hut, not the pre-existing one.
+        // The freshly spawned ConsoleHut should be reachable by cycling, and be
+        // a genuinely different (new) ConsoleHut, not the pre-existing one.
         stack.cycle_innermost(Direction::Prev);
         assert_ne!(stack.focused().id, focused_id);
     }
@@ -741,7 +741,7 @@ mod tests {
              the top-level Stack's length"
         );
         assert_eq!(stack.focused().id, second_id);
-        assert!(matches!(stack.focused_village(), Village::Tab(_)));
+        assert!(matches!(stack.focused_top_level(), Hut::Tab(_)));
 
         // The untouched sibling entry (A) is still there, unaffected.
         assert_eq!(stack.top_level_huts().next().unwrap().id, first_id);
@@ -756,24 +756,24 @@ mod tests {
 
         assert_eq!(stack.len(), 1);
         assert_eq!(stack.focused().id, focused_id);
-        assert!(matches!(stack.focused_village(), Village::Tile(_)));
+        assert!(matches!(stack.focused_top_level(), Hut::Tile(_)));
     }
 
     #[test]
     fn wrap_focused_only_touches_the_specific_pane_its_called_on() {
-        // Regression case for the reported bug: wrapping a Tab-Village
-        // "inside" one pane of an existing Tile-Village must replace
-        // *that pane's* content only, leaving the Tile-Village and its
+        // Regression case for the reported bug: wrapping a Tab-Hut
+        // "inside" one pane of an existing Tile-Hut must replace
+        // *that pane's* content only, leaving the Tile-Hut and its
         // other pane completely untouched — not disturb the top-level
         // Stack at all.
         let mut stack = new_stack();
         stack.wrap_tile().unwrap(); // Tile[new_hut, orig], active = 1 (orig — unchanged focus)
         let other_pane_id = {
-            let Village::Tile(tile) = stack.focused_village() else {
-                panic!("expected a Tile-Village");
+            let Hut::Tile(tile) = stack.focused_top_level() else {
+                panic!("expected a Tile-Hut");
             };
-            let Village::Hut(hut) = &tile.children[0].0 else {
-                panic!("expected a bare Hut");
+            let Hut::Console(hut) = &tile.children[0].0 else {
+                panic!("expected a bare ConsoleHut");
             };
             hut.id
         };
@@ -781,18 +781,18 @@ mod tests {
 
         stack.wrap_tab().unwrap();
 
-        assert_eq!(stack.len(), 1, "still just the one Tile-Village overall");
-        let Village::Tile(tile) = stack.focused_village() else {
-            panic!("expected the Tile-Village to still be a Tile-Village");
+        assert_eq!(stack.len(), 1, "still just the one Tile-Hut overall");
+        let Hut::Tile(tile) = stack.focused_top_level() else {
+            panic!("expected the Tile-Hut to still be a Tile-Hut");
         };
         assert_eq!(tile.children.len(), 2, "the other pane wasn't touched");
         assert!(
-            matches!(&tile.children[0].0, Village::Hut(hut) if hut.id == other_pane_id),
-            "the untouched pane is still exactly the same bare Hut"
+            matches!(&tile.children[0].0, Hut::Console(hut) if hut.id == other_pane_id),
+            "the untouched pane is still exactly the same bare ConsoleHut"
         );
         assert!(
-            matches!(&tile.children[1].0, Village::Tab(_)),
-            "only the active pane became a Tab-Village"
+            matches!(&tile.children[1].0, Hut::Tab(_)),
+            "only the active pane became a Tab-Hut"
         );
         assert_eq!(
             stack.focused().id,
@@ -814,7 +814,7 @@ mod tests {
 
         assert!(
             stack.cycle_innermost(Direction::Next),
-            "moves to the freshly spawned Hut"
+            "moves to the freshly spawned ConsoleHut"
         );
         let new_id = stack.focused().id;
         assert_ne!(new_id, original_id);
@@ -843,8 +843,8 @@ mod tests {
 
         assert_eq!(stack.len(), 1, "still one top-level entry");
         assert!(
-            matches!(stack.focused_village(), Village::Hut(_)),
-            "collapsed back down to a bare Hut instead of a 1-child Tab-Village"
+            matches!(stack.focused_top_level(), Hut::Console(_)),
+            "collapsed back down to a bare ConsoleHut instead of a 1-child Tab-Hut"
         );
     }
 }

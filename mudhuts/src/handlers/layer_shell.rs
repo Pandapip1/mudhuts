@@ -1,7 +1,7 @@
 //! `wlr-layer-shell` (`zwlr_layer_shell_v1`) — lets clients like status
 //! bars, launchers, and notification daemons anchor a surface to a
 //! screen edge/region outside the normal fullscreen-toplevel model, in
-//! one of 4 stacked layers (background < bottom < [normal Hut/Main-
+//! one of 4 stacked layers (background < bottom < [normal ConsoleHut/Main-
 //! Window content] < top < overlay), optionally reserving an "exclusive
 //! zone" that shrinks the area normal content should be laid out in.
 //!

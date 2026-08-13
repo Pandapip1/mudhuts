@@ -1,4 +1,4 @@
-//! Interactive move for floating Sub-Windows/Alerts, via the real
+//! Interactive move for floating Floating Windows/Alerts, via the real
 //! `xdg_toplevel.move` request — mudhuts doesn't negotiate server-side
 //! decorations, so a client draws its own CSD title bar and calls this
 //! itself on drag. Ported from `.smithay-ref/smallvil/src/grabs/
@@ -23,7 +23,7 @@ use crate::main_window::{Dock, Edge};
 /// How close (in genuinely Logical pixels — `location`/`size` below
 /// always come from `self.space`, which is Logical throughout, so this
 /// threshold has to be too, unlike `docks.rs`'s physical-native
-/// `DETACH_THRESHOLD`) to an output edge a released Sub-Window needs to
+/// `DETACH_THRESHOLD`) to an output edge a released Floating Window needs to
 /// be to snap back to docked, rather than staying floating where it was
 /// dropped.
 const REDOCK_THRESHOLD: i32 = 40;
@@ -33,13 +33,13 @@ pub struct MoveSurfaceGrab {
     pub window: Window,
     pub initial_window_location: Point<i32, Logical>,
     /// The moving window's own surface — used on release to look its
-    /// entry back up in the owning Hut's data model (the actual source
+    /// entry back up in the owning ConsoleHut's data model (the actual source
     /// of truth for position/dock state; `space` itself gets rebuilt
     /// from it on every `sync_visible_main_window` call).
     pub surface: WlSurface,
-    /// Whether this is a Sub-Window (checks edge-proximity to re-dock on
+    /// Whether this is a Floating Window (checks edge-proximity to re-dock on
     /// release) vs. an Alert (always ends up floating).
-    pub sub_window: bool,
+    pub floating_window: bool,
 }
 
 impl PointerGrab<State> for MoveSurfaceGrab {
@@ -174,7 +174,7 @@ impl PointerGrab<State> for MoveSurfaceGrab {
         &self.start_data
     }
 
-    /// Persist the drop location back into the owning Hut's own data
+    /// Persist the drop location back into the owning ConsoleHut's own data
     /// model — the real source of truth for position/dock state, which
     /// `State::sync_visible_main_window` rebuilds `space` from on every
     /// focus/visibility change. Without this, the very next such sync
@@ -185,7 +185,7 @@ impl PointerGrab<State> for MoveSurfaceGrab {
             return;
         };
 
-        if !self.sub_window {
+        if !self.floating_window {
             if let Some(alert) = data.stack.focused_mut().alert_mut(&self.surface) {
                 alert.position = location;
             }
@@ -200,7 +200,7 @@ impl PointerGrab<State> for MoveSurfaceGrab {
         // distance check in the same space (see
         // `State::output_size_logical`'s doc comment).
         let redock_edge = nearest_edge_within_threshold(data.output_size_logical(), location, size);
-        if let Some(sub) = data.stack.focused_mut().sub_window_mut(&self.surface) {
+        if let Some(sub) = data.stack.focused_mut().floating_window_mut(&self.surface) {
             sub.dock = match redock_edge {
                 Some(edge) => Dock::Docked(edge),
                 None => Dock::Floating(location),
@@ -213,7 +213,7 @@ impl PointerGrab<State> for MoveSurfaceGrab {
 
 /// The closest of the 4 output edges to a window at `location`/`size`, if
 /// within [`REDOCK_THRESHOLD`] — used on release to decide whether a
-/// dragged-out Sub-Window snaps back to docked.
+/// dragged-out Floating Window snaps back to docked.
 pub(crate) fn nearest_edge_within_threshold(
     output_size: (i32, i32),
     location: Point<i32, Logical>,

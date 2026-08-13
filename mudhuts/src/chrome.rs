@@ -1,7 +1,7 @@
 //! Phase 4's tab-strip chrome: a horizontal strip at the top of the
-//! screen showing the focused Hut's "Terminal" tab plus one tab per Main
+//! screen showing the focused ConsoleHut's "Terminal" tab plus one tab per Main
 //! Window, highlighting whichever is active. Shown only when the focused
-//! Hut has at least one Main Window — an empty Hut has nothing to switch
+//! ConsoleHut has at least one Main Window — an empty ConsoleHut has nothing to switch
 //! between, so no chrome to draw (matches `Ctrl+`` being a no-op there
 //! too).
 
@@ -18,7 +18,7 @@ use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
 
 use mudhuts_term::palette::Rgb;
 
-use crate::hut::Hut;
+use crate::console_hut::ConsoleHut;
 use crate::render::OutputRenderElements;
 
 /// Base sizes (scale 1.0) — scaled via `crate::render::scaled` wherever
@@ -96,10 +96,10 @@ pub(crate) fn to_color32f(rgb: Rgb) -> [f32; 4] {
 }
 
 /// This tab strip's height in physical pixels — `0` if there's nothing
-/// to show (no Main Windows), so callers (`render.rs`'s Village-level
+/// to show (no Main Windows), so callers (`render.rs`'s Hut-level
 /// stacking, `input.rs`'s click hit-testing) don't need their own
 /// separate "is there a strip at all" check.
-pub fn strip_height(hut: &Hut, scale: f64) -> i32 {
+pub fn strip_height(hut: &ConsoleHut, scale: f64) -> i32 {
     if hut.main_window_count() == 0 {
         return 0;
     }
@@ -116,11 +116,11 @@ pub struct TabRect {
     pub rect: Rectangle<i32, Physical>,
 }
 
-/// Compute this Hut's tab strip layout, starting at physical-pixel row
-/// `y` (pushed down by however many Village-level tab strips are stacked
+/// Compute this ConsoleHut's tab strip layout, starting at physical-pixel row
+/// `y` (pushed down by however many Hut-level tab strips are stacked
 /// above it — see `village_chrome.rs`'s module doc) — empty if there's
 /// nothing to show.
-pub fn tab_layout(hut: &Hut, y: i32, scale: f64) -> Vec<TabRect> {
+pub fn tab_layout(hut: &ConsoleHut, y: i32, scale: f64) -> Vec<TabRect> {
     if hut.main_window_count() == 0 {
         return Vec::new();
     }
@@ -147,9 +147,9 @@ pub fn tab_layout(hut: &Hut, y: i32, scale: f64) -> Vec<TabRect> {
 }
 
 /// Build the tab strip's render elements in front-to-back order, starting
-/// at physical-pixel row `y`, or an empty list if the focused Hut has no
+/// at physical-pixel row `y`, or an empty list if the focused ConsoleHut has no
 /// Main Windows.
-pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer, y: i32, scale: f64) -> Vec<Element> {
+pub fn build(hut: &mut ConsoleHut, renderer: &mut GlesRenderer, y: i32, scale: f64) -> Vec<Element> {
     let rects = tab_layout(hut, y, scale);
     if rects.is_empty() {
         return Vec::new();
@@ -163,7 +163,7 @@ pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer, y: i32, scale: f64) -> 
     };
 
     // Stable per-tab element ids, matching each label 1:1 — index 0 is
-    // always the "Terminal" tab (`Hut`'s own cached ids), the rest follow
+    // always the "Terminal" tab (`ConsoleHut`'s own cached ids), the rest follow
     // `hut.main_windows()`'s order. Must stay stable across frames (not
     // freshly generated per call) or the outer damage tracker sees a "new"
     // element every frame instead of recognizing it as the same one.

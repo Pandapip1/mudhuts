@@ -14,7 +14,7 @@
 //! core instancing, not the GLES2 + extensions fallback path.
 //!
 //! [`GlyphAtlas`] (the shader program + atlas texture + rasterization
-//! cache) is shared between [`GpuTermRenderer`] (one Hut's full terminal
+//! cache) is shared between [`GpuTermRenderer`] (one ConsoleHut's full terminal
 //! grid) and [`LabelRenderer`] (Phase 4's tab-strip chrome — short
 //! standalone strings like window titles) via `Rc<RefCell<_>>`, so a
 //! glyph seen by one is cached for the other too rather than rasterized
@@ -608,7 +608,7 @@ pub struct GpuTermRenderer {
 
 impl GpuTermRenderer {
     /// Creates its own atlas. Most callers want [`Self::with_atlas`]
-    /// instead, sharing one with the same Hut's [`LabelRenderer`] (if any)
+    /// instead, sharing one with the same ConsoleHut's [`LabelRenderer`] (if any)
     /// so glyphs aren't rasterized/uploaded twice.
     pub fn new(renderer: &mut GlesRenderer) -> Result<Self, String> {
         let atlas = Rc::new(RefCell::new(GlyphAtlas::new(renderer)?));
@@ -638,7 +638,7 @@ impl GpuTermRenderer {
     }
 
     /// This renderer's glyph atlas, to share with a [`LabelRenderer`] for
-    /// the same Hut.
+    /// the same ConsoleHut.
     pub fn atlas(&self) -> Rc<RefCell<GlyphAtlas>> {
         self.atlas.clone()
     }

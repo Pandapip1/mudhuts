@@ -712,11 +712,11 @@ fn connector_connected(
 
     state.space.map_output(&output, (0, 0));
     state.output_size = (wl_mode.size.w, wl_mode.size.h);
-    // Catches up the initial Hut (spawned in `main.rs` before this
-    // backend existed, at scale 1.0) and remembers `scale` for every Hut
-    // spawned from here on — see `HutStack::rescale_all`'s doc comment.
+    // Catches up the initial ConsoleHut (spawned in `main.rs` before this
+    // backend existed, at scale 1.0) and remembers `scale` for every ConsoleHut
+    // spawned from here on — see `Stack::rescale_all`'s doc comment.
     if let Err(err) = state.stack.rescale_all(scale) {
-        tracing::warn!("failed to rescale initial Hut to real output scale: {err}");
+        tracing::warn!("failed to rescale initial ConsoleHut to real output scale: {err}");
     }
     let (_, _, usable_w, usable_h) = state.usable_area();
     state.stack.resize_all(usable_w, usable_h);
@@ -813,9 +813,9 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
     // `winit_backend.rs`'s own redraw handler, which does the same
     // unconditionally every frame (cheap no-op via `resize_to_pixels`'s
     // own early-return when size is already correct). Without this, a
-    // Hut spawned *after* the initial connector scan (e.g. Alt-Tabbing
+    // ConsoleHut spawned *after* the initial connector scan (e.g. Alt-Tabbing
     // past the stack's end to open a new one) never gets resized past
-    // `Hut::spawn`'s tiny 80x24-cell placeholder grid. Sized to the
+    // `ConsoleHut::spawn`'s tiny 80x24-cell placeholder grid. Sized to the
     // *usable* area, not the raw output — shrinks automatically whenever
     // a layer-shell surface's exclusive zone changes (see
     // `State::usable_area`'s doc comment).

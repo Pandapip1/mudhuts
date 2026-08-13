@@ -1,5 +1,5 @@
 //! PTY + VTE grid + glyph-rasterization glue for mudhuts' built-in terminal
-//! emulator (one instance of this per Hut).
+//! emulator (one instance of this per ConsoleHut).
 //!
 //! `alacritty_terminal` owns PTY spawning and ANSI/VTE parsing and runs its
 //! own background thread pumping bytes between the PTY and the grid; we
@@ -75,19 +75,19 @@ impl Dimensions for GridSize {
     }
 }
 
-/// One built-in terminal: PTY, shell, and VTE grid state for a single Hut.
+/// One built-in terminal: PTY, shell, and VTE grid state for a single ConsoleHut.
 pub struct Terminal {
     term: Arc<FairMutex<Term<EventProxy>>>,
     notifier: Notifier,
     size: GridSize,
     cell_size: (u16, u16),
     /// The shell's own PID (not this process's) — used to recognize a new
-    /// Wayland client as belonging to this Hut by walking its process
+    /// Wayland client as belonging to this ConsoleHut by walking its process
     /// ancestry back to this PID (see the plan's Phase 4 notes; no
     /// protocol needed for the default case).
     pub shell_pid: u32,
     /// Set once the shell has exited; kept around so callers can decide
-    /// whether to respawn or tear down the owning Hut.
+    /// whether to respawn or tear down the owning ConsoleHut.
     pub exited: bool,
 }
 

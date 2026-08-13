@@ -38,8 +38,8 @@ use smithay::wayland::socket::ListeningSocketSource;
 use smithay::wayland::viewporter::ViewporterState;
 
 use crate::keybindings::Keymap;
-use crate::stack::HutStack;
-use crate::village::{Village, pane_rects};
+use crate::stack::Stack;
+use crate::hut::{Hut, pane_rects};
 
 /// Open mudhuts' listening Wayland socket without yet wiring it into an
 /// event loop. Split out from [`State::new`] so callers can learn the
@@ -56,7 +56,7 @@ pub struct State {
     pub socket_name: OsString,
     pub display_handle: DisplayHandle,
 
-    /// Client windows. Phase 1 does not yet organize these into the Hut's
+    /// Client windows. Phase 1 does not yet organize these into the ConsoleHut's
     /// Main Windows (that's Phase 4) — they're just composited on top.
     pub space: Space<Window>,
     pub loop_signal: LoopSignal,
@@ -117,7 +117,7 @@ pub struct State {
 
     pub seat: Seat<Self>,
 
-    pub stack: HutStack,
+    pub stack: Stack,
     pub keymap: Keymap,
     /// The output's current pixel size, tracked here (not just read inside
     /// `winit_backend.rs`'s redraw handler) so newly-focused Huts can be
@@ -137,7 +137,7 @@ pub struct State {
     /// and our own selection are never both active at once).
     pub mouse_report_button_held: Option<u32>,
 
-    /// Set while dragging a docked Sub-Window's handle out to float —
+    /// Set while dragging a docked Floating Window's handle out to float —
     /// see `docks.rs`.
     pub dock_drag: Option<crate::docks::DockDrag>,
 
@@ -329,14 +329,14 @@ pub struct State {
 
 impl State {
     /// `socket` must already be listening (see [`create_socket`]) — created
-    /// separately so `main` can export `WAYLAND_DISPLAY` for the Hut's
+    /// separately so `main` can export `WAYLAND_DISPLAY` for the ConsoleHut's
     /// shell (and anything it launches) *before* that shell is spawned,
     /// rather than after, which would leave it pointed at whatever
     /// compositor mudhuts itself is nested in.
     pub fn new(
         event_loop: &mut EventLoop<Self>,
         display: Display<Self>,
-        stack: HutStack,
+        stack: Stack,
         socket: (ListeningSocketSource, OsString),
         redraw_ping: Ping,
     ) -> Result<Self, Box<dyn std::error::Error>> {
@@ -460,7 +460,7 @@ impl State {
             }
             mudhuts_term::TermEvent::Exited => {
                 tracing::info!("hut {id} shell exited");
-                // Closing the very last Hut (e.g. Ctrl+D-ing out of it)
+                // Closing the very last ConsoleHut (e.g. Ctrl+D-ing out of it)
                 // is the closest thing mudhuts has to a "log out"/"close
                 // the window" gesture — there's no other way to exit at
                 // all otherwise (no window-close button under winit, no
@@ -468,25 +468,25 @@ impl State {
                 // backend without this). Skips the normal remove/
                 // respawn path entirely (nothing will touch the stack
                 // again before the process exits, so leaving the now-
-                // dead Hut entry in place is harmless) rather than
-                // trying to keep the "always ≥1 Hut" invariant intact
+                // dead ConsoleHut entry in place is harmless) rather than
+                // trying to keep the "always ≥1 ConsoleHut" invariant intact
                 // through a stop-in-progress shutdown.
                 //
                 // `self.stack.len()` counts *top-level Stack entries*, not
-                // Huts — since Phase 6, one entry can be a Tab/Tile-Village
+                // Huts — since Phase 6, one entry can be a Tab/Tile-Hut
                 // wrapping several Huts. Checking `len() == 1` alone meant
-                // exiting a Tile-Village's *active* pane (its Hut id
+                // exiting a Tile-Hut's *active* pane (its ConsoleHut id
                 // happens to equal `self.stack.focused().id`, since that
                 // resolves through the active pane) looked exactly like
-                // closing the only Hut in the whole compositor — even
+                // closing the only ConsoleHut in the whole compositor — even
                 // with a live sibling pane right next to it — silently
                 // exiting the entire compositor (and, on the real DRM
                 // backend, dropping straight back to the login greeter)
                 // instead of just falling back to that sibling. Counting
-                // every Hut in the whole tree is the correct "is this
+                // every ConsoleHut in the whole tree is the correct "is this
                 // really the last one" check.
                 if self.stack.all_huts().count() == 1 && self.stack.focused().id == id {
-                    tracing::info!("last Hut closed, exiting");
+                    tracing::info!("last ConsoleHut closed, exiting");
                     self.loop_signal.stop();
                     return;
                 }
@@ -496,8 +496,8 @@ impl State {
                 self.request_redraw();
             }
             mudhuts_term::TermEvent::Wakeup => {
-                // Only the focused Hut's content is currently visible;
-                // a background Hut changing doesn't need a redraw yet
+                // Only the focused ConsoleHut's content is currently visible;
+                // a background ConsoleHut changing doesn't need a redraw yet
                 // (there's no activity indicator to update either, in
                 // this phase).
                 if self.stack.focused().id == id {
@@ -566,7 +566,7 @@ impl State {
             .unwrap_or(1.0)
     }
 
-    /// The rectangle (physical pixels, output-relative) that Hut/Main-
+    /// The rectangle (physical pixels, output-relative) that ConsoleHut/Main-
     /// Window *content* should actually be sized/positioned against —
     /// the full output, minus whatever every mapped layer-shell surface's
     /// exclusive zone currently reserves (see `handlers/layer_shell.rs`'s
@@ -623,7 +623,7 @@ impl State {
     /// The whole output's current size, genuinely [`Logical`] (scale-
     /// divided) — as opposed to `self.output_size`, which is always
     /// physical. Used wherever a physical-pixel-native value (a dragged
-    /// Sub-Window's position/size, read back from `self.space` and
+    /// Floating Window's position/size, read back from `self.space` and
     /// therefore already Logical) needs to be compared against "the
     /// output's size" in the *same* space — see `grabs.rs`'s `unset` and
     /// `docks.rs`'s `finish_drag`, both computing whether a drop point is
@@ -639,20 +639,20 @@ impl State {
         }
     }
 
-    /// Whether the focused Hut's terminal (vs. its active Main Window)
-    /// should currently be the visible view — `Hut::showing_terminal`,
-    /// but forced true when that Hut has no Main Windows to toggle to.
+    /// Whether the focused ConsoleHut's terminal (vs. its active Main Window)
+    /// should currently be the visible view — `ConsoleHut::showing_terminal`,
+    /// but forced true when that ConsoleHut has no Main Windows to toggle to.
     pub fn showing_terminal_effective(&self) -> bool {
-        // A genuinely tiled Tile-Village (2+ panes) always shows every
-        // pane's terminal, regardless of any individual Hut's own
-        // `showing_terminal` flag — see `render.rs`'s Tile-Village
+        // A genuinely tiled Tile-Hut (2+ panes) always shows every
+        // pane's terminal, regardless of any individual ConsoleHut's own
+        // `showing_terminal` flag — see `render.rs`'s Tile-Hut
         // compositing and `village.rs`'s module doc on why Main Windows
-        // aren't shown in a tile pane in v1. Without this, a Hut that had
+        // aren't shown in a tile pane in v1. Without this, a ConsoleHut that had
         // toggled to a Main Window before being tiled would report
         // `false` here while still visually showing its terminal,
         // desyncing mouse-interaction routing (selection/mouse-reports)
         // from what's actually on screen.
-        if matches!(self.stack.focused_village(), Village::Tile(tile) if tile.children.len() >= 2)
+        if matches!(self.stack.focused_top_level(), Hut::Tile(tile) if tile.children.len() >= 2)
         {
             return true;
         }
@@ -663,16 +663,16 @@ impl State {
     /// Screen-space offset of whichever pane currently has effective
     /// focus — always at least [`Self::usable_area`]'s own origin (`(0.0,
     /// 0.0)` unless a layer-shell surface reserves part of the output),
-    /// plus the Tile-Village pane offset on top of that if the focused
-    /// top-level Village is one (see `render.rs`'s Tile-Village
+    /// plus the Tile-Hut pane offset on top of that if the focused
+    /// top-level Hut is one (see `render.rs`'s Tile-Hut
     /// compositing, which places each pane at exactly this same offset)
     /// — so mouse interaction (selection, click, scroll) lines up with
     /// the pane that's actually on screen there, rather than being
-    /// computed against the raw output as if the focused Hut's terminal
+    /// computed against the raw output as if the focused ConsoleHut's terminal
     /// still filled it edge to edge.
     pub fn active_pane_offset(&self) -> (f64, f64) {
         let (area_x, area_y, area_w, area_h) = self.usable_area();
-        let Village::Tile(tile) = self.stack.focused_village() else {
+        let Hut::Tile(tile) = self.stack.focused_top_level() else {
             return (area_x as f64, area_y as f64);
         };
         if tile.children.len() < 2 {
@@ -687,14 +687,14 @@ impl State {
         ((area_x + x) as f64, (area_y + y) as f64)
     }
 
-    /// Make `self.space` match what the focused Hut should currently be
+    /// Make `self.space` match what the focused ConsoleHut should currently be
     /// showing: unmap whatever's mapped (harmless if nothing was), then map
-    /// the focused Hut's active Main Window (if it isn't showing its
-    /// terminal) plus every currently-floating Sub-Window and every Alert
-    /// belonging to that Main Window — docked Sub-Windows stay unmapped
+    /// the focused ConsoleHut's active Main Window (if it isn't showing its
+    /// terminal) plus every currently-floating Floating Window and every Alert
+    /// belonging to that Main Window — docked Floating Windows stay unmapped
     /// (`docks.rs` draws a handle instead), Alerts are mapped last so they
-    /// end up on top. Call after anything that could change which Hut/tab
-    /// is focused or which view a Hut is showing (Alt-Tab commit,
+    /// end up on top. Call after anything that could change which ConsoleHut/tab
+    /// is focused or which view a ConsoleHut is showing (Alt-Tab commit,
     /// `ToggleTerminal`, `TabNext`/`TabPrev`, a new toplevel auto-switching
     /// in, a toplevel closing).
     pub fn sync_visible_main_window(&mut self) {
@@ -716,7 +716,7 @@ impl State {
         let (area_x, area_y, _, _) = self.usable_area();
         self.space
             .map_element(entry.window.clone(), (area_x, area_y), false);
-        for sub in &entry.sub_windows {
+        for sub in &entry.floating_windows {
             if let crate::main_window::Dock::Floating(pos) = sub.dock {
                 self.space.map_element(sub.window.clone(), pos, false);
             }
@@ -727,10 +727,10 @@ impl State {
         }
     }
 
-    /// Find a window (Main Window, Sub-Window, or Alert) by its surface
-    /// across *every* Hut, not just whatever's currently visible in
-    /// `self.space` — a background Hut's windows still need commit/
-    /// configure handling while hidden, and so do docked Sub-Windows that
+    /// Find a window (Main Window, Floating Window, or Alert) by its surface
+    /// across *every* ConsoleHut, not just whatever's currently visible in
+    /// `self.space` — a background ConsoleHut's windows still need commit/
+    /// configure handling while hidden, and so do docked Floating Windows that
     /// aren't mapped at all.
     pub fn find_window_by_surface(&self, surface: &WlSurface) -> Option<Window> {
         self.stack.all_huts().find_map(|h| {
@@ -738,7 +738,7 @@ impl State {
                 if entry.matches(surface) {
                     return Some(entry.window.clone());
                 }
-                if let Some(sub) = entry.sub_windows.iter().find(|s| s.matches(surface)) {
+                if let Some(sub) = entry.floating_windows.iter().find(|s| s.matches(surface)) {
                     return Some(sub.window.clone());
                 }
                 entry
@@ -755,7 +755,7 @@ impl State {
     /// `build_frame_elements` actually draws: a `wlr-layer-shell` Top or
     /// Overlay surface first (drawn above normal content — see
     /// `layer_elements`'s doc comment), then whatever's mapped in
-    /// `self.space` (the focused Hut's visible Main Window/Sub-Windows/
+    /// `self.space` (the focused ConsoleHut's visible Main Window/Floating Windows/
     /// Alerts), then a Bottom or Background layer surface last. Doesn't
     /// need to special-case the terminal-visible branch: while the
     /// terminal itself is showing, it occupies the whole usable area and

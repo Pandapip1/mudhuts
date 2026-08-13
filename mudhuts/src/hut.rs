@@ -1,580 +1,424 @@
-//! A Hut: one built-in terminal plus (eventually) its Main Windows. Phase 1
-//! only has a single Hut and doesn't yet organize client windows into it —
-//! see the plan at `/home/gavin/.claude/plans/cryptic-honking-lamport.md`.
+//! `Hut` — the general, recursively composable node type in the layout
+//! tree ("stuff that can be alt-tabbed to, stuck in a tile, or put in a
+//! tab"). Renamed from the original "Village" as part of the composable
+//! Hut hierarchy redesign (see `docs/rfcs/composable-hut-hierarchy.md`)
+//! — the leaf that used to be called `Hut` is now [`ConsoleHut`]. A
+//! `Hut` is either a [`ConsoleHut`] (leaf), a Tab-Hut (tabbed group of
+//! child Huts — only its `active` child is ever shown, cycled via
+//! Meta+Left/Right), or a Tile-Hut (manually tiled group — every
+//! child is shown at once, side by side; `active` instead picks which
+//! pane currently has keyboard focus). See the plan's Phase 6 notes and
+//! the Nomenclature table.
+//!
+//! v1 scope, deliberately narrower than the full plan: a Tile-Hut
+//! pane always shows its Console Hut's terminal, never a Main Window —
+//! the plan's own notes flag "genuine simultaneous multi-Main-Window
+//! visibility" as the one place the rest of the compositor's single
+//! shared `Space<Window>` assumption breaks down, and that's a
+//! substantially bigger, separately-riskier change than the rest of this
+//! phase (the composable Hut hierarchy RFC's Q1 works out how that gap
+//! eventually closes). Real side-by-side terminals are still fully real
+//! and useful on their own; Main-Window-in-a-tile-pane is a tracked
+//! follow-up (see `project_known_issues` memory). A Tile/Tab-Hut nested
+//! *inside* a tile pane also isn't given its own recursive split in v1 —
+//! it resolves through [`Hut::focused_hut`] like a Tab-Hut would, rather
+//! than splitting that pane further.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
-use smithay::backend::renderer::Texture;
 use smithay::backend::renderer::element::Id;
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
-use smithay::backend::renderer::utils::{CommitCounter, DamageBag, DamageSnapshot};
-use smithay::desktop::Window;
-use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Buffer, Rectangle};
 
-use mudhuts_term::{GlyphCache, TermEvent, Terminal};
-use mudhuts_term::palette::Rgb;
-
-use crate::gpu_term::{GpuTermRenderer, LabelRenderer};
-use crate::main_window::MainWindowEntry;
+use crate::console_hut::ConsoleHut;
 use crate::render::{ChangeTracker, LabelCache};
 
-/// Initial grid size used before the real output size is known.
-const INITIAL_COLS: usize = 80;
-const INITIAL_LINES: usize = 24;
-
-fn next_hut_id() -> u64 {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    NEXT.fetch_add(1, Ordering::Relaxed)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    Next,
+    Prev,
 }
 
-pub struct Hut {
-    /// Stable identity for this Hut, independent of its position in [The
-    /// Stack](crate::stack::HutStack) (which shifts as entries are added
-    /// and discarded) — used to route its `TermEvent` channel to the right
-    /// entry once there are several.
-    pub id: u64,
-    pub terminal: Terminal,
-    pub glyphs: GlyphCache,
-    /// Whether this Hut has ever been interacted with (a keystroke sent to
-    /// its terminal) since it was spawned. A freshly-spawned, never-touched
-    /// Hut is discarded rather than kept around once The Stack moves away
-    /// from it — see the plan's Phase 3 notes.
-    touched: bool,
-    /// Lazily created on first [`Hut::redraw`] call, once a renderer is
-    /// actually available (Phase 1 spawns Huts before the winit backend
-    /// exists).
-    gpu: Option<GpuTermRenderer>,
-    /// Lazily created on first [`Hut::render_label`] call (Phase 4's
-    /// tab-strip chrome) — shares `gpu`'s glyph atlas rather than
-    /// rasterizing the same glyphs into a second one.
-    label_renderer: Option<LabelRenderer>,
-    /// What `redraw` returned last time, reused when nothing changed
-    /// (cheap: an `Arc` clone, not a re-render).
-    last_texture: Option<GlesTexture>,
-    pixel_size: (i32, i32),
-    /// Stable identity for this Hut's terminal render element across
-    /// frames (matters for the compositor's outer damage tracking, which
-    /// compares elements by id between frames).
-    pub element_id: Id,
-    /// Stable identities for this Hut's own "Terminal" tab in `chrome.rs`
-    /// (its text label and background) — like `element_id`, these must
-    /// stay the same across frames rather than being freshly generated
-    /// each call, or the outer damage tracker sees a "new" element every
-    /// frame instead of recognizing it as the same one, which a
-    /// multi-buffer-swapchain-aware tracker (`DrmCompositor`, used by
-    /// the real udev/DRM backend) can handle very differently — and much
-    /// worse — than a simpler single-buffer one (`OutputDamageTracker`,
-    /// used only by the winit backend, which is why this went unnoticed
-    /// there).
-    pub terminal_tab_text_id: Id,
-    pub terminal_tab_bg_id: Id,
-    /// Caches the "Terminal" tab's rendered text label, only actually
-    /// re-rendering it (real GPU work) when its active/inactive state
-    /// flips — see `render::LabelCache`'s doc comment. Also backs real
-    /// damage tracking for its background, bumped on the same flip —
-    /// see `render::ChangeTracker`'s doc comment.
-    terminal_tab_text_cache: LabelCache<bool>,
-    terminal_tab_bg_tracker: ChangeTracker<bool>,
-    /// Stable identities for this Hut's own thumbnail/highlight in the
-    /// Alt-Tab preview popup (`switcher.rs`) — same reasoning as above.
-    pub thumbnail_id: Id,
-    pub thumbnail_highlight_id: Id,
-    /// Real damage tracking for this Hut's terminal texture, bumped in
-    /// [`Self::redraw`] whenever the terminal grid actually had dirty
-    /// cells. `TextureRenderElement::from_static_texture` (used for
-    /// `element_id`/`thumbnail_id` above) is documented by Smithay as
-    /// creating an element *without* damage tracking — its wrapped
-    /// snapshot never advances, so the outer per-element damage tracker
-    /// (`DrmCompositor`'s, in particular) sees zero damage forever after
-    /// the first frame a given Id is rendered, no matter how many times
-    /// the underlying texture's pixel content actually changes. That's
-    /// fine for genuinely static content but wrong for a terminal, whose
-    /// content changes on every keystroke — this tracker backs a real
-    /// `from_texture_with_damage` snapshot instead (see `render.rs`/
-    /// `switcher.rs`).
-    damage_tracker: DamageBag<i32, Buffer>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Axis {
+    Horizontal,
+    Vertical,
+}
 
-    /// Client toplevels belonging to this Hut (see the plan's Phase 4
-    /// notes on PID-ancestry assignment), tab-ordered, plus whatever's
-    /// been tagged as their Sub-Windows/Alerts (Phase 5). At most one
-    /// Main Window's tab is ever visible/mapped at a time — see
-    /// `active_main_window` and `State::sync_visible_main_window` — but
-    /// that one's floating Sub-Windows and Alerts are all visible
-    /// alongside it.
-    main_windows: Vec<MainWindowEntry>,
-    /// Index into `main_windows` of the tab that's active — meaningless
-    /// while `main_windows` is empty.
-    active_main_window: usize,
-    /// Whether *this Hut's* terminal (vs. its active Main Window) is the
-    /// visible view when this Hut is focused. Per-Hut so switching Huts
-    /// (or Main Window tabs) doesn't disturb what each one was last
-    /// showing. Ignored (treated as `true`) while `main_windows` is
-    /// empty — see `State::showing_terminal_effective`.
-    pub showing_terminal: bool,
-    /// Fractional scroll-wheel/trackpad distance (physical pixels,
-    /// signed the same way `input.rs`'s `PointerAxis` handling reads
-    /// `vertical_amount`) not yet converted into a whole line of
-    /// scrollback movement. See `input.rs`'s `PointerAxis` handler for
-    /// why accumulating this (instead of flooring every event to at
-    /// least one line) matters for continuous-scroll devices like a
-    /// trackpad, which send many small events per swipe.
-    pub scroll_accum: f64,
+pub enum Hut {
+    // Boxed: `ConsoleHut` is a large struct (glyph caches, GPU renderer state,
+    // ...) and `Hut` gets moved around a lot (`Vec` insert/remove
+    // during wrap/collapse) — without this, every `Hut` (including
+    // every `Tab`/`Tile` variant) would pay `ConsoleHut`'s full size regardless
+    // of which variant it actually is.
+    Console(Box<ConsoleHut>),
+    Tab(TabVillage),
+    Tile(TileVillage),
+}
+
+pub struct TabVillage {
+    pub children: Vec<Hut>,
+    pub active: usize,
+    /// Each child's rendered tab-label texture, cached the same way
+    /// `ConsoleHut`'s own tab caches are (see `render::LabelCache`'s doc
+    /// comment) — one entry per child, kept in sync with `children`'s
+    /// length by `village_chrome::build` (grown lazily) and
+    /// [`Hut::remove_child_hut`] (shrunk in lockstep with
+    /// `children`) — a bare `Vec` alongside `children` rather than zipped
+    /// into it, so `children` itself doesn't need to know anything about
+    /// rendering.
+    pub(crate) label_cache: Vec<LabelCache<(String, bool)>>,
+    /// Each child's tab's stable (text, background) element ids —
+    /// matters for the compositor's outer damage tracking, which
+    /// compares elements by id between frames (see `ConsoleHut::element_id`'s
+    /// doc comment for why a fresh `Id::new()` per frame is a real
+    /// correctness bug, not cosmetic).
+    pub tab_ids: Vec<(Id, Id)>,
+    /// Each child's tab background's real damage tracking, bumped only
+    /// when its active/inactive state flips (see `render::ChangeTracker`'s
+    /// doc comment).
+    pub(crate) bg_tracker: Vec<ChangeTracker<bool>>,
+}
+
+pub struct TileVillage {
+    pub axis: Axis,
+    /// Each child alongside its fraction of the tile's total extent along
+    /// `axis` — expected to sum to 1.0, though nothing panics if they
+    /// don't (see [`pane_rects`], which just uses them as relative
+    /// weights).
+    pub children: Vec<(Hut, f64)>,
+    /// Which pane currently has keyboard focus — distinct from a
+    /// Tab-Hut's `active`, which *also* controls visibility; every
+    /// Tile-Hut pane is visible regardless of this index.
+    pub active: usize,
+    /// Stable identities for the 4 border strips (top/bottom/left/right)
+    /// drawn around whichever pane is `active` — reused across frames
+    /// regardless of *which* pane that is: each strip's *geometry*
+    /// simply follows `active` frame to frame, which the compositor's
+    /// own per-element damage tracking already handles correctly on its
+    /// own (a moving/resizing element is damaged wherever it was and
+    /// wherever it now is, same as a moved window) — no `ChangeTracker`
+    /// needed the way a fixed-geometry element's *content*-only change
+    /// would (see `render::ChangeTracker`'s doc comment for that other
+    /// case). 4 *distinct* ids, not 1 reused 4 times — every element in a
+    /// single frame needs its own identity, or the damage tracker can't
+    /// tell the 4 strips apart.
+    pub(crate) highlight_ids: [Id; 4],
+}
+
+fn wrapping_step(len: usize, active: usize, dir: Direction) -> usize {
+    match dir {
+        Direction::Next => (active + 1) % len,
+        Direction::Prev => (active + len - 1) % len,
+    }
 }
 
 impl Hut {
-    /// Spawn a new Hut (shell + empty framebuffer). `extra_env` is set in
-    /// the shell's environment only (see [`Terminal::spawn`] — notably,
-    /// this is how mudhuts points the shell at its own Wayland socket
-    /// without touching the compositor's own `WAYLAND_DISPLAY`, which the
-    /// backend needs untouched to find whatever it's nested inside) — on
-    /// top of `extra_env`, every Hut's shell also gets `MUDHUTS_HUT_ID`
-    /// set to this Hut's own id, inherited by every descendant process
-    /// regardless of `fork()`/`exec()` (see `ownership.rs`'s doc comment
-    /// on why this is needed alongside the PID-ancestry walk). Returns
-    /// the Hut plus a channel the caller must insert into the calloop
-    /// event loop to learn about terminal events (title changes, shell
-    /// exit).
-    pub fn spawn(
-        extra_env: impl IntoIterator<Item = (String, String)>,
-        scale: f64,
-    ) -> Result<
-        (
-            Hut,
-            smithay::reexports::calloop::channel::Channel<TermEvent>,
-        ),
-        String,
-    > {
-        let id = next_hut_id();
-        let glyphs = GlyphCache::new(scale)?;
-        let cell_size = (glyphs.cell_width() as u16, glyphs.cell_height() as u16);
-        let extra_env = extra_env
-            .into_iter()
-            .chain(std::iter::once(("MUDHUTS_HUT_ID".to_string(), id.to_string())));
-        let (terminal, events) = Terminal::spawn(INITIAL_COLS, INITIAL_LINES, cell_size, extra_env)
-            .map_err(|e| e.to_string())?;
-
-        let pixel_size = (
-            (INITIAL_COLS * cell_size.0 as usize) as i32,
-            (INITIAL_LINES * cell_size.1 as usize) as i32,
-        );
-
-        Ok((
-            Hut {
-                id,
-                terminal,
-                glyphs,
-                touched: false,
-                gpu: None,
-                last_texture: None,
-                pixel_size,
-                element_id: Id::new(),
-                terminal_tab_text_id: Id::new(),
-                terminal_tab_bg_id: Id::new(),
-                terminal_tab_text_cache: LabelCache::new(),
-                terminal_tab_bg_tracker: ChangeTracker::new(),
-                thumbnail_id: Id::new(),
-                thumbnail_highlight_id: Id::new(),
-                damage_tracker: DamageBag::default(),
-                label_renderer: None,
-                main_windows: Vec::new(),
-                active_main_window: 0,
-                showing_terminal: true,
-                scroll_accum: 0.0,
-            },
-            events,
-        ))
+    /// Combine `current` (shown last, so the wrap is visually a no-op)
+    /// after `other` into a new Tab-Hut.
+    pub fn wrap_tab(other: Hut, current: Hut) -> Hut {
+        Hut::Tab(TabVillage {
+            children: vec![other, current],
+            active: 1,
+            label_cache: vec![LabelCache::new(), LabelCache::new()],
+            tab_ids: vec![(Id::new(), Id::new()), (Id::new(), Id::new())],
+            bg_tracker: vec![ChangeTracker::new(), ChangeTracker::new()],
+        })
     }
 
-    pub fn shell_pid(&self) -> u32 {
-        self.terminal.shell_pid
+    /// Combine `current` and `other` into a new Tile-Hut, split evenly
+    /// along `axis`. `current`'s pane keeps keyboard focus, matching
+    /// `wrap_tab`'s "visually a no-op" property.
+    pub fn wrap_tile(other: Hut, current: Hut, axis: Axis) -> Hut {
+        Hut::Tile(TileVillage {
+            axis,
+            children: vec![(other, 0.5), (current, 0.5)],
+            active: 1,
+            highlight_ids: [Id::new(), Id::new(), Id::new(), Id::new()],
+        })
     }
 
-    /// The Main Window whose tab is currently active, if any.
-    pub fn active_window(&self) -> Option<&Window> {
-        self.main_windows.get(self.active_main_window).map(|e| &e.window)
-    }
-
-    /// The active tab's full entry (Sub-Windows/Alerts included), if any.
-    pub fn active_main_window_entry(&self) -> Option<&MainWindowEntry> {
-        self.main_windows.get(self.active_main_window)
-    }
-
-    /// Index into `main_windows()` of the active tab — meaningless while
-    /// `main_windows()` is empty.
-    pub fn active_main_window_index(&self) -> usize {
-        self.active_main_window
-    }
-
-    pub fn main_windows(&self) -> &[MainWindowEntry] {
-        &self.main_windows
-    }
-
-    /// Directly select a Main Window tab (clamped to bounds) — for
-    /// clicking a specific tab in `chrome.rs`'s strip, unlike
-    /// [`Self::cycle_tab`]'s relative forward/backward step.
-    pub fn set_active_main_window(&mut self, index: usize) {
-        self.active_main_window = index.min(self.main_windows.len().saturating_sub(1));
-    }
-
-    pub fn main_windows_mut(&mut self) -> &mut [MainWindowEntry] {
-        &mut self.main_windows
-    }
-
-    /// The "Terminal" tab's text-label texture and a damage snapshot for
-    /// it — reused from the cache (no GPU work) unless `active` differs
-    /// from last frame's, matching `render::LabelCache`'s whole point.
-    pub fn terminal_tab_label(
-        &mut self,
-        renderer: &mut GlesRenderer,
-        active: bool,
-        fg: Rgb,
-        bg: Rgb,
-    ) -> Result<(GlesTexture, DamageSnapshot<i32, Buffer>), String> {
-        if self.terminal_tab_text_cache.is_stale(&active) {
-            let texture = self.render_label(renderer, "Terminal", fg, bg)?;
-            return Ok(self.terminal_tab_text_cache.store(active, texture));
-        }
-        match self.terminal_tab_text_cache.cached() {
-            Some(result) => Ok(result),
-            None => {
-                // Shouldn't happen (`is_stale` would've been true), but
-                // stays panic-free rather than assumed.
-                let texture = self.render_label(renderer, "Terminal", fg, bg)?;
-                Ok(self.terminal_tab_text_cache.store(active, texture))
-            }
-        }
-    }
-
-    /// A commit counter for the "Terminal" tab's background element,
-    /// bumped only if `active` differs from last frame's.
-    pub fn terminal_tab_bg_commit(&mut self, active: bool) -> CommitCounter {
-        self.terminal_tab_bg_tracker.commit(active)
-    }
-
-    pub fn main_window_count(&self) -> usize {
-        self.main_windows.len()
-    }
-
-    /// A new client toplevel was assigned to this Hut — appended as a new
-    /// tab. Only becomes the active tab if `make_active` is set — callers
-    /// pass `true` when there was nothing else to keep showing (this
-    /// Hut's very first Main Window), matching the auto-switch spirit
-    /// from Phase 2.5, now per-Hut and per-tab rather than global.
-    /// `false` for a window arriving while this Hut is already showing a
-    /// *different* tab: it just joins the tab strip, exactly like the
-    /// existing "background Hut" case already does — without this, a
-    /// second/third window opening in a Hut that already has one visible
-    /// would silently steal the view out from under whatever the user
-    /// was looking at (`Self::main_windows`'s `active_main_window` index
-    /// changing regardless of the caller's own `should_show_now`
-    /// decision was exactly this bug — see `new_toplevel`'s notes).
-    pub fn push_main_window(
-        &mut self,
-        window: Window,
-        make_active: bool,
-        foreign_handle: smithay::wayland::foreign_toplevel_list::ForeignToplevelHandle,
-    ) {
-        self.main_windows
-            .push(MainWindowEntry::new(window, foreign_handle));
-        if make_active {
-            self.active_main_window = self.main_windows.len() - 1;
-        }
-    }
-
-    /// Whether `surface` is currently a bare (untagged) Main Window in
-    /// this Hut — used to resolve `mudhuts_window_role_v1.set_sub`/
-    /// `set_alert`'s target toplevel (which must start out as a plain
-    /// Main Window; `new_toplevel` always adds new clients as one before
-    /// any role-assignment request can arrive on the same connection).
-    pub fn has_bare_main_window(&self, surface: &WlSurface) -> bool {
-        self.main_windows.iter().any(|e| e.matches(surface))
-    }
-
-    /// Remove and return a bare Main Window by surface, adjusting the
-    /// active tab index the same way [`Self::remove_window`] does.
-    /// Doesn't touch `showing_terminal`/redraw bookkeeping itself — the
-    /// caller (role assignment) always re-inserts it somewhere else
-    /// immediately, so nothing user-visible actually changes.
-    pub fn take_bare_main_window(&mut self, surface: &WlSurface) -> Option<Window> {
-        let idx = self.main_windows.iter().position(|e| e.matches(surface))?;
-        let entry = self.main_windows.remove(idx);
-        if idx < self.active_main_window {
-            self.active_main_window -= 1;
-        }
-        self.active_main_window = self
-            .active_main_window
-            .min(self.main_windows.len().saturating_sub(1));
-        Some(entry.window)
-    }
-
-    /// Find a bare Main Window's entry by surface, mutably — for
-    /// `set_sub`/`set_alert` to reach the *target* ("main") toplevel's
-    /// `sub_windows`/`alerts` list.
-    pub fn find_main_window_mut(&mut self, surface: &WlSurface) -> Option<&mut MainWindowEntry> {
-        self.main_windows.iter_mut().find(|e| e.matches(surface))
-    }
-
-    /// Remove and return a Sub-Window or Alert (searching every Main
-    /// Window's own lists) by surface — for `mudhuts_window_role_v1.
-    /// set_main`, which moves a tagged window back to being a bare Main
-    /// Window.
-    pub fn take_nested_window(&mut self, surface: &WlSurface) -> Option<Window> {
-        for entry in &mut self.main_windows {
-            if let Some(idx) = entry.sub_windows.iter().position(|s| s.matches(surface)) {
-                return Some(entry.sub_windows.remove(idx).window);
-            }
-            if let Some(idx) = entry.alerts.iter().position(|a| a.matches(surface)) {
-                return Some(entry.alerts.remove(idx).window);
-            }
-        }
-        None
-    }
-
-    /// Find a Sub-Window's own entry (for updating its `Dock` state
-    /// while dragging), searching every Main Window's `sub_windows`.
-    pub fn sub_window_mut(
-        &mut self,
-        surface: &WlSurface,
-    ) -> Option<&mut crate::main_window::SubWindow> {
-        self.main_windows
-            .iter_mut()
-            .find_map(|e| e.sub_windows.iter_mut().find(|s| s.matches(surface)))
-    }
-
-    /// Find an Alert's own entry (for updating its tracked position while
-    /// dragging), searching every Main Window's `alerts`.
-    pub fn alert_mut(&mut self, surface: &WlSurface) -> Option<&mut crate::main_window::Alert> {
-        self.main_windows
-            .iter_mut()
-            .find_map(|e| e.alerts.iter_mut().find(|a| a.matches(surface)))
-    }
-
-    /// A client toplevel belonging to this Hut was destroyed — a bare
-    /// Main Window, or a Sub-Window/Alert of one. Returns whether it was
-    /// actually found here (callers check every Hut). Falls back to
-    /// showing the terminal if a Main Window was removed and that was
-    /// the last tab.
-    pub fn remove_window(&mut self, surface: &WlSurface) -> bool {
-        if let Some(idx) = self.main_windows.iter().position(|e| e.matches(surface)) {
-            self.main_windows.remove(idx);
-            if idx < self.active_main_window {
-                self.active_main_window -= 1;
-            }
-            self.active_main_window = self
-                .active_main_window
-                .min(self.main_windows.len().saturating_sub(1));
-            if self.main_windows.is_empty() {
-                self.showing_terminal = true;
-            }
-            return true;
-        }
-        for entry in &mut self.main_windows {
-            if let Some(idx) = entry.sub_windows.iter().position(|s| s.matches(surface)) {
-                entry.sub_windows.remove(idx);
-                return true;
-            }
-            if let Some(idx) = entry.alerts.iter().position(|a| a.matches(surface)) {
-                entry.alerts.remove(idx);
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Meta+Right/Left within this Hut: cycle the active Main Window tab.
-    /// No-op with fewer than 2 — there's no Tab/Tile-Village to bubble up
-    /// to yet (Phase 6).
-    pub fn cycle_tab(&mut self, forward: bool) {
-        let len = self.main_windows.len();
-        if len < 2 {
-            return;
-        }
-        self.active_main_window = if forward {
-            (self.active_main_window + 1) % len
-        } else {
-            (self.active_main_window + len - 1) % len
-        };
-    }
-
-    /// Whether this Hut has ever received a keystroke since it was
-    /// spawned — see the `touched` field doc.
-    pub fn touched(&self) -> bool {
-        self.touched
-    }
-
-    /// Whatever [`Self::redraw`] last produced, without triggering a new
-    /// render — for the Alt-Tab preview popup's thumbnails, which read
-    /// every Hut's texture rather than just the focused one. `None` if
-    /// this Hut has never been drawn yet (e.g. `redraw` was never called
-    /// on it — its GPU renderer hasn't even been created).
-    pub fn cached_texture(&self) -> Option<GlesTexture> {
-        self.last_texture.clone()
-    }
-
-    pub fn mark_touched(&mut self) {
-        self.touched = true;
-    }
-
-    /// Resize the Hut's terminal grid to fill an output of `width`x`height`
-    /// physical pixels.
-    pub fn resize_to_pixels(&mut self, width: i32, height: i32) {
-        if (width, height) == self.pixel_size {
-            return;
-        }
-        self.pixel_size = (width, height);
-
-        let cell_w = self.glyphs.cell_width().max(1);
-        let cell_h = self.glyphs.cell_height().max(1);
-        let cols = (width.max(0) as usize / cell_w).max(1);
-        let lines = (height.max(0) as usize / cell_h).max(1);
-        self.terminal
-            .resize(cols, lines, (cell_w as u16, cell_h as u16));
-    }
-
-    /// Rebuild this Hut's glyph cache for a newly-known real output scale,
-    /// re-deriving its terminal grid's cols/lines from the new cell size
-    /// at the same physical `pixel_size`, and dropping its GPU glyph atlas
-    /// (`gpu`/`label_renderer`) so it's rebuilt from scratch at the new
-    /// glyph size the next time this Hut is drawn — a `GlyphCache` can't
-    /// be rescaled in place (see its own doc comment: every cached glyph
-    /// bitmap was rasterized at the size it was built for).
+    /// Wrap *in place* whichever leaf `focused_hut`/`focused_hut_mut`
+    /// would reach from here (following each level's `active` index all
+    /// the way down to the actual bare ConsoleHut) — `make(old)` replaces just
+    /// that leaf, leaving every sibling and every ancestor container
+    /// completely untouched. This is `wrap_tab`/`wrap_tile`'s whole
+    /// point: pressing wrap-tab while focused on one pane of an existing
+    /// Tile-Hut should turn *that pane* into a small Tab-Hut,
+    /// not disturb the Tile-Hut itself or reach for some unrelated
+    /// top-level Stack entry to combine with (`stack::Stack::wrap_tab`
+    /// always passes a freshly spawned ConsoleHut as one side, never an
+    /// existing entry, for exactly the same reason — see its doc
+    /// comment).
     ///
-    /// Only ever needed once per Hut, right after the real output scale
-    /// becomes known for the first time — `main.rs` spawns the very first
-    /// Hut before any backend/output exists yet (so it starts at scale
-    /// 1.0), and this is what catches it up once `winit_backend.rs`/
-    /// `udev_backend.rs` learn the real value (see `HutStack::rescale_all`).
-    pub fn rescale(&mut self, scale: f64) -> Result<(), String> {
-        self.glyphs = GlyphCache::new(scale)?;
-        self.gpu = None;
-        self.label_renderer = None;
-
-        let (width, height) = self.pixel_size;
-        let cell_w = self.glyphs.cell_width().max(1);
-        let cell_h = self.glyphs.cell_height().max(1);
-        let cols = (width.max(0) as usize / cell_w).max(1);
-        let lines = (height.max(0) as usize / cell_h).max(1);
-        self.terminal
-            .resize(cols, lines, (cell_w as u16, cell_h as u16));
-        Ok(())
-    }
-
-    /// Convert a pixel position (relative to the Hut's own buffer, i.e.
-    /// output-space when the terminal is the visible view) into a 0-based
-    /// `(column, row)` grid cell, clamped to the current grid size, plus
-    /// which half of that cell the position falls in (`true` = left half)
-    /// — matters for selection boundary precision when starting/extending
-    /// a drag from partway into a cell. Note this is 0-based (matching
-    /// `alacritty_terminal`'s own grid coordinates, used for selection),
-    /// *not* the 1-based coordinates SGR mouse-reporting escape sequences
-    /// use — callers doing mouse reporting need to add 1.
-    pub fn pixel_to_cell(&self, x: f64, y: f64) -> (usize, usize, bool) {
-        let cell_w = self.glyphs.cell_width().max(1);
-        let cell_h = self.glyphs.cell_height().max(1);
-        let px_x = x.max(0.0) as usize;
-        let px_y = y.max(0.0) as usize;
-        let col = (px_x / cell_w).min(self.terminal.cols().saturating_sub(1));
-        let row = (px_y / cell_h).min(self.terminal.lines().saturating_sub(1));
-        let left_half = (px_x % cell_w) < cell_w / 2;
-        (col, row, left_half)
-    }
-
-    /// Re-render (via the GPU glyph-atlas renderer, if anything changed
-    /// since last time) and return the current texture to composite, or
-    /// `None` if there's nothing to show yet (zero pixel size, or the GPU
-    /// renderer failed to initialize).
-    pub fn redraw(&mut self, renderer: &mut GlesRenderer) -> Option<GlesTexture> {
-        let (width, height) = self.pixel_size;
-        if width <= 0 || height <= 0 {
-            return None;
+    /// Implementation note: reaching the leaf requires temporarily
+    /// moving it out of `self` to hand to `make` (which needs it by
+    /// value) and then writing the result back — `std::mem::replace`
+    /// needs *some* placeholder value in between, so an empty
+    /// (harmless, momentary) `Hut::Tab` stands in for the instant
+    /// between the two assignments; nothing ever observes it.
+    pub fn wrap_focused(&mut self, make: impl FnOnce(Hut) -> Hut) {
+        if matches!(self, Hut::Console(_)) {
+            let placeholder = Hut::Tab(TabVillage {
+                children: Vec::new(),
+                active: 0,
+                label_cache: Vec::new(),
+                tab_ids: Vec::new(),
+                bg_tracker: Vec::new(),
+            });
+            let old = std::mem::replace(self, placeholder);
+            *self = make(old);
+            return;
         }
+        match self {
+            Hut::Tab(tab) => tab.children[tab.active].wrap_focused(make),
+            Hut::Tile(tile) => tile.children[tile.active].0.wrap_focused(make),
+            Hut::Console(_) => unreachable!("checked above"),
+        }
+    }
 
-        if self.gpu.is_none() {
-            match GpuTermRenderer::new(renderer) {
-                Ok(gpu) => self.gpu = Some(gpu),
-                Err(err) => {
-                    tracing::error!("failed to initialize GPU terminal renderer: {err}");
-                    return None;
+    /// Whether this Hut should survive being "left behind" when The
+    /// Stack moves away from it (see `stack::Stack`'s `advance_forward`/
+    /// `advance_backward`, and the plan's original Phase 3 discard rule).
+    /// A bare Console Hut defers to its own [`ConsoleHut::touched`]; anything wrapped in
+    /// a Tab/Tile-Hut was deliberately composed by the user out of
+    /// Huts already in use, so it's never a "never-touched, safe-to-
+    /// discard" candidate the way a freshly auto-spawned bare Console Hut is.
+    pub fn touched(&self) -> bool {
+        match self {
+            Hut::Console(hut) => hut.touched(),
+            Hut::Tab(_) | Hut::Tile(_) => true,
+        }
+    }
+
+    /// Marks the underlying ConsoleHut touched if this *is* one — a no-op for a
+    /// Tab/Tile-Hut, which is always already considered touched (see
+    /// [`Self::touched`]).
+    pub fn mark_touched(&mut self) {
+        if let Hut::Console(hut) = self {
+            hut.mark_touched();
+        }
+    }
+
+    /// Resize every Console Hut anywhere under this Hut to fill an output of
+    /// `width`x`height` physical pixels — a Tab-Hut's children all
+    /// get the full size (only `active` is ever shown, but every child
+    /// needs to track the real size so switching to it doesn't show a
+    /// stale layout, matching `Stack::resize_all`'s original pre-redesign
+    /// behavior); a Tile-Hut's children each get their own pane's
+    /// share instead (see [`pane_rects`]).
+    pub fn resize_to_pixels(&mut self, width: i32, height: i32) {
+        match self {
+            Hut::Console(hut) => hut.resize_to_pixels(width, height),
+            Hut::Tab(tab) => {
+                for child in &mut tab.children {
+                    child.resize_to_pixels(width, height);
+                }
+            }
+            Hut::Tile(tile) => {
+                let rects = pane_rects(tile.axis, tile.children.iter().map(|(_, frac)| *frac), (width, height));
+                for ((child, _), (_, _, w, h)) in tile.children.iter_mut().zip(rects) {
+                    child.resize_to_pixels(w, h);
                 }
             }
         }
-        let gpu = self.gpu.as_mut()?;
+    }
 
-        let Some(cells) = self.terminal.take_dirty_cells() else {
-            return self.last_texture.clone();
-        };
+    /// The ConsoleHut that currently has effective focus, walking down through
+    /// whichever child is `active` at each Tab/Tile-Hut level.
+    pub fn focused_hut(&self) -> &ConsoleHut {
+        match self {
+            Hut::Console(hut) => hut,
+            Hut::Tab(tab) => tab.children[tab.active].focused_hut(),
+            Hut::Tile(tile) => tile.children[tile.active].0.focused_hut(),
+        }
+    }
 
-        let cell_w = self.glyphs.cell_width();
-        let cell_h = self.glyphs.cell_height();
-        let baseline = self.glyphs.baseline();
-        match gpu.redraw(
-            renderer,
-            &mut self.glyphs,
-            &cells,
-            cell_w,
-            cell_h,
-            baseline,
-            width,
-            height,
-        ) {
-            Ok(texture) => {
-                self.damage_tracker
-                    .add([Rectangle::from_size(texture.size())]);
-                self.last_texture = Some(texture.clone());
-                Some(texture)
+    pub fn focused_hut_mut(&mut self) -> &mut ConsoleHut {
+        match self {
+            Hut::Console(hut) => hut,
+            Hut::Tab(tab) => tab.children[tab.active].focused_hut_mut(),
+            Hut::Tile(tile) => tile.children[tile.active].0.focused_hut_mut(),
+        }
+    }
+
+    /// Find a ConsoleHut anywhere under this Hut by id, recursively —
+    /// unlike [`Self::focused_hut`], not limited to whichever child is
+    /// currently active/visible (a background Main Window's owning ConsoleHut
+    /// still needs to be reachable, e.g. for `handlers::xdg_shell`'s
+    /// PID-ancestry lookup).
+    pub fn find_hut_mut(&mut self, id: u64) -> Option<&mut ConsoleHut> {
+        match self {
+            Hut::Console(hut) if hut.id == id => Some(hut),
+            Hut::Console(_) => None,
+            Hut::Tab(tab) => tab.children.iter_mut().find_map(|c| c.find_hut_mut(id)),
+            Hut::Tile(tile) => tile
+                .children
+                .iter_mut()
+                .find_map(|(c, _)| c.find_hut_mut(id)),
+        }
+    }
+
+    /// Every ConsoleHut anywhere under this Hut, recursively — for searches
+    /// that need to reach a background/inactive ConsoleHut too (PID-ancestry
+    /// ownership, finding a window by surface across every ConsoleHut, resizing
+    /// every Main Window on output resize), not just whatever's currently
+    /// shown.
+    pub fn all_huts(&self) -> Box<dyn Iterator<Item = &ConsoleHut> + '_> {
+        match self {
+            Hut::Console(hut) => Box::new(std::iter::once(hut.as_ref())),
+            Hut::Tab(tab) => Box::new(tab.children.iter().flat_map(|c| c.all_huts())),
+            Hut::Tile(tile) => Box::new(tile.children.iter().flat_map(|(c, _)| c.all_huts())),
+        }
+    }
+
+    pub fn all_huts_mut(&mut self) -> Box<dyn Iterator<Item = &mut ConsoleHut> + '_> {
+        match self {
+            Hut::Console(hut) => Box::new(std::iter::once(hut.as_mut())),
+            Hut::Tab(tab) => Box::new(tab.children.iter_mut().flat_map(|c| c.all_huts_mut())),
+            Hut::Tile(tile) => Box::new(
+                tile.children
+                    .iter_mut()
+                    .flat_map(|(c, _)| c.all_huts_mut()),
+            ),
+        }
+    }
+
+    /// Try to remove ConsoleHut `id` from among this Hut's own children,
+    /// recursively — only meaningful for a Tab/Tile-Hut (a bare ConsoleHut
+    /// has no children to remove from, so always returns `false`). If
+    /// removing left exactly one child behind, [`Self::collapse_if_singleton`]
+    /// replaces this Hut with that child directly — an emptied-out
+    /// wrapper around one survivor is never useful to keep around. See
+    /// `stack::Stack::remove_exited`, which calls this for a ConsoleHut
+    /// that's exited but isn't a bare top-level Stack entry.
+    pub fn remove_child_hut(&mut self, id: u64) -> bool {
+        let removed = match self {
+            Hut::Console(_) => false,
+            Hut::Tab(tab) => {
+                let keep: Vec<bool> = tab
+                    .children
+                    .iter()
+                    .map(|c| !matches!(c, Hut::Console(hut) if hut.id == id))
+                    .collect();
+                if keep.iter().any(|k| !k) {
+                    let mut kept = keep.iter();
+                    tab.children.retain(|_| *kept.next().unwrap());
+                    let mut kept = keep.iter();
+                    tab.label_cache
+                        .retain(|_| kept.next().copied().unwrap_or(true));
+                    let mut kept = keep.iter();
+                    tab.tab_ids.retain(|_| kept.next().copied().unwrap_or(true));
+                    let mut kept = keep.iter();
+                    tab.bg_tracker
+                        .retain(|_| kept.next().copied().unwrap_or(true));
+                    tab.active = tab.active.min(tab.children.len().saturating_sub(1));
+                    true
+                } else {
+                    tab.children.iter_mut().any(|c| c.remove_child_hut(id))
+                }
             }
-            Err(err) => {
-                tracing::error!("GPU terminal redraw failed: {err}");
-                self.last_texture.clone()
+            Hut::Tile(tile) => {
+                let before = tile.children.len();
+                tile.children
+                    .retain(|(c, _)| !matches!(c, Hut::Console(hut) if hut.id == id));
+                if tile.children.len() != before {
+                    tile.active = tile.active.min(tile.children.len().saturating_sub(1));
+                    true
+                } else {
+                    tile.children.iter_mut().any(|(c, _)| c.remove_child_hut(id))
+                }
+            }
+        };
+        if removed {
+            self.collapse_if_singleton();
+        }
+        removed
+    }
+
+    /// If this Hut is a Tab/Tile-Hut with exactly one child left,
+    /// replace it with that child directly.
+    fn collapse_if_singleton(&mut self) {
+        let solo = match self {
+            Hut::Console(_) => None,
+            Hut::Tab(tab) if tab.children.len() == 1 => tab.children.pop(),
+            Hut::Tile(tile) if tile.children.len() == 1 => tile.children.pop().map(|(c, _)| c),
+            _ => None,
+        };
+        if let Some(child) = solo {
+            *self = child;
+        }
+    }
+
+    /// Meta+Left/Right's bubble-up step (see the plan's Meta+Left/Right
+    /// resolution notes) — only called once the focused ConsoleHut itself has
+    /// fewer than 2 Main Window tabs to cycle (that check happens one
+    /// layer below this, in `input.rs`, via `ConsoleHut::cycle_tab`). Recurses
+    /// into the active child *first* — "innermost first" — only cycling
+    /// *this* level's `active` index if nothing deeper had anything to
+    /// cycle. Returns whether anything was actually cycled, so a no-op
+    /// call (a lone ConsoleHut, or every container along the active path having
+    /// fewer than 2 children) is distinguishable from a real change.
+    pub fn cycle_innermost(&mut self, dir: Direction) -> bool {
+        match self {
+            Hut::Console(_) => false,
+            Hut::Tab(tab) => {
+                if tab.children[tab.active].cycle_innermost(dir) {
+                    return true;
+                }
+                if tab.children.len() < 2 {
+                    return false;
+                }
+                tab.active = wrapping_step(tab.children.len(), tab.active, dir);
+                true
+            }
+            Hut::Tile(tile) => {
+                if tile.children[tile.active].0.cycle_innermost(dir) {
+                    return true;
+                }
+                if tile.children.len() < 2 {
+                    return false;
+                }
+                tile.active = wrapping_step(tile.children.len(), tile.active, dir);
+                true
             }
         }
     }
+}
 
-    /// A snapshot of [`Self::damage_tracker`] to hand to
-    /// `TextureRenderElement::from_texture_with_damage` — see that field's
-    /// doc comment for why `from_static_texture` isn't correct for the
-    /// terminal's own (or its thumbnail's) render element.
-    pub fn element_damage_snapshot(&self) -> DamageSnapshot<i32, Buffer> {
-        self.damage_tracker.snapshot()
-    }
+/// Compute each of a Tile-Hut's pane rectangles (`x, y, width,
+/// height`, in whatever pixel space `size` itself is — physical or
+/// logical, the caller's choice) from its axis and fractions, splitting
+/// `size` along `axis` proportionally. Shared between
+/// [`Hut::resize_to_pixels`] (sizing each pane's terminal grid) and
+/// `render.rs`'s Tile-Hut compositing (positioning each pane's
+/// texture) so the two can never disagree about where a pane actually is
+/// — the same reasoning as `docks::Handle`'s shared rect.
+pub fn pane_rects(
+    axis: Axis,
+    fracs: impl Iterator<Item = f64> + Clone,
+    size: (i32, i32),
+) -> Vec<(i32, i32, i32, i32)> {
+    let (width, height) = size;
+    let total = fracs.clone().sum::<f64>().max(f64::EPSILON);
+    let extent = match axis {
+        Axis::Horizontal => width,
+        Axis::Vertical => height,
+    };
 
-    /// Render `text` as a small standalone label texture (Phase 4's
-    /// tab-strip chrome — window titles, not the terminal grid), sharing
-    /// this Hut's own glyph atlas with its terminal renderer rather than
-    /// rasterizing the same glyphs into a second, separate one. Lazily
-    /// initializes both if needed.
-    pub fn render_label(
-        &mut self,
-        renderer: &mut GlesRenderer,
-        text: &str,
-        fg: mudhuts_term::palette::Rgb,
-        bg: mudhuts_term::palette::Rgb,
-    ) -> Result<GlesTexture, String> {
-        if self.gpu.is_none() {
-            self.gpu = Some(GpuTermRenderer::new(renderer)?);
-        }
-        let Some(gpu) = self.gpu.as_ref() else {
-            return Err("terminal GPU renderer unavailable".to_string());
+    let mut rects = Vec::new();
+    let mut offset = 0;
+    let fracs: Vec<f64> = fracs.collect();
+    for (i, frac) in fracs.iter().enumerate() {
+        // The last pane absorbs any leftover pixel from rounding, so the
+        // panes always exactly tile the full extent with no gap/overlap.
+        let this_extent = if i + 1 == fracs.len() {
+            extent - offset
+        } else {
+            ((frac / total) * extent as f64).round() as i32
         };
-        if self.label_renderer.is_none() {
-            self.label_renderer = Some(LabelRenderer::new(renderer, gpu.atlas())?);
-        }
-        let Some(label_renderer) = self.label_renderer.as_mut() else {
-            return Err("label renderer unavailable".to_string());
+        let rect = match axis {
+            Axis::Horizontal => (offset, 0, this_extent, height),
+            Axis::Vertical => (0, offset, width, this_extent),
         };
-        let cell_w = self.glyphs.cell_width();
-        let cell_h = self.glyphs.cell_height();
-        let baseline = self.glyphs.baseline();
-        label_renderer.render(
-            renderer,
-            &mut self.glyphs,
-            text,
-            cell_w,
-            cell_h,
-            baseline,
-            fg,
-            bg,
-        )
+        rects.push(rect);
+        offset += this_extent;
     }
+    rects
 }

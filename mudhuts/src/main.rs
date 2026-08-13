@@ -4,7 +4,7 @@ mod docks;
 mod gpu_term;
 mod grabs;
 mod handlers;
-mod hut;
+mod console_hut;
 mod input;
 mod keybindings;
 mod main_window;
@@ -14,7 +14,7 @@ mod stack;
 mod state;
 mod switcher;
 mod udev_backend;
-mod village;
+mod hut;
 mod village_chrome;
 mod winit_backend;
 
@@ -78,7 +78,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let socket = state::create_socket()?;
 
-    // Point each Hut's shell (and anything launched from it) at mudhuts'
+    // Point each ConsoleHut's shell (and anything launched from it) at mudhuts'
     // own socket, *without* touching the compositor's own process-wide
     // `WAYLAND_DISPLAY` — the winit backend still needs that pointed at
     // whatever mudhuts itself is nested inside, read when `init_winit`
@@ -87,13 +87,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let extra_env = vec![("WAYLAND_DISPLAY".to_string(), socket_name.clone())];
     // Spawned before any backend/output exists, so the real scale isn't
     // known yet — starts at 1.0 and gets caught up by
-    // `HutStack::rescale_all` once `init_udev`/`init_winit` below learn
-    // the real value (see `Hut::rescale`'s doc comment).
-    let (hut, term_events) = hut::Hut::spawn(extra_env.clone(), 1.0)?;
+    // `Stack::rescale_all` once `init_udev`/`init_winit` below learn
+    // the real value (see `ConsoleHut::rescale`'s doc comment).
+    let (hut, term_events) = console_hut::ConsoleHut::spawn(extra_env.clone(), 1.0)?;
 
     let (redraw_ping, redraw_ping_source) = smithay::reexports::calloop::ping::make_ping()?;
     let loop_handle = event_loop.handle();
-    let stack = stack::HutStack::new(hut, term_events, loop_handle, extra_env)?;
+    let stack = stack::Stack::new(hut, term_events, loop_handle, extra_env)?;
     let mut state = State::new(&mut event_loop, display, stack, socket, redraw_ping)?;
 
     if let Some(helper) = &args.authority_helper {

@@ -1,4 +1,4 @@
-//! A Main Window and the Sub-Windows/Alerts tagged as belonging to it —
+//! A Main Window and the Floating Windows/Alerts tagged as belonging to it —
 //! see the plan's Phase 5 notes and the Nomenclature table.
 
 use smithay::backend::renderer::element::Id;
@@ -9,7 +9,7 @@ use smithay::utils::{Logical, Point};
 
 use crate::render::{ChangeTracker, LabelCache};
 
-/// Which screen edge a docked Sub-Window is minimized to.
+/// Which screen edge a docked Floating Window is minimized to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Edge {
     Left,
@@ -18,7 +18,7 @@ pub enum Edge {
     Bottom,
 }
 
-/// Where a Sub-Window currently is. Docked ones aren't mapped as a real
+/// Where a Floating Window currently is. Docked ones aren't mapped as a real
 /// surface at all (there's nothing to composite — see `docks.rs`, which
 /// draws a small handle instead); floating ones are mapped normally at
 /// the given position.
@@ -28,10 +28,10 @@ pub enum Dock {
     Floating(Point<i32, Logical>),
 }
 
-pub struct SubWindow {
+pub struct FloatingWindow {
     pub window: Window,
     pub dock: Dock,
-    /// Stable identities for this Sub-Window's docked handle in
+    /// Stable identities for this Floating Window's docked handle in
     /// `docks.rs` (its title-label text and background) — same reasoning
     /// as `MainWindowEntry::tab_text_id`/`tab_bg_id`.
     pub handle_text_id: Id,
@@ -44,8 +44,8 @@ pub struct SubWindow {
     pub(crate) handle_text_cache: LabelCache<String>,
 }
 
-impl SubWindow {
-    /// A freshly-tagged Sub-Window starts docked — defaulting to the
+impl FloatingWindow {
+    /// A freshly-tagged Floating Window starts docked — defaulting to the
     /// right edge. Nothing in `mudhuts_window_role_v1` hints at a
     /// preferred edge, and the user can drag it to any of the other 3
     /// immediately anyway.
@@ -80,7 +80,7 @@ impl Alert {
     /// No protocol hint gives a preferred position, and centering needs
     /// the current output size (not available where Alerts are created,
     /// in the shell protocol handler) — starts at a simple fixed offset;
-    /// the same drag mechanic as Sub-Windows (Phase 5's move grab) lets
+    /// the same drag mechanic as Floating Windows (Phase 5's move grab) lets
     /// the user put it wherever from there.
     pub fn new(window: Window) -> Self {
         Self {
@@ -96,16 +96,16 @@ impl Alert {
     }
 }
 
-/// One Main Window (a client toplevel presented as a tab within its Hut)
+/// One Main Window (a client toplevel presented as a tab within its ConsoleHut)
 /// plus whatever's been tagged as belonging to it.
 pub struct MainWindowEntry {
     pub window: Window,
-    pub sub_windows: Vec<SubWindow>,
+    pub floating_windows: Vec<FloatingWindow>,
     pub alerts: Vec<Alert>,
     /// Stable identities for this Main Window's tab in `chrome.rs`'s tab
     /// strip (its text label and background) — created once here and
-    /// reused across every frame's `build()` call, matching `Hut::element_id`'s
-    /// pattern; see `Hut::terminal_tab_text_id`'s doc comment for why a
+    /// reused across every frame's `build()` call, matching `ConsoleHut::element_id`'s
+    /// pattern; see `ConsoleHut::terminal_tab_text_id`'s doc comment for why a
     /// fresh `Id::new()` per frame is a real correctness bug, not cosmetic.
     pub tab_text_id: Id,
     pub tab_bg_id: Id,
@@ -136,7 +136,7 @@ impl MainWindowEntry {
     ) -> Self {
         Self {
             window,
-            sub_windows: Vec::new(),
+            floating_windows: Vec::new(),
             alerts: Vec::new(),
             tab_text_id: Id::new(),
             tab_bg_id: Id::new(),

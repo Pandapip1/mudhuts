@@ -46,11 +46,11 @@ pub fn init_winit(
     // backend is meant for more than local development against the real
     // udev/DRM one).
     let scale = backend.borrow().scale_factor();
-    // Catches up the initial Hut (spawned in `main.rs` before this backend
-    // existed, at scale 1.0) and remembers `scale` for every Hut spawned
-    // from here on — see `HutStack::rescale_all`'s doc comment.
+    // Catches up the initial ConsoleHut (spawned in `main.rs` before this backend
+    // existed, at scale 1.0) and remembers `scale` for every ConsoleHut spawned
+    // from here on — see `Stack::rescale_all`'s doc comment.
     if let Err(err) = state.stack.rescale_all(scale) {
-        tracing::warn!("failed to rescale initial Hut to real output scale: {err}");
+        tracing::warn!("failed to rescale initial ConsoleHut to real output scale: {err}");
     }
 
     let output = Output::new(

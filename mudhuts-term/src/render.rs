@@ -34,7 +34,7 @@ pub struct GlyphCache {
     /// `FONT_SIZE * scale` this cache was built for — every glyph in
     /// `cache` was rasterized at this size, so it has to stay fixed for
     /// this instance's lifetime (a scale change means a fresh `GlyphCache`,
-    /// not mutating this one — see `Hut::rescale`).
+    /// not mutating this one — see `ConsoleHut::rescale`).
     font_size: f32,
     cell_width: usize,
     cell_height: usize,
@@ -45,7 +45,7 @@ impl GlyphCache {
     /// `scale` is the output's real DPI scale (`1.0` on a standard-density
     /// display) — multiplied into `FONT_SIZE` so text renders at the same
     /// *apparent* size regardless of the panel's pixel density, not just
-    /// the same pixel count. See `mudhuts::hut::Hut::rescale`'s doc
+    /// the same pixel count. See `mudhuts::hut::ConsoleHut::rescale`'s doc
     /// comment for why the caller may not know the real value yet at
     /// construction time and might rebuild this later.
     pub fn new(scale: f64) -> Result<Self, String> {

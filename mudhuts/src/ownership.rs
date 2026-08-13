@@ -1,11 +1,11 @@
-//! Default Hut assignment for new client toplevels — see the plan's
+//! Default ConsoleHut assignment for new client toplevels — see the plan's
 //! Phase 4 notes. No protocol needed for this default case (that's
-//! reserved for Sub-Window/Alert role assignment, Phase 5).
+//! reserved for Floating Window/Alert role assignment, Phase 5).
 //!
 //! Two resolution paths, tried in order:
 //!
-//! 1. `MUDHUTS_HUT_ID`, an env var every Hut's shell has set in its own
-//!    environment (see `Hut::spawn`) — inherited by every descendant
+//! 1. `MUDHUTS_HUT_ID`, an env var every ConsoleHut's shell has set in its own
+//!    environment (see `ConsoleHut::spawn`) — inherited by every descendant
 //!    process regardless of `fork()`/`exec()`, and so, unlike walking
 //!    `PPid` chains, immune to a descendant being reparented away from
 //!    the shell entirely. That reparenting isn't a hypothetical: apps
@@ -20,13 +20,13 @@
 //!    during which the real process gets reparented before its toplevel
 //!    ever shows up.
 //! 2. Walking the connecting client's process ancestry back to a known
-//!    Hut's shell PID — kept as a fallback for whatever `MUDHUTS_HUT_ID`
+//!    ConsoleHut's shell PID — kept as a fallback for whatever `MUDHUTS_HUT_ID`
 //!    doesn't cover (e.g. a launcher that explicitly clears its child's
 //!    environment).
 
 use std::fs;
 
-use crate::stack::HutStack;
+use crate::stack::Stack;
 
 /// Read `/proc/<pid>/environ`'s null-separated `KEY=VALUE` entries
 /// looking for `MUDHUTS_HUT_ID`. `None` if the process is gone,
@@ -43,7 +43,7 @@ fn env_hut_id(pid: u32) -> Option<u64> {
 }
 
 /// This only ever climbs a normal process tree (client -> ... -> some
-/// Hut's shell), so a real hit is always close — bounded so a
+/// ConsoleHut's shell), so a real hit is always close — bounded so a
 /// pathological or adversarial `/proc` entry can't hang the walk.
 const MAX_ANCESTRY_HOPS: usize = 32;
 
@@ -58,12 +58,12 @@ fn parent_pid(pid: u32) -> Option<u32> {
         .and_then(|rest| rest.trim().parse().ok())
 }
 
-/// Resolve which Hut owns `client_pid` — first via its own `MUDHUTS_HUT_ID`
+/// Resolve which ConsoleHut owns `client_pid` — first via its own `MUDHUTS_HUT_ID`
 /// environment variable (see the module doc for why this is tried
-/// first), then by walking its process ancestry looking for a Hut whose
+/// first), then by walking its process ancestry looking for a ConsoleHut whose
 /// shell is it or one of its ancestors. `None` if neither finds a match —
-/// callers should fall back to the currently focused Hut.
-pub fn find_owning_hut(client_pid: u32, stack: &HutStack) -> Option<u64> {
+/// callers should fall back to the currently focused ConsoleHut.
+pub fn find_owning_hut(client_pid: u32, stack: &Stack) -> Option<u64> {
     if let Some(id) = env_hut_id(client_pid)
         && stack.all_huts().any(|hut| hut.id == id)
     {
@@ -90,16 +90,16 @@ mod tests {
 
     use super::*;
     use crate::State;
-    use crate::hut::Hut;
+    use crate::console_hut::ConsoleHut;
 
     fn loop_handle() -> LoopHandle<'static, State> {
         let event_loop: EventLoop<'static, State> = EventLoop::try_new().unwrap();
         Box::leak(Box::new(event_loop)).handle()
     }
 
-    fn new_stack() -> HutStack {
-        let (hut, events) = Hut::spawn(std::iter::empty(), 1.0).unwrap();
-        HutStack::new(hut, events, loop_handle(), Vec::new()).unwrap()
+    fn new_stack() -> Stack {
+        let (hut, events) = ConsoleHut::spawn(std::iter::empty(), 1.0).unwrap();
+        Stack::new(hut, events, loop_handle(), Vec::new()).unwrap()
     }
 
     #[test]
@@ -128,7 +128,7 @@ mod tests {
         // environment isn't guaranteed clean of `MUDHUTS_HUT_ID` — if the
         // whole test suite happens to be run from inside a live mudhuts
         // session (its own daily-driver use), the test process inherits
-        // that Hut's real id, which `env_hut_id` would then find first,
+        // that ConsoleHut's real id, which `env_hut_id` would then find first,
         // making this assertion depend on ambient state outside the
         // test's control. A short-lived child with that variable
         // explicitly cleared sidesteps it entirely.

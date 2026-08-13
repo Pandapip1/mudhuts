@@ -14,7 +14,7 @@ use smithay::utils::{Buffer, Rectangle, Scale, Transform};
 use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
 
 use crate::State;
-use crate::village::{Village, pane_rects};
+use crate::hut::{Hut, pane_rects};
 use crate::{chrome, docks, switcher, village_chrome};
 
 /// The [`TextureRenderElement`] buffer-scale ([`Element::src`]/
@@ -76,7 +76,7 @@ pub(crate) fn scaled(px: i32, scale: f64) -> i32 {
 /// `CommitCounter` that never advances (e.g. `CommitCounter::default()`
 /// passed fresh every frame) means "never damaged again after the first
 /// frame" — the same class of bug as `TextureRenderElement::from_static_texture`
-/// (see `Hut::damage_tracker`'s doc comment), just for
+/// (see `ConsoleHut::damage_tracker`'s doc comment), just for
 /// `SolidColorRenderElement`/hand-tracked content instead.
 pub(crate) struct ChangeTracker<T> {
     last: Option<T>,
@@ -103,10 +103,10 @@ impl<T: PartialEq> ChangeTracker<T> {
     }
 }
 
-/// Caches a rendered label texture (from `Hut::render_label`), only
+/// Caches a rendered label texture (from `ConsoleHut::render_label`), only
 /// actually re-rendering it when the value identifying its content
 /// (title text, active/inactive state, ...) changes since last time.
-/// `Hut::render_label` does real GPU work every call — glyph-atlas
+/// `ConsoleHut::render_label` does real GPU work every call — glyph-atlas
 /// lookups plus instanced draw calls into an FBO — and without this
 /// cache, `chrome.rs`'s tab strip and `docks.rs`'s dock handles would
 /// pay that cost on *every single frame* they're visible, even though a
@@ -134,7 +134,7 @@ impl<T: PartialEq> LabelCache<T> {
     /// rendered yet) — split from [`Self::store`] (rather than a single
     /// render-and-cache call taking a closure) specifically so the
     /// caller can render a fresh texture via a `&mut self` method of its
-    /// *own* (e.g. `Hut::render_label`) in between the two, without that
+    /// *own* (e.g. `ConsoleHut::render_label`) in between the two, without that
     /// call fighting a simultaneous mutable borrow of this cache.
     pub(crate) fn is_stale(&self, key: &T) -> bool {
         self.texture.is_none() || self.last.as_ref() != Some(key)
@@ -174,7 +174,7 @@ impl<T: PartialEq> LabelCache<T> {
 //
 // `Terminal` is also reused for the Alt-Tab popup's thumbnails
 // (`switcher.rs`) — they're the same element type (a texture composited
-// at an explicit size/location), just wrapping a different Hut's cached
+// at an explicit size/location), just wrapping a different ConsoleHut's cached
 // texture. `SolidColor` backs the popup's background panel and highlight
 // border (`SolidColorRenderElement` isn't generic over `R` at all).
 // `Pointer` backs the udev/DRM backend's own compositor-drawn cursor
@@ -198,7 +198,7 @@ type Element = OutputRenderElements<GlesRenderer, WaylandSurfaceRenderElement<Gl
 /// Main-Window-visible branch below (its own doc comment confirms it:
 /// "this will include layer-shell surfaces added to this output's
 /// LayerMap") — this helper is only for the *other* two branches
-/// (showing the terminal directly, or a Tile-Village), which don't go
+/// (showing the terminal directly, or a Tile-Hut), which don't go
 /// through a `Space` at all, so nothing else would ever composite layer
 /// surfaces for them. Kept split (not flattened into one Vec) so the
 /// caller can insert its own content — a terminal texture, or a whole
@@ -298,8 +298,8 @@ fn lock_screen_elements(
 }
 
 /// Build one frame's worth of render elements (Alt-Tab popup, tab-strip
-/// chrome, docked-handle chrome, then either the focused Hut's terminal
-/// texture or its visible Main Window/Sub-Windows/Alerts via `state.space`)
+/// chrome, docked-handle chrome, then either the focused ConsoleHut's terminal
+/// texture or its visible Main Window/Floating Windows/Alerts via `state.space`)
 /// in front-to-back order — shared by every backend
 /// (`winit_backend.rs`/`udev_backend.rs`) so the element-assembly logic
 /// itself is written once. Backend-specific concerns (binding a
@@ -311,7 +311,7 @@ pub fn build_frame_elements(
     output: &Output,
     size: (i32, i32),
 ) -> Vec<OutputRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> {
-    // Checked before every other branch below (switcher, Village chrome,
+    // Checked before every other branch below (switcher, Hut chrome,
     // terminal/window content): a locked session must render *nothing*
     // else, not even layered underneath a lock surface — see
     // `handlers/session_lock.rs`'s module doc on why the protocol
@@ -325,10 +325,10 @@ pub fn build_frame_elements(
     let scale = state.output_scale();
     let mut elements = Vec::new();
 
-    // Only the focused Hut normally gets redrawn (see Phase 2.6's
-    // damage-avoidance work) — but the Alt-Tab popup shows every Hut's
+    // Only the focused ConsoleHut normally gets redrawn (see Phase 2.6's
+    // damage-avoidance work) — but the Alt-Tab popup shows every ConsoleHut's
     // thumbnail, so while it's open they all need fresh cached textures.
-    // Redundant with the focused Hut's own redraw further down (cheap: a
+    // Redundant with the focused ConsoleHut's own redraw further down (cheap: a
     // second `redraw` call in the same tick is a no-op cache hit, since
     // damage was already reset by the first).
     if state.stack.is_previewing() {
@@ -343,15 +343,15 @@ pub fn build_frame_elements(
     // client window; empty when no preview session is open.
     elements.extend(switcher::build(&state.stack, size, renderer, scale));
 
-    // Tile-Village (Phase 6) — bypasses the normal single-Hut chrome/
+    // Tile-Hut (Phase 6) — bypasses the normal single-ConsoleHut chrome/
     // docks/terminal-or-space pipeline entirely: every pane is visible
-    // simultaneously, side by side, each always showing its own Hut's
+    // simultaneously, side by side, each always showing its own ConsoleHut's
     // terminal (never a Main Window — see `village.rs`'s module doc on
     // why that's this pass's deliberate scope). A 1-child (or empty)
-    // Tile never actually exists (`Village::collapse_if_singleton`
+    // Tile never actually exists (`Hut::collapse_if_singleton`
     // unwraps it immediately), but the length check stays as a defensive
     // fallback to the normal pipeline rather than assumed.
-    if matches!(state.stack.focused_village(), Village::Tile(tile) if tile.children.len() >= 2) {
+    if matches!(state.stack.focused_top_level(), Hut::Tile(tile) if tile.children.len() >= 2) {
         let (layer_upper, layer_lower) = layer_elements(state, renderer);
         elements.extend(layer_upper);
         elements.extend(build_tile_elements(state, renderer));
@@ -359,24 +359,24 @@ pub fn build_frame_elements(
         return elements;
     }
 
-    // Village-level tab strip(s) (Phase 6) — one per Tab-Village along
+    // Hut-level tab strip(s) (Phase 6) — one per Tab-Hut along
     // the active path, stacked from the top of the screen, outermost
     // first (see `village_chrome.rs`'s module doc). Empty unless the
-    // focused top-level Village actually is a Tab-Village with 2+
+    // focused top-level Hut actually is a Tab-Hut with 2+
     // children; `next_y` is unchanged (0) in that case.
     let cell_w = state.stack.focused().glyphs.cell_width().max(1);
     let cell_h = state.stack.focused().glyphs.cell_height().max(1) as i32;
     let (village_tab_elements, next_y) =
-        village_chrome::build(state.stack.focused_village_mut(), renderer, 0, cell_w, cell_h, scale);
+        village_chrome::build(state.stack.focused_top_level_mut(), renderer, 0, cell_w, cell_h, scale);
     elements.extend(village_tab_elements);
 
-    // Tab-strip chrome (Phase 4) — pushed below any Village-level strips
+    // Tab-strip chrome (Phase 4) — pushed below any Hut-level strips
     // above it, still on top of the terminal/window content and still
-    // below the Alt-Tab popup above. Empty when the focused Hut has no
+    // below the Alt-Tab popup above. Empty when the focused ConsoleHut has no
     // Main Windows.
     elements.extend(chrome::build(state.stack.focused_mut(), renderer, next_y, scale));
 
-    // Docked Sub-Window handles (Phase 5) — same z-order slot as the tab
+    // Docked Floating Window handles (Phase 5) — same z-order slot as the tab
     // strip, only shown alongside the Main Window they belong to (never
     // while the terminal itself is the visible view).
     if !show_terminal {
@@ -398,7 +398,7 @@ pub fn build_frame_elements(
             // terminal's content genuinely changes every keystroke, and
             // `from_static_texture` is documented by Smithay as creating
             // an element with no damage tracking at all (see
-            // `Hut::damage_tracker`'s doc comment).
+            // `ConsoleHut::damage_tracker`'s doc comment).
             //
             // Buffer scale, not an explicit `size` — see
             // `texture_buffer_scale`'s doc comment for why leaving this
@@ -433,17 +433,17 @@ pub fn build_frame_elements(
     elements
 }
 
-/// Build a Tile-Village's panes side by side: each child's own terminal
-/// texture (already sized to its pane by `Village::resize_to_pixels` —
+/// Build a Tile-Hut's panes side by side: each child's own terminal
+/// texture (already sized to its pane by `Hut::resize_to_pixels` —
 /// see that method and [`pane_rects`]), composited at its pane's screen
 /// position, plus a highlight border around whichever pane currently has
 /// keyboard focus. Only called once the caller's confirmed the focused
-/// top-level Village really is a `Village::Tile` with 2+ children.
+/// top-level Hut really is a `Hut::Tile` with 2+ children.
 ///
 /// Panes are normal content — like the terminal-visible branch above,
 /// sized and positioned against [`State::usable_area`], not the raw
-/// output rect (matches `Village::resize_to_pixels`'s own sizing via
-/// `HutStack::resize_all`, and `State::active_pane_offset`'s identical
+/// output rect (matches `Hut::resize_to_pixels`'s own sizing via
+/// `Stack::resize_all`, and `State::active_pane_offset`'s identical
 /// rect computation for mouse-interaction routing — both must agree with
 /// what's actually drawn here).
 fn build_tile_elements(
@@ -452,7 +452,7 @@ fn build_tile_elements(
 ) -> Vec<OutputRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> {
     let (area_x, area_y, area_w, area_h) = state.usable_area();
     let scale = state.output_scale();
-    let Village::Tile(tile) = state.stack.focused_village_mut() else {
+    let Hut::Tile(tile) = state.stack.focused_top_level_mut() else {
         return Vec::new();
     };
     let rects: Vec<_> = pane_rects(tile.axis, tile.children.iter().map(|(_, frac)| *frac), (area_w, area_h))

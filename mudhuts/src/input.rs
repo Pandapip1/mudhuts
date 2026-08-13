@@ -17,7 +17,7 @@ use smithay::wayland::shell::wlr_layer::{KeyboardInteractivity, Layer as WlrLaye
 
 use crate::State;
 use crate::keybindings::Action;
-use crate::village::{Village, pane_rects};
+use crate::hut::{Hut, pane_rects};
 use crate::{chrome, docks, village_chrome};
 
 /// Mime types mudhuts advertises for every selection it sets itself
@@ -243,7 +243,7 @@ impl State {
     /// so the window needs *no* stale focus lingering while it's hidden,
     /// and *does* need focus the moment it's shown. Shared by
     /// `Action::ToggleTerminal` and every chrome click that can change
-    /// which Hut/tab/pane is now showing (`try_click_chrome`).
+    /// which ConsoleHut/tab/pane is now showing (`try_click_chrome`).
     fn sync_keyboard_focus_to_view(&mut self) {
         let target = if self.showing_terminal_effective() {
             None
@@ -260,25 +260,25 @@ impl State {
     }
 
     /// Try to handle a left-click as a chrome interaction — a
-    /// Village-level tab (any nesting level), a Hut-level Main-Window tab,
-    /// or clicking into a Tile-Village pane — rather than a normal
+    /// Hut-level tab (any nesting level), a ConsoleHut-level Main-Window tab,
+    /// or clicking into a Tile-Hut pane — rather than a normal
     /// terminal/window click. On a hit, switches focus accordingly and
     /// returns `true`, so the caller can skip its normal click handling
     /// for this press.
     ///
-    /// A genuinely tiled Tile-Village (2+ panes) is checked *exclusively*
+    /// A genuinely tiled Tile-Hut (2+ panes) is checked *exclusively*
     /// — mirroring `render.rs`'s `build_frame_elements`, which bypasses
-    /// the Village-tab/Hut-tab chrome pipeline entirely while tiled (see
+    /// the Hut-tab/ConsoleHut-tab chrome pipeline entirely while tiled (see
     /// its own early return): neither strip is ever actually drawn there,
     /// so hit-testing against them too would risk a click inside a tile
-    /// pane spuriously landing on some *other* Hut's tab layout that
+    /// pane spuriously landing on some *other* ConsoleHut's tab layout that
     /// happens to overlap the same screen position but was never
     /// visible. Otherwise, checked in front-to-back z-order matching that
-    /// same function's element push order: Village-level tabs first
-    /// (topmost), then the Hut-level strip below them.
+    /// same function's element push order: Hut-level tabs first
+    /// (topmost), then the ConsoleHut-level strip below them.
     ///
     /// `pos` is physical — every rect this checks against (tile panes,
-    /// Village/Hut tab strips) is mudhuts' own drawn chrome, sized
+    /// Hut/ConsoleHut tab strips) is mudhuts' own drawn chrome, sized
     /// against `usable_area()`/`output_size`, not a real Wayland surface
     /// Smithay tracks in Logical space. The caller converts from the
     /// seat's Logical position before calling this.
@@ -292,7 +292,7 @@ impl State {
         // pane whenever a layer-shell surface reserves part of the
         // output.
         let (area_x, area_y, area_w, area_h) = self.usable_area();
-        if let Village::Tile(tile) = self.stack.focused_village_mut()
+        if let Hut::Tile(tile) = self.stack.focused_top_level_mut()
             && tile.children.len() >= 2
         {
             let rects = pane_rects(tile.axis, tile.children.iter().map(|(_, frac)| *frac), (area_w, area_h));
@@ -314,7 +314,7 @@ impl State {
         let scale = self.output_scale();
 
         if village_chrome::handle_click(
-            self.stack.focused_village_mut(),
+            self.stack.focused_top_level_mut(),
             (pixel.x, pixel.y),
             0,
             cell_w,
@@ -327,7 +327,7 @@ impl State {
             return true;
         }
 
-        let strip_y = village_chrome::stack_height(self.stack.focused_village(), cell_h, scale);
+        let strip_y = village_chrome::stack_height(self.stack.focused_top_level(), cell_h, scale);
         let hit = chrome::tab_layout(self.stack.focused(), strip_y, scale)
             .into_iter()
             .find(|t| t.rect.contains(pixel));
@@ -478,8 +478,8 @@ impl State {
                 // via the un-forced `showing_terminal` field, not
                 // `showing_terminal_effective()`, since that would always
                 // report true here and this toggle would never do
-                // anything. Per-Hut now (Phase 4): toggling in one Hut
-                // doesn't disturb what any other Hut was last showing.
+                // anything. Per-ConsoleHut now (Phase 4): toggling in one ConsoleHut
+                // doesn't disturb what any other ConsoleHut was last showing.
                 let hut = self.stack.focused_mut();
                 if hut.main_window_count() > 0 {
                     hut.showing_terminal = !hut.showing_terminal;
@@ -511,12 +511,12 @@ impl State {
                     self.stack.preview_next()
                 };
                 if let Err(err) = result {
-                    tracing::error!("failed to advance the Hut stack: {err}");
+                    tracing::error!("failed to advance the ConsoleHut stack: {err}");
                 }
                 if instant {
                     self.sync_visible_main_window();
                 }
-                // The newly-focused (or newly-previewed) Hut gets resized
+                // The newly-focused (or newly-previewed) ConsoleHut gets resized
                 // to the real output size as part of the redraw this
                 // triggers (see `winit_backend.rs`'s `resize_all` call,
                 // which runs before that frame's texture is generated) —
@@ -535,16 +535,16 @@ impl State {
                 self.request_redraw();
             }
             // Innermost-first resolution (see the plan's Meta+Left/Right
-            // notes): the focused Hut's own Main Window tabs win if it
+            // notes): the focused ConsoleHut's own Main Window tabs win if it
             // has 2+; only then does this bubble up to the nearest
-            // ancestor Tab/Tile-Village and cycle *its* children instead
-            // (`HutStack::cycle_innermost` recurses to find that level on
-            // its own — a no-op if there isn't one, e.g. a lone Hut).
+            // ancestor Tab/Tile-Hut and cycle *its* children instead
+            // (`Stack::cycle_innermost` recurses to find that level on
+            // its own — a no-op if there isn't one, e.g. a lone ConsoleHut).
             Action::TabNext => {
                 if self.stack.focused().main_window_count() >= 2 {
                     self.stack.focused_mut().cycle_tab(true);
                 } else {
-                    self.stack.cycle_innermost(crate::village::Direction::Next);
+                    self.stack.cycle_innermost(crate::hut::Direction::Next);
                 }
                 self.sync_visible_main_window();
                 self.request_redraw();
@@ -553,21 +553,21 @@ impl State {
                 if self.stack.focused().main_window_count() >= 2 {
                     self.stack.focused_mut().cycle_tab(false);
                 } else {
-                    self.stack.cycle_innermost(crate::village::Direction::Prev);
+                    self.stack.cycle_innermost(crate::hut::Direction::Prev);
                 }
                 self.sync_visible_main_window();
                 self.request_redraw();
             }
             Action::WrapTab => {
                 if let Err(err) = self.stack.wrap_tab() {
-                    tracing::error!("failed to spawn a new Hut for wrap-tab: {err}");
+                    tracing::error!("failed to spawn a new ConsoleHut for wrap-tab: {err}");
                 }
                 self.sync_visible_main_window();
                 self.request_redraw();
             }
             Action::WrapTile => {
                 if let Err(err) = self.stack.wrap_tile() {
-                    tracing::error!("failed to spawn a new Hut for wrap-tile: {err}");
+                    tracing::error!("failed to spawn a new ConsoleHut for wrap-tile: {err}");
                 }
                 self.sync_visible_main_window();
                 self.request_redraw();
@@ -753,8 +753,8 @@ impl State {
                     && button == BTN_LEFT
                     && self.try_click_chrome(self.to_physical(pointer.current_location()))
                 {
-                    // Handled as a chrome click (a Village-level tab, a
-                    // Hut-level Main-Window tab, or a Tile-Village pane) —
+                    // Handled as a chrome click (a Hut-level tab, a
+                    // ConsoleHut-level Main-Window tab, or a Tile-Hut pane) —
                     // skip the normal terminal/window click handling
                     // below for this press.
                 } else if pressed
@@ -835,7 +835,7 @@ impl State {
                             keyboard.set_focus(self, Some(toplevel.wl_surface().clone()), serial);
                         }
                         // No `send_pending_configure()` sweep here: until
-                        // the floating Sub-Window/Alert system (Phase 5)
+                        // the floating Floating Window/Alert system (Phase 5)
                         // adds real per-window focus, every window is
                         // permanently hinted `Activated` (set once in
                         // `new_toplevel`) and nothing else in this handler
@@ -947,7 +947,7 @@ impl State {
                             }
                         } else {
                             // No app has grabbed the mouse — scroll this
-                            // Hut's own scrollback instead of doing
+                            // ConsoleHut's own scrollback instead of doing
                             // nothing, 3 lines per click (unchanged from
                             // before this fix). `clicks > 0` is "scroll
                             // down" (same convention as the wheel-report

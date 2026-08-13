@@ -31,7 +31,7 @@ impl XdgShellHandler for State {
         //
         // Also permanently hint `Activated` (focused). There's no real
         // per-window focus tracking yet — that needs the floating
-        // Sub-Window/Alert system (Phase 5) — and since only ever one
+        // Floating Window/Alert system (Phase 5) — and since only ever one
         // thing is shown at a time in the meantime, toggling this off and
         // on would just cost clients unnecessary redraws for a distinction
         // that isn't meaningful yet. Never touched again after this.
@@ -53,9 +53,9 @@ impl XdgShellHandler for State {
             });
         }
 
-        // Default Hut assignment needs no protocol: walk the connecting
-        // client's process ancestry back to a known Hut's shell PID (see
-        // the plan's Phase 4 notes). Falls back to the focused Hut if the
+        // Default ConsoleHut assignment needs no protocol: walk the connecting
+        // client's process ancestry back to a known ConsoleHut's shell PID (see
+        // the plan's Phase 4 notes). Falls back to the focused ConsoleHut if the
         // client's credentials aren't available or no ancestor matches
         // (e.g. it wasn't actually launched from one of our shells).
         let owning_hut_id = surface
@@ -84,13 +84,13 @@ impl XdgShellHandler for State {
             hut.push_main_window(window, was_empty, foreign_handle);
         }
 
-        // Nothing else was showing yet for this Hut specifically, so the
+        // Nothing else was showing yet for this ConsoleHut specifically, so the
         // newly launched window becomes visible immediately rather than
         // staying hidden behind the terminal until a manual Ctrl+` — but
-        // only when it's the focused Hut; a window launched from a
-        // background Hut's shell just joins that Hut's own tab strip
+        // only when it's the focused ConsoleHut; a window launched from a
+        // background ConsoleHut's shell just joins that ConsoleHut's own tab strip
         // without stealing focus (generalizes the original Phase 2.5
-        // "was empty" rule to be per-Hut).
+        // "was empty" rule to be per-ConsoleHut).
         let should_show_now = is_focused_hut && was_empty;
         if should_show_now {
             self.stack.focused_mut().showing_terminal = false;
@@ -149,7 +149,7 @@ impl XdgShellHandler for State {
         surface.send_repositioned(token);
     }
 
-    /// Real interactive move, for floating Sub-Windows/Alerts only — bare
+    /// Real interactive move, for floating Floating Windows/Alerts only — bare
     /// Main Windows are always fullscreen, so there's nothing to drag for
     /// those (matches the plan's Phase 5 notes: mudhuts assumes CSD, so
     /// this is what a client's own title bar actually calls).
@@ -167,9 +167,9 @@ impl XdgShellHandler for State {
         };
 
         let hut = self.stack.focused_mut();
-        let is_sub_window = hut.sub_window_mut(&wl_surface).is_some();
-        let is_alert = !is_sub_window && hut.alert_mut(&wl_surface).is_some();
-        if !is_sub_window && !is_alert {
+        let is_floating_window = hut.floating_window_mut(&wl_surface).is_some();
+        let is_alert = !is_floating_window && hut.alert_mut(&wl_surface).is_some();
+        if !is_floating_window && !is_alert {
             return;
         }
 
@@ -185,7 +185,7 @@ impl XdgShellHandler for State {
             window,
             initial_window_location,
             surface: wl_surface,
-            sub_window: is_sub_window,
+            floating_window: is_floating_window,
         };
 
         pointer.set_grab(self, grab, serial, Focus::Clear);
@@ -282,9 +282,9 @@ pub fn handle_commit(popups: &mut PopupManager, window: Option<Window>, surface:
 /// only ever sent once, at creation, so already-mapped Main Windows need
 /// an explicit fresh configure to actually resize; xdg_shell doesn't
 /// propagate a compositor-driven size change on its own. Only bare Main
-/// Windows are fullscreen — Sub-Windows/Alerts float at whatever size
+/// Windows are fullscreen — Floating Windows/Alerts float at whatever size
 /// their own CSD/content wants, so they're left alone here.
-pub(crate) fn resize_all_main_windows(stack: &crate::stack::HutStack, size: Size<i32, Logical>) {
+pub(crate) fn resize_all_main_windows(stack: &crate::stack::Stack, size: Size<i32, Logical>) {
     for hut in stack.all_huts() {
         for entry in hut.main_windows() {
             let Some(toplevel) = entry.window.toplevel() else {
@@ -329,7 +329,7 @@ impl State {
         let Ok(root) = find_popup_root_surface(&PopupKind::Xdg(popup.clone())) else {
             return;
         };
-        // Looked up across every Hut (not just `self.space`, which now
+        // Looked up across every ConsoleHut (not just `self.space`, which now
         // only ever holds whichever single Main Window is currently
         // visible) — a popup's parent window doesn't have to be the
         // visible one. Every Main Window is fullscreen at the output's

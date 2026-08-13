@@ -2,10 +2,10 @@
 //! notes) — no real GUI app speaks this protocol yet, so this is how
 //! role assignment actually gets exercised: connects, creates two bare
 //! `xdg_toplevel`s, binds `mudhuts_shell_v1`, and tags the second as a
-//! Sub-Window or Alert of the first (selected via `--sub`/`--alert`).
-//! Run from mudhuts' own built-in shell so its PID-ancestry Hut
+//! Floating Window or Alert of the first (selected via `--sub`/`--alert`).
+//! Run from mudhuts' own built-in shell so its PID-ancestry ConsoleHut
 //! assignment (see `mudhuts/src/ownership.rs`) puts both toplevels in the
-//! same Hut — check mudhuts' logs to confirm the role landed.
+//! same ConsoleHut — check mudhuts' logs to confirm the role landed.
 
 use std::env;
 use std::process::ExitCode;
@@ -162,7 +162,7 @@ fn main() -> ExitCode {
         println!("tagged the second toplevel as an Alert of the first");
     } else {
         role.set_sub(&main_toplevel);
-        println!("tagged the second toplevel as a Sub-Window of the first");
+        println!("tagged the second toplevel as a Floating Window of the first");
     }
 
     if let Err(err) = event_queue.roundtrip(&mut state) {

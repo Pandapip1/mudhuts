@@ -1,7 +1,7 @@
 //! The Alt-Tab preview popup: a horizontal strip of thumbnails, one per
-//! Hut in The Stack, with a highlight border around whichever one is
+//! ConsoleHut in The Stack, with a highlight border around whichever one is
 //! currently previewed — see the plan's Phase 3.5 notes. Reuses each
-//! Hut's already-rendered cached texture ([`Hut::cached_texture`]) scaled
+//! ConsoleHut's already-rendered cached texture ([`ConsoleHut::cached_texture`]) scaled
 //! down via an explicit `size` override, rather than a new rendering
 //! pipeline: `TextureRenderElement` composites a texture at whatever
 //! size/location it's given regardless of the texture's native size.
@@ -15,7 +15,7 @@ use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
 
 use crate::render::OutputRenderElements;
-use crate::stack::HutStack;
+use crate::stack::Stack;
 
 /// Base sizes (scale 1.0) — scaled via `crate::render::scaled` wherever
 /// they're actually used, so the popup stays the same apparent size
@@ -31,7 +31,7 @@ type Element = OutputRenderElements<GlesRenderer, WaylandSurfaceRenderElement<Gl
 /// `winit_backend.rs`, which pushes these ahead of the normal background
 /// elements — index 0 renders on top), or an empty list if no preview
 /// session is open.
-pub fn build(stack: &HutStack, output_size: (i32, i32), renderer: &GlesRenderer, scale: f64) -> Vec<Element> {
+pub fn build(stack: &Stack, output_size: (i32, i32), renderer: &GlesRenderer, scale: f64) -> Vec<Element> {
     if !stack.is_previewing() {
         return Vec::new();
     }
@@ -74,7 +74,7 @@ pub fn build(stack: &HutStack, output_size: (i32, i32), renderer: &GlesRenderer,
             )));
             // `from_texture_with_damage`, not `from_static_texture` — this
             // wraps the same ever-changing terminal content as the main
-            // render element (see `Hut::damage_tracker`'s doc comment),
+            // render element (see `ConsoleHut::damage_tracker`'s doc comment),
             // just scaled down.
             //
             // The *base* (unscaled) `THUMB_SIZE`, not `thumb_w`/`thumb_h`

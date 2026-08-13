@@ -33,7 +33,7 @@ use mudhuts_protocols::server::mudhuts_shell_v1::{self, MudhutsShellV1};
 use mudhuts_protocols::server::mudhuts_window_role_v1::{self, MudhutsWindowRoleV1};
 
 use crate::State;
-use crate::main_window::{Alert, SubWindow};
+use crate::main_window::{Alert, FloatingWindow};
 
 impl GlobalDispatch2<MudhutsShellV1, State> for GlobalData {
     fn bind(
@@ -157,7 +157,7 @@ fn resolve_by_identifier(state: &State, identifier: &str) -> Option<WlSurface> {
 
 /// Which `xdg_toplevel` a `mudhuts_window_role_v1` object was created for
 /// — the toplevel that's being (re-)tagged as a bare Main Window, a
-/// Sub-Window, or an Alert.
+/// Floating Window, or an Alert.
 pub struct WindowRoleUserData {
     toplevel: xdg_toplevel::XdgToplevel,
 }
@@ -215,10 +215,10 @@ enum Role {
 }
 
 /// Move `tagged_surface`'s window to its new role, wherever it currently
-/// lives (a bare Main Window, or already a Sub-Window/Alert of some other
-/// Main Window) — always within the same Hut it was originally assigned
-/// to (Sub-Windows/Alerts belong to a Main Window in *their own* Hut; a
-/// `main` toplevel from a different Hut just means the target isn't
+/// lives (a bare Main Window, or already a Floating Window/Alert of some other
+/// Main Window) — always within the same ConsoleHut it was originally assigned
+/// to (Floating Windows/Alerts belong to a Main Window in *their own* ConsoleHut; a
+/// `main` toplevel from a different ConsoleHut just means the target isn't
 /// found, handled below by leaving it as a bare Main Window instead of
 /// silently moving it across Huts).
 fn retag(state: &mut State, tagged_surface: &WlSurface, target: Option<(Role, WlSurface)>) {
@@ -246,20 +246,20 @@ fn retag(state: &mut State, tagged_surface: &WlSurface, target: Option<(Role, Wl
             Some((role, main_surface)) => match hut.find_main_window_mut(main_surface) {
                 Some(entry) => {
                     match role {
-                        Role::Sub => entry.sub_windows.push(SubWindow::new(window)),
+                        Role::Sub => entry.floating_windows.push(FloatingWindow::new(window)),
                         Role::Alert => entry.alerts.push(Alert::new(window)),
                     }
                     tracing::debug!(
                         "mudhuts_window_role_v1: retagged as {}",
                         match role {
-                            Role::Sub => "a Sub-Window",
+                            Role::Sub => "a Floating Window",
                             Role::Alert => "an Alert",
                         }
                     );
                 }
                 None => {
                     tracing::warn!(
-                        "mudhuts_window_role_v1: target main window not found in the same Hut, leaving as a bare Main Window"
+                        "mudhuts_window_role_v1: target main window not found in the same ConsoleHut, leaving as a bare Main Window"
                     );
                     let foreign_handle = state.foreign_toplevel_list_state.new_toplevel::<State>(
                         &crate::chrome::window_title(&window),
@@ -277,6 +277,6 @@ fn retag(state: &mut State, tagged_surface: &WlSurface, target: Option<(Role, Wl
         state.sync_visible_main_window();
         state.request_redraw();
     } else {
-        tracing::warn!("mudhuts_window_role_v1: tagged toplevel not found in any Hut");
+        tracing::warn!("mudhuts_window_role_v1: tagged toplevel not found in any ConsoleHut");
     }
 }

@@ -15,20 +15,20 @@ use smithay::input::keyboard::{ModifiersState, xkb};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
-    /// Toggle the focused Hut's terminal vs. its last-focused Main Window.
+    /// Toggle the focused ConsoleHut's terminal vs. its last-focused Main Window.
     /// Stubbed until Main Windows land (Phase 4).
     ToggleTerminal,
     /// Move forward/backward through The Stack (MRU). Stubbed until
-    /// multi-Hut support lands (Phase 3).
+    /// multi-ConsoleHut support lands (Phase 3).
     StackNext,
     StackPrev,
-    /// Innermost-first tab cycle (Hut's Main Windows, else ancestor
-    /// Tab/Tile-Village). Stubbed until Main Windows/Villages land
+    /// Innermost-first tab cycle (ConsoleHut's Main Windows, else ancestor
+    /// Tab/Tile-Hut). Stubbed until Main Windows/Huts land
     /// (Phase 4/6).
     TabNext,
     TabPrev,
-    /// Wrap the focused Village with a sibling into a new Tab/Tile-Village.
-    /// Stubbed until the Village management layer lands (Phase 6).
+    /// Wrap the focused Hut with a sibling into a new Tab/Tile-Hut.
+    /// Stubbed until the Hut management layer lands (Phase 6).
     WrapTab,
     WrapTile,
     /// Close the focused client window. Implemented now — doesn't depend
