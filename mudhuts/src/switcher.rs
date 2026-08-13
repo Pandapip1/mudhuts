@@ -7,7 +7,6 @@
 //! size/location it's given regardless of the texture's native size.
 
 use smithay::backend::renderer::{Renderer, Texture};
-use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
@@ -60,7 +59,7 @@ pub fn build(stack: &HutStack, output_size: (i32, i32), renderer: &GlesRenderer)
                 texture.height() as f64,
             )));
             let element = TextureRenderElement::from_static_texture(
-                Id::new(),
+                hut.thumbnail_id.clone(),
                 renderer.context_id(),
                 (x as f64, y as f64),
                 texture,
@@ -84,7 +83,7 @@ pub fn build(stack: &HutStack, output_size: (i32, i32), renderer: &GlesRenderer)
                 )),
             );
             let highlight = SolidColorRenderElement::new(
-                Id::new(),
+                hut.thumbnail_highlight_id.clone(),
                 geometry,
                 smithay::backend::renderer::utils::CommitCounter::default(),
                 [0.3, 0.6, 1.0, 1.0],
@@ -95,7 +94,7 @@ pub fn build(stack: &HutStack, output_size: (i32, i32), renderer: &GlesRenderer)
     }
 
     let panel = SolidColorRenderElement::new(
-        Id::new(),
+        stack.panel_id(),
         Rectangle::<i32, Physical>::new(
             Point::from((panel_x, panel_y)),
             Size::from((panel_w, panel_h)),

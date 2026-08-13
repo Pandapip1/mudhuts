@@ -52,6 +52,22 @@ pub struct Hut {
     /// frames (matters for the compositor's outer damage tracking, which
     /// compares elements by id between frames).
     pub element_id: Id,
+    /// Stable identities for this Hut's own "Terminal" tab in `chrome.rs`
+    /// (its text label and background) — like `element_id`, these must
+    /// stay the same across frames rather than being freshly generated
+    /// each call, or the outer damage tracker sees a "new" element every
+    /// frame instead of recognizing it as the same one, which a
+    /// multi-buffer-swapchain-aware tracker (`DrmCompositor`, used by
+    /// the real udev/DRM backend) can handle very differently — and much
+    /// worse — than a simpler single-buffer one (`OutputDamageTracker`,
+    /// used only by the winit backend, which is why this went unnoticed
+    /// there).
+    pub terminal_tab_text_id: Id,
+    pub terminal_tab_bg_id: Id,
+    /// Stable identities for this Hut's own thumbnail/highlight in the
+    /// Alt-Tab preview popup (`switcher.rs`) — same reasoning as above.
+    pub thumbnail_id: Id,
+    pub thumbnail_highlight_id: Id,
 
     /// Client toplevels belonging to this Hut (see the plan's Phase 4
     /// notes on PID-ancestry assignment), tab-ordered, plus whatever's
@@ -110,6 +126,10 @@ impl Hut {
                 last_texture: None,
                 pixel_size,
                 element_id: Id::new(),
+                terminal_tab_text_id: Id::new(),
+                terminal_tab_bg_id: Id::new(),
+                thumbnail_id: Id::new(),
+                thumbnail_highlight_id: Id::new(),
                 label_renderer: None,
                 main_windows: Vec::new(),
                 active_main_window: 0,

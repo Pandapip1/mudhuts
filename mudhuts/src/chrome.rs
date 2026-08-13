@@ -6,7 +6,6 @@
 //! too).
 
 use smithay::backend::renderer::Renderer;
-use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
@@ -91,6 +90,16 @@ pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer) -> Vec<Element> {
     let mut labels = vec!["Terminal".to_string()];
     labels.extend(hut.main_windows().iter().map(|entry| window_title(&entry.window)));
 
+    // Stable per-tab element ids, matching each label 1:1 — index 0 is
+    // always the "Terminal" tab (`Hut`'s own cached ids), the rest follow
+    // `hut.main_windows()`'s order. Must stay stable across frames (not
+    // freshly generated per call) or the outer damage tracker sees a "new"
+    // element every frame instead of recognizing it as the same one.
+    let mut text_ids = vec![hut.terminal_tab_text_id.clone()];
+    let mut bg_ids = vec![hut.terminal_tab_bg_id.clone()];
+    text_ids.extend(hut.main_windows().iter().map(|entry| entry.tab_text_id.clone()));
+    bg_ids.extend(hut.main_windows().iter().map(|entry| entry.tab_bg_id.clone()));
+
     let cell_w = hut.glyphs.cell_width().max(1);
     let cell_h = hut.glyphs.cell_height().max(1) as i32;
     let tab_h = cell_h + TAB_PADDING * 2;
@@ -110,7 +119,7 @@ pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer) -> Vec<Element> {
         match hut.render_label(renderer, label, fg, bg) {
             Ok(texture) => {
                 let text = TextureRenderElement::from_static_texture(
-                    Id::new(),
+                    text_ids[i].clone(),
                     renderer.context_id(),
                     ((x + TAB_PADDING) as f64, TAB_PADDING as f64),
                     texture,
@@ -128,7 +137,7 @@ pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer) -> Vec<Element> {
         }
 
         let background = SolidColorRenderElement::new(
-            Id::new(),
+            bg_ids[i].clone(),
             Rectangle::<i32, Physical>::new(Point::from((x, 0)), Size::from((tab_w, tab_h))),
             CommitCounter::default(),
             to_color32f(bg),

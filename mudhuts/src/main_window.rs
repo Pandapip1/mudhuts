@@ -1,6 +1,7 @@
 //! A Main Window and the Sub-Windows/Alerts tagged as belonging to it —
 //! see the plan's Phase 5 notes and the Nomenclature table.
 
+use smithay::backend::renderer::element::Id;
 use smithay::desktop::Window;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point};
@@ -84,6 +85,13 @@ pub struct MainWindowEntry {
     pub window: Window,
     pub sub_windows: Vec<SubWindow>,
     pub alerts: Vec<Alert>,
+    /// Stable identities for this Main Window's tab in `chrome.rs`'s tab
+    /// strip (its text label and background) — created once here and
+    /// reused across every frame's `build()` call, matching `Hut::element_id`'s
+    /// pattern; see `Hut::terminal_tab_text_id`'s doc comment for why a
+    /// fresh `Id::new()` per frame is a real correctness bug, not cosmetic.
+    pub tab_text_id: Id,
+    pub tab_bg_id: Id,
 }
 
 impl MainWindowEntry {
@@ -92,6 +100,8 @@ impl MainWindowEntry {
             window,
             sub_windows: Vec::new(),
             alerts: Vec::new(),
+            tab_text_id: Id::new(),
+            tab_bg_id: Id::new(),
         }
     }
 

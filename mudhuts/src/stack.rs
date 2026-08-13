@@ -11,6 +11,7 @@
 //! behind (in either direction) is discarded rather than kept around as a
 //! dead entry.
 
+use smithay::backend::renderer::element::Id;
 use smithay::reexports::calloop::LoopHandle;
 use smithay::reexports::calloop::channel::{self, Channel};
 
@@ -28,6 +29,12 @@ pub struct HutStack {
     /// `current`, which doesn't change until [`Self::commit_preview`] —
     /// the visible/focused Hut stays frozen for the whole session.
     preview: Option<usize>,
+    /// Stable identity for `switcher.rs`'s single popup background panel
+    /// element — created once here and reused across every frame's
+    /// `build()` call, matching `Hut::element_id`'s pattern (a fresh
+    /// `Id::new()` per frame breaks the outer damage tracker's ability to
+    /// recognize it as the same element between frames).
+    panel_id: Id,
     loop_handle: LoopHandle<'static, State>,
     /// Environment applied to every spawned Hut's shell (currently just
     /// `WAYLAND_DISPLAY`, pointing it at mudhuts' own socket) — see
@@ -49,6 +56,7 @@ impl HutStack {
             huts: vec![first],
             current: 0,
             preview: None,
+            panel_id: Id::new(),
             loop_handle,
             extra_env,
         };
@@ -174,6 +182,12 @@ impl HutStack {
     /// if a session is open, else whatever's focused.
     pub fn preview_index(&self) -> usize {
         self.preview.unwrap_or(self.current)
+    }
+
+    /// Stable identity for the popup's single background panel element —
+    /// see this struct's `panel_id` field doc comment.
+    pub fn panel_id(&self) -> Id {
+        self.panel_id.clone()
     }
 
     /// All Huts in Stack order, for the popup renderer.
