@@ -27,7 +27,7 @@ use mudhuts_term::TermEvent;
 use crate::State;
 use crate::console_hut::ConsoleHut;
 use crate::hut::{Axis, Direction, Hut};
-use crate::redraw::RedrawHandle;
+use crate::redraw::{Redrawable, RedrawHandle};
 
 pub struct MruStackHut {
     huts: Vec<Hut>,
@@ -213,6 +213,14 @@ impl MruStackHut {
         let (hut, events) = ConsoleHut::spawn(self.extra_env.clone(), self.scale)?;
         let id = hut.id;
         self.huts[self.current].wrap_focused(|old| Hut::wrap_tab(Hut::Console(Box::new(hut)), old));
+        // Composable Hut hierarchy RFC migration step 4: wires the fresh
+        // Tab-Hut (and every other node in this top-level entry, harmlessly
+        // re-attaching what already had it) up to this Stack's own
+        // `RedrawHandle`, so `TabbedHut::set_active`/`TileHut::set_active`
+        // can request a redraw on their own from then on — see
+        // `Hut::attach_redraw_handle`'s doc comment.
+        self.huts[self.current].attach_redraw_handle(self.redraw.clone());
+        self.redraw.mark_dirty();
         self.insert_channel(id, events)
     }
 
@@ -224,6 +232,9 @@ impl MruStackHut {
         let id = hut.id;
         self.huts[self.current]
             .wrap_focused(|old| Hut::wrap_tile(Hut::Console(Box::new(hut)), old, Axis::Horizontal));
+        // See `Self::wrap_tab`'s matching comment above.
+        self.huts[self.current].attach_redraw_handle(self.redraw.clone());
+        self.redraw.mark_dirty();
         self.insert_channel(id, events)
     }
 

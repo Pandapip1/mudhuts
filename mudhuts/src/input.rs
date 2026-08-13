@@ -302,10 +302,12 @@ impl State {
             }) else {
                 return false;
             };
-            tile.active = i;
+            // `set_active` requests its own redraw (composable Hut
+            // hierarchy RFC migration step 4) — no `request_redraw()`
+            // needed here.
+            tile.set_active(i);
             self.sync_visible_main_window();
             self.sync_keyboard_focus_to_view();
-            self.request_redraw();
             return true;
         }
 
@@ -321,9 +323,11 @@ impl State {
             cell_h,
             scale,
         ) {
+            // Same as the Tile-pane branch above — `handle_click` goes
+            // through `TabbedHut::set_active`, which already requested
+            // the redraw.
             self.sync_visible_main_window();
             self.sync_keyboard_focus_to_view();
-            self.request_redraw();
             return true;
         }
 
@@ -544,36 +548,44 @@ impl State {
             // (`Stack::cycle_innermost` recurses to find that level on
             // its own — a no-op if there isn't one, e.g. a lone ConsoleHut).
             Action::TabNext => {
+                // `cycle_tab` is a ConsoleHut-internal change (not part of
+                // this migration step's Redrawable wiring — see
+                // `hut::Hut::attach_redraw_handle`'s doc comment), so it
+                // still needs an explicit redraw; `cycle_innermost`
+                // requests its own via `TabbedHut`/`TileHut::set_active`
+                // whenever it actually changes anything, so no
+                // unconditional call is needed for that branch.
                 if self.stack.focused().main_window_count() >= 2 {
                     self.stack.focused_mut().cycle_tab(true);
+                    self.request_redraw();
                 } else {
                     self.stack.cycle_innermost(crate::hut::Direction::Next);
                 }
                 self.sync_visible_main_window();
-                self.request_redraw();
             }
             Action::TabPrev => {
                 if self.stack.focused().main_window_count() >= 2 {
                     self.stack.focused_mut().cycle_tab(false);
+                    self.request_redraw();
                 } else {
                     self.stack.cycle_innermost(crate::hut::Direction::Prev);
                 }
                 self.sync_visible_main_window();
-                self.request_redraw();
             }
             Action::WrapTab => {
+                // `Stack::wrap_tab` already requests its own redraw
+                // (composable Hut hierarchy RFC migration step 4) — no
+                // `request_redraw()` needed here.
                 if let Err(err) = self.stack.wrap_tab() {
                     tracing::error!("failed to spawn a new ConsoleHut for wrap-tab: {err}");
                 }
                 self.sync_visible_main_window();
-                self.request_redraw();
             }
             Action::WrapTile => {
                 if let Err(err) = self.stack.wrap_tile() {
                     tracing::error!("failed to spawn a new ConsoleHut for wrap-tile: {err}");
                 }
                 self.sync_visible_main_window();
-                self.request_redraw();
             }
             Action::CopySelection => {
                 // Deliberately separate from the primary-selection commit

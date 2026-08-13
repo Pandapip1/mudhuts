@@ -133,7 +133,7 @@ pub fn handle_click(
     let point = Point::from(pos);
     for TabRect { index: i, rect } in level_layout(&tab.children, y, cell_w, cell_h, scale) {
         if rect.contains(point) {
-            tab.active = i;
+            tab.set_active(i);
             return true;
         }
     }

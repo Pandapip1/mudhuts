@@ -27,6 +27,7 @@
 use smithay::backend::renderer::element::Id;
 
 use crate::console_hut::ConsoleHut;
+use crate::redraw::{Redrawable, RedrawHandle};
 use crate::render::{ChangeTracker, LabelCache};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +75,29 @@ pub struct TabbedHut {
     /// when its active/inactive state flips (see `render::ChangeTracker`'s
     /// doc comment).
     pub(crate) bg_tracker: Vec<ChangeTracker<bool>>,
+    /// Composable Hut hierarchy RFC migration step 4: set via
+    /// [`Hut::attach_redraw_handle`] (recursively, from
+    /// `stack::MruStackHut::wrap_tab`/`wrap_tile`) — [`Self::set_active`]
+    /// calls `mark_dirty()` on it itself, so nothing that changes which
+    /// child tab is active can forget to request a redraw. `None` only
+    /// momentarily, for a freshly-constructed node before that attach call
+    /// runs (see `Hut::wrap_focused`'s placeholder).
+    redraw: Option<RedrawHandle>,
+}
+
+impl TabbedHut {
+    /// Switch which child is active, requesting a redraw — the one place
+    /// this should ever be set from outside `hut.rs`, so the redraw can't
+    /// be forgotten (see [`Self::redraw`]'s doc comment). Internal
+    /// bookkeeping (`remove_child_hut`'s clamp on removal) still writes
+    /// `active` directly — nothing to redraw differently there, since the
+    /// element being removed is already forcing a redraw of its own.
+    pub fn set_active(&mut self, index: usize) {
+        self.active = index;
+        if let Some(redraw) = &self.redraw {
+            redraw.mark_dirty();
+        }
+    }
 }
 
 pub struct TileHut {
@@ -100,6 +124,20 @@ pub struct TileHut {
     /// single frame needs its own identity, or the damage tracker can't
     /// tell the 4 strips apart.
     pub(crate) highlight_ids: [Id; 4],
+    /// See [`TabbedHut::redraw`]'s doc comment — same purpose, for
+    /// [`Self::set_active`] (which pane has keyboard focus).
+    redraw: Option<RedrawHandle>,
+}
+
+impl TileHut {
+    /// See [`TabbedHut::set_active`] — same purpose, for which pane has
+    /// keyboard focus.
+    pub fn set_active(&mut self, index: usize) {
+        self.active = index;
+        if let Some(redraw) = &self.redraw {
+            redraw.mark_dirty();
+        }
+    }
 }
 
 fn wrapping_step(len: usize, active: usize, dir: Direction) -> usize {
@@ -119,6 +157,7 @@ impl Hut {
             label_cache: vec![LabelCache::new(), LabelCache::new()],
             tab_ids: vec![(Id::new(), Id::new()), (Id::new(), Id::new())],
             bg_tracker: vec![ChangeTracker::new(), ChangeTracker::new()],
+            redraw: None,
         })
     }
 
@@ -131,6 +170,7 @@ impl Hut {
             children: vec![(other, 0.5), (current, 0.5)],
             active: 1,
             highlight_ids: [Id::new(), Id::new(), Id::new(), Id::new()],
+            redraw: None,
         })
     }
 
@@ -161,6 +201,7 @@ impl Hut {
                 label_cache: Vec::new(),
                 tab_ids: Vec::new(),
                 bg_tracker: Vec::new(),
+                redraw: None,
             });
             let old = std::mem::replace(self, placeholder);
             *self = make(old);
@@ -365,7 +406,7 @@ impl Hut {
                 if tab.children.len() < 2 {
                     return false;
                 }
-                tab.active = wrapping_step(tab.children.len(), tab.active, dir);
+                tab.set_active(wrapping_step(tab.children.len(), tab.active, dir));
                 true
             }
             Hut::Tile(tile) => {
@@ -375,8 +416,35 @@ impl Hut {
                 if tile.children.len() < 2 {
                     return false;
                 }
-                tile.active = wrapping_step(tile.children.len(), tile.active, dir);
+                tile.set_active(wrapping_step(tile.children.len(), tile.active, dir));
                 true
+            }
+        }
+    }
+}
+
+impl Redrawable for Hut {
+    /// Recurses into every descendant, not just this node — a Tab/Tile-Hut
+    /// might contain other Tab/Tile-Huts nested arbitrarily deep (see the
+    /// module doc's v1 scope note), and every one of them needs the same
+    /// handle so [`TabbedHut::set_active`]/[`TileHut::set_active`] can mark
+    /// a redraw regardless of how deep the click/cycle that changed them
+    /// was. A no-op for a bare `Console` leaf — `ConsoleHut` isn't part of
+    /// this migration step (see the RFC's step 4 notes).
+    fn attach_redraw_handle(&mut self, handle: RedrawHandle) {
+        match self {
+            Hut::Console(_) => {}
+            Hut::Tab(tab) => {
+                tab.redraw = Some(handle.clone());
+                for child in &mut tab.children {
+                    child.attach_redraw_handle(handle.clone());
+                }
+            }
+            Hut::Tile(tile) => {
+                tile.redraw = Some(handle.clone());
+                for (child, _) in &mut tile.children {
+                    child.attach_redraw_handle(handle.clone());
+                }
             }
         }
     }
