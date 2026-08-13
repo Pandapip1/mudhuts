@@ -4,6 +4,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::winit::WinitGraphicsBackend;
 use smithay::desktop::{PopupManager, Space, Window};
 use smithay::input::pointer::CursorImageStatus;
 use smithay::input::{Seat, SeatState};
@@ -17,6 +18,8 @@ use smithay::utils::{Logical, Point};
 use smithay::wayland::compositor::{CompositorClientState, CompositorState};
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
 use smithay::wayland::foreign_toplevel_list::ForeignToplevelListState;
+use smithay::wayland::image_capture_source::{ImageCaptureSourceState, OutputCaptureSourceState};
+use smithay::wayland::image_copy_capture::{ImageCopyCaptureState, Session};
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::shell::xdg::XdgShellState;
@@ -113,6 +116,37 @@ pub struct State {
     /// attempt the import; `State` doesn't otherwise have a renderer of
     /// its own; that's normally backend-private state.
     pub dmabuf_renderer: Option<Rc<RefCell<GlesRenderer>>>,
+    /// Mirrors `dmabuf_renderer` above, but for the winit backend: nothing
+    /// under `winit_backend.rs` otherwise stores a renderer/backend handle
+    /// reachable from a Wayland `Dispatch` callback (the renderer there
+    /// normally only exists transiently inside `backend.bind()`'s scope,
+    /// inside the redraw closure) — needed because screenshot capture
+    /// (`handlers/capture.rs`) is client-pull-driven, firing from a
+    /// `Dispatch` callback rather than tied to either backend's own redraw
+    /// tick. Only ever one of this and `dmabuf_renderer` is set, depending
+    /// on which backend actually started.
+    pub winit_backend: Option<Rc<RefCell<WinitGraphicsBackend<GlesRenderer>>>>,
+
+    /// `ext-image-capture-source-v1` core state (shared by every source
+    /// type; see `handlers/capture.rs`'s module doc).
+    pub image_capture_source_state: ImageCaptureSourceState,
+    /// `ext-output-image-capture-source-v1` — lets a client turn a
+    /// `wl_output` into an opaque capture source. No toplevel/region
+    /// capture source in v1 (see `handlers/capture.rs`'s module doc).
+    pub output_capture_source_state: OutputCaptureSourceState,
+    /// `ext-image-copy-capture-v1` — the actual screenshot protocol; see
+    /// `handlers/capture.rs`.
+    pub image_copy_capture_state: ImageCopyCaptureState,
+    /// Owned capture [`Session`]s, kept alive here for as long as their
+    /// client keeps them open — `Session`'s `Drop` impl immediately sends
+    /// `stopped()` and fails every pending frame, so dropping one before
+    /// the client is done would look exactly like a spurious capture
+    /// failure. Entries for destroyed sessions are removed by
+    /// `ImageCopyCaptureHandler::session_destroyed`; `ImageCopyCaptureState`'s
+    /// own separate internal tracking Vecs need a periodic `.cleanup()`
+    /// call instead (both backends' redraw ticks do this already, next to
+    /// `state.popups.cleanup()`).
+    pub image_copy_sessions: Vec<Session>,
 
     /// `ext_foreign_toplevel_list_v1` — advertises every Main Window to
     /// any client that binds it (panels, taskbars, ...), and gives each
@@ -166,6 +200,9 @@ impl State {
             smithay::wayland::GlobalData,
         );
         let foreign_toplevel_list_state = ForeignToplevelListState::new::<Self>(&dh);
+        let image_capture_source_state = ImageCaptureSourceState::new();
+        let output_capture_source_state = OutputCaptureSourceState::new::<Self>(&dh);
+        let image_copy_capture_state = ImageCopyCaptureState::new::<Self>(&dh);
         let authority_token = {
             use rand::distr::{Alphanumeric, SampleString};
             Alphanumeric.sample_string(&mut rand::rng(), 32)
@@ -207,6 +244,11 @@ impl State {
             dmabuf_state: DmabufState::new(),
             dmabuf_global: None,
             dmabuf_renderer: None,
+            winit_backend: None,
+            image_capture_source_state,
+            output_capture_source_state,
+            image_copy_capture_state,
+            image_copy_sessions: Vec::new(),
             foreign_toplevel_list_state,
             authority_token,
             redraw_ping,

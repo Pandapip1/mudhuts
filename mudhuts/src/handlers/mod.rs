@@ -1,3 +1,4 @@
+pub(crate) mod capture;
 mod compositor;
 pub(crate) mod shell;
 pub(crate) mod xdg_shell;
