@@ -1,5 +1,6 @@
 mod compositor;
 pub(crate) mod layer_shell;
+mod session_lock;
 pub(crate) mod shell;
 pub(crate) mod xdg_shell;
 

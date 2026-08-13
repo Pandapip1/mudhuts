@@ -2,7 +2,7 @@ use smithay::backend::renderer::{Renderer, Texture};
 use smithay::backend::renderer::element::AsRenderElements;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
-use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
+use smithay::backend::renderer::element::surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree};
 use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::utils::{CommitCounter, DamageBag, DamageSnapshot};
@@ -189,6 +189,59 @@ fn layer_elements(
     (render(upper), render(lower))
 }
 
+/// Everything mudhuts draws while `state.locked` is set (see
+/// `handlers/session_lock.rs`'s module doc) — the *only* thing drawn in
+/// that state, replacing every other branch of [`build_frame_elements`]
+/// rather than being layered on top of it, since none of that (Alt-Tab
+/// popup, chrome, terminal/window content) should be visible, or even
+/// get a fresh texture, while the session is locked.
+///
+/// The locking client's own [`LockSurface`](smithay::wayland::session_lock::LockSurface),
+/// once mapped and alive, wins; otherwise (nothing mapped yet, or a
+/// stale one that's gone) a plain opaque rectangle covering the whole
+/// output, so the screen actually goes blank the instant `state.locked`
+/// flips true rather than leaving the last real frame on screen until
+/// some client gets around to mapping a lock surface — the protocol
+/// requires exactly that blank-or-locked frame to have been presented
+/// before `locked()` can even be sent to the client (see
+/// `handlers/session_lock.rs`'s `lock` doc comment).
+fn lock_screen_elements(
+    state: &State,
+    renderer: &mut GlesRenderer,
+    size: (i32, i32),
+) -> Vec<Element> {
+    if let Some(surface) = &state.lock_surface
+        && surface.alive()
+    {
+        let elems: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = render_elements_from_surface_tree(
+            renderer,
+            surface.wl_surface(),
+            smithay::utils::Point::<i32, smithay::utils::Physical>::from((0, 0)),
+            Scale::from(1.0),
+            1.0,
+            Kind::Unspecified,
+        );
+        if !elems.is_empty() {
+            return elems
+                .into_iter()
+                .map(|e| Element::from(SpaceRenderElements::Surface(e)))
+                .collect();
+        }
+    }
+
+    let background = SolidColorRenderElement::new(
+        state.lock_backdrop_id.clone(),
+        Rectangle::<i32, smithay::utils::Physical>::new(
+            smithay::utils::Point::from((0, 0)),
+            smithay::utils::Size::from(size),
+        ),
+        CommitCounter::default(),
+        [0.0, 0.0, 0.0, 1.0],
+        Kind::Unspecified,
+    );
+    vec![Element::from(background)]
+}
+
 /// Build one frame's worth of render elements (Alt-Tab popup, tab-strip
 /// chrome, docked-handle chrome, then either the focused Hut's terminal
 /// texture or its visible Main Window/Sub-Windows/Alerts via `state.space`)
@@ -203,6 +256,16 @@ pub fn build_frame_elements(
     output: &Output,
     size: (i32, i32),
 ) -> Vec<OutputRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> {
+    // Checked before every other branch below (switcher, Village chrome,
+    // terminal/window content): a locked session must render *nothing*
+    // else, not even layered underneath a lock surface — see
+    // `handlers/session_lock.rs`'s module doc on why the protocol
+    // requires this before it can even tell the client the lock
+    // succeeded.
+    if state.locked {
+        return lock_screen_elements(state, renderer, size);
+    }
+
     let show_terminal = state.showing_terminal_effective();
     let mut elements = Vec::new();
 

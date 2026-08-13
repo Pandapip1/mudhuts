@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::desktop::{PopupManager, Space, Window, WindowSurfaceType, layer_map_for_output};
 use smithay::input::pointer::CursorImageStatus;
@@ -10,6 +11,7 @@ use smithay::input::{Seat, SeatState};
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::ping::Ping;
 use smithay::reexports::calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction};
+use smithay::reexports::wayland_protocols::ext::session_lock::v1::server::ext_session_lock_v1::ExtSessionLockV1;
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Display, DisplayHandle};
@@ -19,6 +21,7 @@ use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
 use smithay::wayland::foreign_toplevel_list::ForeignToplevelListState;
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
+use smithay::wayland::session_lock::{LockSurface, SessionLockManagerState, SessionLocker};
 use smithay::wayland::shell::wlr_layer::{Layer as WlrLayer, WlrLayerShellState};
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
@@ -128,6 +131,49 @@ pub struct State {
     /// in one of 4 layers (background/bottom/top/overlay) relative to
     /// normal content. See `handlers/layer_shell.rs`'s module doc.
     pub layer_shell_state: WlrLayerShellState,
+    /// `ext-session-lock-v1` — lets a trusted screen-locker client blank
+    /// the screen and take over all input until it explicitly unlocks
+    /// (see `handlers/session_lock.rs`'s module doc for the full
+    /// lifecycle). Mirrors `layer_shell_state`'s pattern: the manager
+    /// global lives here, everything else the protocol needs is the
+    /// handful of fields immediately below.
+    pub session_lock_state: SessionLockManagerState,
+    /// Whether a client currently holds the session lock — checked ahead
+    /// of *everything* else in `input.rs`'s `process_input_event` (a
+    /// locked session wins even over an `exclusive` layer-shell surface)
+    /// and in `render.rs`'s `build_frame_elements` (nothing else is drawn
+    /// while this is set). Left `true` if the locking client dies without
+    /// unlocking — see `handlers/session_lock.rs`'s `unlock` doc comment
+    /// on why that's the protocol-correct default, not a bug.
+    pub locked: bool,
+    /// The identity of whichever `ext_session_lock_v1` this compositor has
+    /// actually accepted (as opposed to a racing second client's, which
+    /// gets its confirmation dropped — see `handlers/session_lock.rs`'s
+    /// `lock`) — kept independently of `pending_lock` (which is consumed
+    /// once confirmed) so a late `new_surface` call can still be checked
+    /// against it for the lock's entire lifetime, not just until the
+    /// first frame confirms it.
+    pub accepted_lock: Option<ExtSessionLockV1>,
+    /// This output's lock surface, if the locking client has mapped one —
+    /// single-output throughout (like everything else here), so a plain
+    /// `Option` suffices rather than a per-output map. `None` means
+    /// "locked, but nothing to show yet" — `render.rs`'s
+    /// `build_frame_elements` still blanks the screen either way.
+    pub lock_surface: Option<LockSurface>,
+    /// Held between accepting a lock request and actually confirming it —
+    /// see `handlers/session_lock.rs`'s `lock` doc comment for why that
+    /// confirmation can't happen synchronously, and `udev_backend.rs`'s
+    /// `render_surface`/`winit_backend.rs`'s redraw handler for where it
+    /// finally gets taken and confirmed.
+    pub pending_lock: Option<SessionLocker>,
+    /// Stable identity for the plain blank backdrop `render.rs`'s
+    /// `build_frame_elements` draws while locked and no lock surface is
+    /// mapped yet (or one just went stale) — kept here rather than
+    /// minted fresh every frame so Smithay's damage tracking sees the
+    /// same element across frames instead of "a brand new one" each time
+    /// (mirrors why `village.rs`'s `highlight_ids` are stored, not
+    /// generated per-frame).
+    pub lock_backdrop_id: Id,
     /// A one-time secret, generated fresh each run, that a helper program
     /// mudhuts itself spawns (see `main.rs`'s `--authority-helper`) must
     /// present via `mudhuts_shell_authority_v1.authenticate` before any of
@@ -174,6 +220,12 @@ impl State {
         );
         let foreign_toplevel_list_state = ForeignToplevelListState::new::<Self>(&dh);
         let layer_shell_state = WlrLayerShellState::new::<Self>(&dh);
+        // `|_| true`: every client is allowed to see the global, matching
+        // this compositor's general permissiveness elsewhere (there's no
+        // broader client-trust/allowlist model here to hook a narrower
+        // filter into — see `handlers/shell.rs`'s module doc for the one
+        // place mudhuts *does* have one, which is unrelated to this).
+        let session_lock_state = SessionLockManagerState::new::<Self, _>(&dh, |_| true);
         let authority_token = {
             use rand::distr::{Alphanumeric, SampleString};
             Alphanumeric.sample_string(&mut rand::rng(), 32)
@@ -217,6 +269,12 @@ impl State {
             dmabuf_renderer: None,
             foreign_toplevel_list_state,
             layer_shell_state,
+            session_lock_state,
+            locked: false,
+            accepted_lock: None,
+            lock_surface: None,
+            pending_lock: None,
+            lock_backdrop_id: Id::new(),
             authority_token,
             redraw_ping,
         })

@@ -146,9 +146,26 @@ pub fn init_winit(
 
                     if let Some(result) = render_result
                         && let Some(damage) = result.damage
-                        && let Err(err) = backend.submit(Some(damage))
                     {
-                        tracing::warn!("failed to submit buffer: {err}");
+                        match backend.submit(Some(damage)) {
+                            Ok(()) => {
+                                // Only now — a locked frame has actually
+                                // been built (via `render.rs`'s early-
+                                // return guard) and successfully submitted
+                                // for real presentation — is it safe to
+                                // tell the locking client its lock
+                                // succeeded. See
+                                // `handlers/session_lock.rs`'s `lock` doc
+                                // comment for why this can't happen any
+                                // earlier.
+                                if state.locked
+                                    && let Some(confirmation) = state.pending_lock.take()
+                                {
+                                    confirmation.lock();
+                                }
+                            }
+                            Err(err) => tracing::warn!("failed to submit buffer: {err}"),
+                        }
                     }
 
                     state.space.elements().for_each(|window| {
