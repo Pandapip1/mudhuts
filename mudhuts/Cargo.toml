@@ -7,6 +7,7 @@ version.workspace = true
 mudhuts-term = { path = "../mudhuts-term" }
 mudhuts-protocols = { path = "../mudhuts-protocols", features = ["server"] }
 alacritty_terminal = "0.26"
+rand = "0.10"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 tracing.workspace = true

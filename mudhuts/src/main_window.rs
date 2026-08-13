@@ -119,10 +119,21 @@ pub struct MainWindowEntry {
     /// again after the first frame it's drawn.
     pub(crate) tab_text_cache: LabelCache<(String, bool)>,
     tab_bg_tracker: ChangeTracker<bool>,
+    /// This Main Window's `ext_foreign_toplevel_list_v1` handle — gives it
+    /// a stable identifier string a trusted helper program can use to
+    /// tag it via `mudhuts_shell_authority_v1` without needing a direct
+    /// object reference (see `handlers/shell.rs`'s module doc). Dropping
+    /// this automatically sends `closed` to any client watching it
+    /// (`ForeignToplevelHandle`'s own `Drop` impl) — nothing extra needed
+    /// when a Main Window's entry is removed.
+    pub foreign_handle: smithay::wayland::foreign_toplevel_list::ForeignToplevelHandle,
 }
 
 impl MainWindowEntry {
-    pub fn new(window: Window) -> Self {
+    pub fn new(
+        window: Window,
+        foreign_handle: smithay::wayland::foreign_toplevel_list::ForeignToplevelHandle,
+    ) -> Self {
         Self {
             window,
             sub_windows: Vec::new(),
@@ -131,6 +142,7 @@ impl MainWindowEntry {
             tab_bg_id: Id::new(),
             tab_text_cache: LabelCache::new(),
             tab_bg_tracker: ChangeTracker::new(),
+            foreign_handle,
         }
     }
 

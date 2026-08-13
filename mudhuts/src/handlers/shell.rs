@@ -4,12 +4,31 @@
 //! `delegate_*!` macro for a custom protocol, so this plugs straight into
 //! the generic blanket impl `smithay::delegate_dispatch2!(State)` already
 //! invoked once in `handlers/mod.rs`.
+//!
+//! Phase 5b's `mudhuts_shell_authority_v1` lives here too: a *privileged*
+//! sibling of `mudhuts_window_role_v1` for a trusted helper program to tag
+//! *other* clients' toplevels (ones that don't speak `mudhuts_shell_v1`
+//! natively) by rule — app_id/title matching, entirely the helper's own
+//! business, not this protocol's. Trust model: any client can bind
+//! `get_authority`, but every request on the resulting object except
+//! `authenticate` is refused until it presents the one-time secret
+//! `State::authority_token` mudhuts generated at startup and handed only
+//! to the one helper process it itself spawned (`main.rs`'s
+//! `--authority-helper`, via the `MUDHUTS_AUTHORITY_TOKEN` env var of
+//! that one child) — an unrelated client binding the interface just gets
+//! every request refused, since it can't know the token. Toplevels are
+//! named by `ext_foreign_toplevel_list_v1` identifier strings rather than
+//! direct object references, since the helper doesn't own them the way a
+//! natively-speaking client owns its own toplevel.
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::reexports::wayland_server::{Client, DataInit, DisplayHandle, New};
+use smithay::reexports::wayland_server::{Client, DataInit, DisplayHandle, New, Resource};
 use smithay::wayland::{Dispatch2, GlobalData, GlobalDispatch2};
 
+use mudhuts_protocols::server::mudhuts_shell_authority_v1::{self, Error as AuthorityError, MudhutsShellAuthorityV1};
 use mudhuts_protocols::server::mudhuts_shell_v1::{self, MudhutsShellV1};
 use mudhuts_protocols::server::mudhuts_window_role_v1::{self, MudhutsWindowRoleV1};
 
@@ -39,10 +58,101 @@ impl Dispatch2<MudhutsShellV1, State> for GlobalData {
         _dh: &DisplayHandle,
         data_init: &mut DataInit<'_, State>,
     ) {
-        if let mudhuts_shell_v1::Request::GetWindowRole { id, toplevel } = request {
-            data_init.init(id, WindowRoleUserData { toplevel });
+        match request {
+            mudhuts_shell_v1::Request::GetWindowRole { id, toplevel } => {
+                data_init.init(id, WindowRoleUserData { toplevel });
+            }
+            mudhuts_shell_v1::Request::GetAuthority { id } => {
+                data_init.init(id, AuthorityUserData::default());
+            }
+            _ => {}
         }
     }
+}
+
+/// Whether a `mudhuts_shell_authority_v1` object has successfully
+/// authenticated yet — see this module's doc for the trust model.
+#[derive(Default)]
+struct AuthorityUserData {
+    authenticated: AtomicBool,
+}
+
+impl Dispatch2<MudhutsShellAuthorityV1, State> for AuthorityUserData {
+    fn request(
+        &self,
+        state: &mut State,
+        _client: &Client,
+        resource: &MudhutsShellAuthorityV1,
+        request: mudhuts_shell_authority_v1::Request,
+        _dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, State>,
+    ) {
+        if let mudhuts_shell_authority_v1::Request::Authenticate { token } = request {
+            if token == state.authority_token {
+                self.authenticated.store(true, Ordering::Relaxed);
+            } else {
+                resource.post_error(AuthorityError::BadToken, "wrong token".to_string());
+            }
+            return;
+        }
+
+        if !self.authenticated.load(Ordering::Relaxed) {
+            resource.post_error(
+                AuthorityError::NotAuthenticated,
+                "must authenticate before any other request".to_string(),
+            );
+            return;
+        }
+
+        match request {
+            mudhuts_shell_authority_v1::Request::Authenticate { .. } => unreachable!("handled above"),
+            mudhuts_shell_authority_v1::Request::SetMain { identifier } => {
+                let Some(surface) = resolve_by_identifier(state, &identifier) else {
+                    resource.post_error(AuthorityError::UnknownToplevel, format!("no Main Window with identifier {identifier:?}"));
+                    return;
+                };
+                retag(state, &surface, None);
+            }
+            mudhuts_shell_authority_v1::Request::SetSub { identifier, main_identifier } => {
+                let (Some(surface), Some(main_surface)) = (
+                    resolve_by_identifier(state, &identifier),
+                    resolve_by_identifier(state, &main_identifier),
+                ) else {
+                    resource.post_error(AuthorityError::UnknownToplevel, "identifier or main_identifier not found".to_string());
+                    return;
+                };
+                retag(state, &surface, Some((Role::Sub, main_surface)));
+            }
+            mudhuts_shell_authority_v1::Request::SetAlert { identifier, main_identifier } => {
+                let (Some(surface), Some(main_surface)) = (
+                    resolve_by_identifier(state, &identifier),
+                    resolve_by_identifier(state, &main_identifier),
+                ) else {
+                    resource.post_error(AuthorityError::UnknownToplevel, "identifier or main_identifier not found".to_string());
+                    return;
+                };
+                retag(state, &surface, Some((Role::Alert, main_surface)));
+            }
+            mudhuts_shell_authority_v1::Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+/// Find a current Main Window's surface by its
+/// `ext_foreign_toplevel_list_v1` identifier string — see this module's
+/// doc on why the authority path names toplevels this way rather than by
+/// direct object reference.
+fn resolve_by_identifier(state: &State, identifier: &str) -> Option<WlSurface> {
+    state.stack.all_huts().find_map(|hut| {
+        hut.main_windows().iter().find_map(|entry| {
+            if entry.foreign_handle.identifier() == identifier {
+                entry.window.toplevel().map(|t| t.wl_surface().clone())
+            } else {
+                None
+            }
+        })
+    })
 }
 
 /// Which `xdg_toplevel` a `mudhuts_window_role_v1` object was created for
@@ -128,7 +238,10 @@ fn retag(state: &mut State, tagged_surface: &WlSurface, target: Option<(Role, Wl
         match &target {
             None => {
                 tracing::debug!("mudhuts_window_role_v1: retagged as a bare Main Window");
-                hut.push_main_window(window, true);
+                let foreign_handle = state
+                    .foreign_toplevel_list_state
+                    .new_toplevel::<State>(&crate::chrome::window_title(&window), &crate::chrome::window_app_id(&window));
+                hut.push_main_window(window, true, foreign_handle);
             }
             Some((role, main_surface)) => match hut.find_main_window_mut(main_surface) {
                 Some(entry) => {
@@ -148,7 +261,11 @@ fn retag(state: &mut State, tagged_surface: &WlSurface, target: Option<(Role, Wl
                     tracing::warn!(
                         "mudhuts_window_role_v1: target main window not found in the same Hut, leaving as a bare Main Window"
                     );
-                    hut.push_main_window(window, true);
+                    let foreign_handle = state.foreign_toplevel_list_state.new_toplevel::<State>(
+                        &crate::chrome::window_title(&window),
+                        &crate::chrome::window_app_id(&window),
+                    );
+                    hut.push_main_window(window, true, foreign_handle);
                 }
             },
         }

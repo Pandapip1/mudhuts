@@ -10,6 +10,7 @@ use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
+use smithay::wayland::foreign_toplevel_list::{ForeignToplevelListHandler, ForeignToplevelListState};
 use smithay::wayland::output::OutputHandler;
 use smithay::wayland::pointer_constraints::PointerConstraintsHandler;
 use smithay::wayland::selection::SelectionHandler;
@@ -85,6 +86,18 @@ impl DmabufHandler for State {
                 notifier.failed();
             }
         }
+    }
+}
+
+/// `ext_foreign_toplevel_list_v1` — see `state.rs`'s
+/// `foreign_toplevel_list_state` doc comment. No requests of its own
+/// worth reacting to (it's purely "here's what's open," not
+/// "make/close this") — every actual `ForeignToplevelHandle` is created
+/// directly by `handlers/xdg_shell.rs`'s `new_toplevel`, not from this
+/// trait.
+impl ForeignToplevelListHandler for State {
+    fn foreign_toplevel_list_state(&mut self) -> &mut ForeignToplevelListState {
+        &mut self.foreign_toplevel_list_state
     }
 }
 

@@ -259,8 +259,14 @@ impl Hut {
     /// was looking at (`Self::main_windows`'s `active_main_window` index
     /// changing regardless of the caller's own `should_show_now`
     /// decision was exactly this bug — see `new_toplevel`'s notes).
-    pub fn push_main_window(&mut self, window: Window, make_active: bool) {
-        self.main_windows.push(MainWindowEntry::new(window));
+    pub fn push_main_window(
+        &mut self,
+        window: Window,
+        make_active: bool,
+        foreign_handle: smithay::wayland::foreign_toplevel_list::ForeignToplevelHandle,
+    ) {
+        self.main_windows
+            .push(MainWindowEntry::new(window, foreign_handle));
         if make_active {
             self.active_main_window = self.main_windows.len() - 1;
         }

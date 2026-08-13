@@ -64,6 +64,25 @@ pub(crate) fn window_title(window: &Window) -> String {
     }
 }
 
+/// Read a toplevel's app_id live — unlike [`window_title`], never falls
+/// back to anything else (an empty string if the client never set one,
+/// matching `ext_foreign_toplevel_list_v1`'s own convention for
+/// `app_id`) — for `handlers/xdg_shell.rs`'s `new_toplevel`, which needs
+/// title and app_id as two genuinely separate strings when creating this
+/// Main Window's `ForeignToplevelHandle`.
+pub(crate) fn window_app_id(window: &Window) -> String {
+    let Some(toplevel) = window.toplevel() else {
+        return String::new();
+    };
+    with_states(toplevel.wl_surface(), |states| {
+        states
+            .data_map
+            .get::<XdgToplevelSurfaceData>()
+            .and_then(|data| data.lock().ok().and_then(|guard| guard.app_id.clone()))
+    })
+    .unwrap_or_default()
+}
+
 pub(crate) fn to_color32f(rgb: Rgb) -> [f32; 4] {
     [
         rgb[0] as f32 / 255.0,

@@ -39,7 +39,40 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+/// A helper program to spawn once mudhuts itself is up, and the (already
+/// helper-specific) arguments to launch it with — see `parse_args`.
+struct AuthorityHelper {
+    path: String,
+    args: Vec<String>,
+}
+
+struct Args {
+    tty: bool,
+    authority_helper: Option<AuthorityHelper>,
+}
+
+/// `--tty` (see the plan's Phase 7 notes) and `--authority-helper <path>
+/// [args...]` (Phase 5b — everything after the path is that helper's own
+/// command line, not mudhuts' own, since it needs to parse its own
+/// `--sub`/`--alert` rules; see `handlers/shell.rs`'s module doc for the
+/// trust model this establishes) can both be given, in any order.
+fn parse_args() -> Args {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let tty = args.iter().any(|a| a == "--tty");
+    let authority_helper = args
+        .iter()
+        .position(|a| a == "--authority-helper")
+        .and_then(|i| {
+            let path = args.get(i + 1)?.clone();
+            let helper_args = args.get(i + 2..).map(<[String]>::to_vec).unwrap_or_default();
+            Some(AuthorityHelper { path, args: helper_args })
+        });
+    Args { tty, authority_helper }
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let args = parse_args();
+
     let mut event_loop: EventLoop<'static, State> = EventLoop::try_new()?;
     let display: Display<State> = Display::new()?;
 
@@ -51,7 +84,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // whatever mudhuts itself is nested inside, read when `init_winit`
     // runs below.
     let socket_name = socket.1.to_string_lossy().into_owned();
-    let extra_env = vec![("WAYLAND_DISPLAY".to_string(), socket_name)];
+    let extra_env = vec![("WAYLAND_DISPLAY".to_string(), socket_name.clone())];
     let (hut, term_events) = hut::Hut::spawn(extra_env.clone())?;
 
     let (redraw_ping, redraw_ping_source) = smithay::reexports::calloop::ping::make_ping()?;
@@ -59,11 +92,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let stack = stack::HutStack::new(hut, term_events, loop_handle, extra_env)?;
     let mut state = State::new(&mut event_loop, display, stack, socket, redraw_ping)?;
 
+    if let Some(helper) = &args.authority_helper {
+        // Trust model hinges on this being the *only* process that ever
+        // sees `state.authority_token`: set directly on this one child's
+        // environment, never written to a file, logged, or otherwise
+        // exposed — see `handlers/shell.rs`'s module doc.
+        match std::process::Command::new(&helper.path)
+            .args(&helper.args)
+            .env("WAYLAND_DISPLAY", &socket_name)
+            .env("MUDHUTS_AUTHORITY_TOKEN", &state.authority_token)
+            .spawn()
+        {
+            Ok(_child) => tracing::info!("spawned authority helper {:?}", helper.path),
+            Err(err) => tracing::error!("failed to spawn authority helper {:?}: {err}", helper.path),
+        }
+    }
+
     // Explicit opt-in only — no auto-detection from absent
     // `WAYLAND_DISPLAY`/`DISPLAY`. `--tty` is a real seat/DRM-owning
     // backend with real safety stakes (it can seize DRM master / switch
     // VTs), so it should never activate by surprise.
-    if std::env::args().nth(1).as_deref() == Some("--tty") {
+    if args.tty {
         udev_backend::init_udev(&mut event_loop, &mut state, redraw_ping_source)?;
     } else {
         winit_backend::init_winit(&mut event_loop, &mut state, redraw_ping_source)?;

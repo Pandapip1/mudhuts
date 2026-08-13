@@ -16,6 +16,7 @@ use smithay::reexports::wayland_server::{Display, DisplayHandle};
 use smithay::utils::{Logical, Point};
 use smithay::wayland::compositor::{CompositorClientState, CompositorState};
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
+use smithay::wayland::foreign_toplevel_list::ForeignToplevelListState;
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::shell::xdg::XdgShellState;
@@ -113,6 +114,20 @@ pub struct State {
     /// its own; that's normally backend-private state.
     pub dmabuf_renderer: Option<Rc<RefCell<GlesRenderer>>>,
 
+    /// `ext_foreign_toplevel_list_v1` — advertises every Main Window to
+    /// any client that binds it (panels, taskbars, ...), and gives each
+    /// one a stable identifier string. Phase 5b's `mudhuts_shell_authority_v1`
+    /// piggybacks on that same identifier to let a trusted helper program
+    /// tag *other* clients' toplevels without needing a direct object
+    /// reference to them (see `handlers/shell.rs`).
+    pub foreign_toplevel_list_state: ForeignToplevelListState,
+    /// A one-time secret, generated fresh each run, that a helper program
+    /// mudhuts itself spawns (see `main.rs`'s `--authority-helper`) must
+    /// present via `mudhuts_shell_authority_v1.authenticate` before any of
+    /// its other requests are honored — see `handlers/shell.rs`'s module
+    /// doc for the trust model this establishes.
+    pub authority_token: String,
+
     /// Wakes up the winit backend's redraw handler (see `winit_backend.rs`,
     /// the only place that owns the actual window handle needed to call
     /// its `request_redraw()`) from anywhere else that changes something
@@ -147,9 +162,14 @@ impl State {
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
         let data_device_state = DataDeviceState::new::<Self>(&dh);
         dh.create_global::<Self, mudhuts_protocols::server::mudhuts_shell_v1::MudhutsShellV1, _>(
-            1,
+            2,
             smithay::wayland::GlobalData,
         );
+        let foreign_toplevel_list_state = ForeignToplevelListState::new::<Self>(&dh);
+        let authority_token = {
+            use rand::distr::{Alphanumeric, SampleString};
+            Alphanumeric.sample_string(&mut rand::rng(), 32)
+        };
 
         let mut seat_state = SeatState::new();
         let mut seat: Seat<Self> = seat_state.new_wl_seat(&dh, "mudhuts");
@@ -187,6 +207,8 @@ impl State {
             dmabuf_state: DmabufState::new(),
             dmabuf_global: None,
             dmabuf_renderer: None,
+            foreign_toplevel_list_state,
+            authority_token,
             redraw_ping,
         })
     }

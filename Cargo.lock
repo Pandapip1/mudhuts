@@ -889,6 +889,7 @@ dependencies = [
  "alacritty_terminal",
  "mudhuts-protocols",
  "mudhuts-term",
+ "rand",
  "serde",
  "smithay",
  "smithay-drm-extras",
@@ -897,6 +898,15 @@ dependencies = [
  "tracing-journald",
  "tracing-subscriber",
  "xcursor",
+]
+
+[[package]]
+name = "mudhuts-authority-helper"
+version = "0.1.0"
+dependencies = [
+ "mudhuts-protocols",
+ "wayland-client",
+ "wayland-protocols",
 ]
 
 [[package]]

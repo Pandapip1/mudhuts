@@ -66,8 +66,15 @@ impl XdgShellHandler for State {
             .stack
             .find_mut(owning_hut_id)
             .is_some_and(|hut| hut.main_window_count() == 0);
+        // Advertised via `ext_foreign_toplevel_list_v1` from the moment
+        // it becomes a Main Window — gives it a stable identifier a
+        // trusted helper program can later use to tag it (Phase 5b's
+        // `mudhuts_shell_authority_v1` — see `handlers/shell.rs`).
+        let foreign_handle = self
+            .foreign_toplevel_list_state
+            .new_toplevel::<State>(&crate::chrome::window_title(&window), &crate::chrome::window_app_id(&window));
         if let Some(hut) = self.stack.find_mut(owning_hut_id) {
-            hut.push_main_window(window, was_empty);
+            hut.push_main_window(window, was_empty, foreign_handle);
         }
 
         // Nothing else was showing yet for this Hut specifically, so the
