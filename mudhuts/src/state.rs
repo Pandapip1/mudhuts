@@ -20,6 +20,7 @@ use smithay::wayland::foreign_toplevel_list::ForeignToplevelListState;
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::shell::xdg::XdgShellState;
+use smithay::wayland::shell::xdg::dialog::XdgDialogState;
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::socket::ListeningSocketSource;
 
@@ -49,6 +50,13 @@ pub struct State {
 
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
+    /// `xdg-wm-dialog-v1` — lets a toolkit mark a toplevel as a "dialog"
+    /// (optionally "modal") relative to a parent set via
+    /// `xdg_toplevel.set_parent`, so `handlers/xdg_shell.rs`'s
+    /// `handle_commit` can skip the usual fullscreen hint for it. No
+    /// state of its own beyond the global handle; the actual per-toplevel
+    /// hint lives on `XdgToplevelSurfaceData` (Smithay's own storage).
+    pub xdg_dialog_state: XdgDialogState,
     pub shm_state: ShmState,
     pub output_manager_state: OutputManagerState,
     pub seat_state: SeatState<State>,
@@ -157,6 +165,7 @@ impl State {
 
         let compositor_state = CompositorState::new::<Self>(&dh);
         let xdg_shell_state = XdgShellState::new::<Self>(&dh);
+        let xdg_dialog_state = XdgDialogState::new::<Self>(&dh);
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
         let popups = PopupManager::default();
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
@@ -189,6 +198,7 @@ impl State {
             loop_signal,
             compositor_state,
             xdg_shell_state,
+            xdg_dialog_state,
             shm_state,
             output_manager_state,
             seat_state,
