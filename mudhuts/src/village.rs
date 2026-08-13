@@ -130,6 +130,45 @@ impl Village {
         })
     }
 
+    /// Wrap *in place* whichever leaf `focused_hut`/`focused_hut_mut`
+    /// would reach from here (following each level's `active` index all
+    /// the way down to the actual bare Hut) — `make(old)` replaces just
+    /// that leaf, leaving every sibling and every ancestor container
+    /// completely untouched. This is `wrap_tab`/`wrap_tile`'s whole
+    /// point: pressing wrap-tab while focused on one pane of an existing
+    /// Tile-Village should turn *that pane* into a small Tab-Village,
+    /// not disturb the Tile-Village itself or reach for some unrelated
+    /// top-level Stack entry to combine with (`stack::HutStack::wrap_tab`
+    /// always passes a freshly spawned Hut as one side, never an
+    /// existing entry, for exactly the same reason — see its doc
+    /// comment).
+    ///
+    /// Implementation note: reaching the leaf requires temporarily
+    /// moving it out of `self` to hand to `make` (which needs it by
+    /// value) and then writing the result back — `std::mem::replace`
+    /// needs *some* placeholder value in between, so an empty
+    /// (harmless, momentary) `Village::Tab` stands in for the instant
+    /// between the two assignments; nothing ever observes it.
+    pub fn wrap_focused(&mut self, make: impl FnOnce(Village) -> Village) {
+        if matches!(self, Village::Hut(_)) {
+            let placeholder = Village::Tab(TabVillage {
+                children: Vec::new(),
+                active: 0,
+                label_cache: Vec::new(),
+                tab_ids: Vec::new(),
+                bg_tracker: Vec::new(),
+            });
+            let old = std::mem::replace(self, placeholder);
+            *self = make(old);
+            return;
+        }
+        match self {
+            Village::Tab(tab) => tab.children[tab.active].wrap_focused(make),
+            Village::Tile(tile) => tile.children[tile.active].0.wrap_focused(make),
+            Village::Hut(_) => unreachable!("checked above"),
+        }
+    }
+
     /// Whether this Village should survive being "left behind" when The
     /// Stack moves away from it (see `stack::HutStack`'s `advance_forward`/
     /// `advance_backward`, and the plan's original Phase 3 discard rule).

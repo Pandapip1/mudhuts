@@ -154,65 +154,37 @@ impl HutStack {
         self.villages[self.current].cycle_innermost(dir)
     }
 
-    /// The index to combine `current` with for `wrap_tab`/`wrap_tile` —
-    /// the next entry in Stack order (which, so long as the user's been
-    /// using the preview/commit Alt-Tab flow rather than the instant-
-    /// commit fallback, is exactly the "previous" — second-most-recently-
-    /// used — entry, since `commit_preview` always moves the freshly
-    /// selected one to index 0). `None` with fewer than 2 entries — there's
-    /// nothing to combine with.
-    fn wrap_target(&self) -> Option<usize> {
-        if self.villages.len() < 2 {
-            return None;
-        }
-        Some((self.current + 1) % self.villages.len())
-    }
-
-    /// Group the focused Village with the Stack's previous entry into a
-    /// new Tab-Village, replacing both — a no-op with fewer than 2
-    /// entries. See [`Village::wrap_tab`] for why the result is visually
-    /// unchanged (the just-focused entry stays the active tab).
-    pub fn wrap_tab(&mut self) {
-        let Some(other) = self.wrap_target() else {
-            return;
-        };
-        self.combine(other, Village::wrap_tab);
+    /// Spawn a fresh Hut and wrap it together with whatever's currently
+    /// focused into a new Tab-Village, *in place* — see
+    /// [`Village::wrap_focused`] for why this always reaches all the way
+    /// down to the actual focused Hut (whatever container it's already
+    /// inside, if any) rather than operating on top-level Stack entries:
+    /// wrapping a specific pane of an existing Tile-Village needs to
+    /// replace *just that pane*, leaving the Tile-Village itself and
+    /// every other pane completely untouched. Always creates a new Hut
+    /// rather than merging in some other existing entry — pressing
+    /// wrap-tab/wrap-tile is "make a new thing to put next to what I'm
+    /// looking at," not "combine two things I already have open."
+    /// Commits any open preview session first (see
+    /// `Action::WrapTab`/`WrapTile`'s original doc comment on why —
+    /// `current` doesn't follow a preview session until it's committed).
+    pub fn wrap_tab(&mut self) -> Result<(), String> {
+        self.commit_preview();
+        let (hut, events) = Hut::spawn(self.extra_env.clone())?;
+        let id = hut.id;
+        self.villages[self.current].wrap_focused(|old| Village::wrap_tab(Village::Hut(Box::new(hut)), old));
+        self.insert_channel(id, events)
     }
 
     /// Same as [`Self::wrap_tab`], but into a new (horizontally split)
     /// Tile-Village instead.
-    pub fn wrap_tile(&mut self) {
-        let Some(other) = self.wrap_target() else {
-            return;
-        };
-        self.combine(other, |a, b| Village::wrap_tile(a, b, Axis::Horizontal));
-    }
-
-    /// Remove `current` and `other`, combine them via `make(other,
-    /// current)`, and reinsert the result at whichever of the two indices
-    /// was lower — `current` follows it there. Clears any open preview
-    /// session defensively (wrap-tab/wrap-tile isn't meant to be
-    /// triggered mid-session, but two entries disappearing from under a
-    /// stale preview index would otherwise risk one going out of bounds).
-    fn combine(&mut self, other: usize, make: impl FnOnce(Village, Village) -> Village) {
-        let current = self.current;
-        let (lo, hi) = if current < other {
-            (current, other)
-        } else {
-            (other, current)
-        };
-        // Remove the higher index first so the lower index's position
-        // doesn't shift out from under the second `remove` call.
-        let hi_village = self.villages.remove(hi);
-        let lo_village = self.villages.remove(lo);
-        let (other_village, current_village) = if current < other {
-            (hi_village, lo_village)
-        } else {
-            (lo_village, hi_village)
-        };
-        self.villages.insert(lo, make(other_village, current_village));
-        self.current = lo;
-        self.preview = None;
+    pub fn wrap_tile(&mut self) -> Result<(), String> {
+        self.commit_preview();
+        let (hut, events) = Hut::spawn(self.extra_env.clone())?;
+        let id = hut.id;
+        self.villages[self.current]
+            .wrap_focused(|old| Village::wrap_tile(Village::Hut(Box::new(hut)), old, Axis::Horizontal));
+        self.insert_channel(id, events)
     }
 
     fn insert_channel(&self, id: u64, events: Channel<TermEvent>) -> Result<(), String> {
@@ -698,7 +670,37 @@ mod tests {
     }
 
     #[test]
-    fn wrap_tab_combines_current_and_the_previous_entry_without_changing_focus() {
+    fn wrap_tab_spawns_a_new_hut_and_wraps_the_focused_one_in_place() {
+        let mut stack = new_stack();
+        let focused_id = stack.focused().id;
+        assert_eq!(stack.len(), 1);
+
+        stack.wrap_tab().unwrap();
+
+        assert_eq!(
+            stack.len(),
+            1,
+            "wrapping the only entry doesn't add a 2nd top-level entry"
+        );
+        assert_eq!(
+            stack.focused().id,
+            focused_id,
+            "wrapping shouldn't change what's on screen — the pre-existing \
+             Hut stays active, the freshly spawned one is the other tab"
+        );
+        assert!(
+            matches!(stack.focused_village(), Village::Tab(_)),
+            "the wrapped entry is a Tab-Village"
+        );
+
+        // The freshly spawned Hut should be reachable by cycling, and be
+        // a genuinely different (new) Hut, not the pre-existing one.
+        stack.cycle_innermost(Direction::Prev);
+        assert_ne!(stack.focused().id, focused_id);
+    }
+
+    #[test]
+    fn wrap_tab_only_replaces_the_focused_entry_leaving_others_untouched() {
         let mut stack = new_stack();
         let first_id = stack.focused().id;
         stack.focused_mut().mark_touched();
@@ -706,70 +708,98 @@ mod tests {
         let second_id = stack.focused().id;
         assert_eq!(stack.len(), 2);
 
-        stack.wrap_tab();
+        stack.wrap_tab().unwrap();
 
-        assert_eq!(stack.len(), 1, "both entries combined into one");
         assert_eq!(
-            stack.focused().id,
-            second_id,
-            "wrapping shouldn't change what's on screen"
+            stack.len(),
+            2,
+            "wrapping only replaces the focused entry's own content, not \
+             the top-level Stack's length"
+        );
+        assert_eq!(stack.focused().id, second_id);
+        assert!(matches!(stack.focused_village(), Village::Tab(_)));
+
+        // The untouched sibling entry (A) is still there, unaffected.
+        assert_eq!(stack.top_level_huts().next().unwrap().id, first_id);
+    }
+
+    #[test]
+    fn wrap_tile_spawns_a_new_hut_and_wraps_the_focused_one_in_place() {
+        let mut stack = new_stack();
+        let focused_id = stack.focused().id;
+
+        stack.wrap_tile().unwrap();
+
+        assert_eq!(stack.len(), 1);
+        assert_eq!(stack.focused().id, focused_id);
+        assert!(matches!(stack.focused_village(), Village::Tile(_)));
+    }
+
+    #[test]
+    fn wrap_focused_only_touches_the_specific_pane_its_called_on() {
+        // Regression case for the reported bug: wrapping a Tab-Village
+        // "inside" one pane of an existing Tile-Village must replace
+        // *that pane's* content only, leaving the Tile-Village and its
+        // other pane completely untouched — not disturb the top-level
+        // Stack at all.
+        let mut stack = new_stack();
+        stack.wrap_tile().unwrap(); // Tile[new_hut, orig], active = 1 (orig — unchanged focus)
+        let other_pane_id = {
+            let Village::Tile(tile) = stack.focused_village() else {
+                panic!("expected a Tile-Village");
+            };
+            let Village::Hut(hut) = &tile.children[0].0 else {
+                panic!("expected a bare Hut");
+            };
+            hut.id
+        };
+        let active_pane_id = stack.focused().id;
+
+        stack.wrap_tab().unwrap();
+
+        assert_eq!(stack.len(), 1, "still just the one Tile-Village overall");
+        let Village::Tile(tile) = stack.focused_village() else {
+            panic!("expected the Tile-Village to still be a Tile-Village");
+        };
+        assert_eq!(tile.children.len(), 2, "the other pane wasn't touched");
+        assert!(
+            matches!(&tile.children[0].0, Village::Hut(hut) if hut.id == other_pane_id),
+            "the untouched pane is still exactly the same bare Hut"
         );
         assert!(
-            matches!(stack.focused_village(), Village::Tab(_)),
-            "combined entry is a Tab-Village"
+            matches!(&tile.children[1].0, Village::Tab(_)),
+            "only the active pane became a Tab-Village"
         );
-
-        // The other entry should still be reachable by cycling.
-        stack.cycle_innermost(Direction::Prev);
-        assert_eq!(stack.focused().id, first_id);
-    }
-
-    #[test]
-    fn wrap_tab_is_a_no_op_with_only_one_entry() {
-        let mut stack = new_stack();
-        let id = stack.focused().id;
-        stack.wrap_tab();
-        assert_eq!(stack.len(), 1);
-        assert_eq!(stack.focused().id, id);
-        assert!(matches!(stack.focused_village(), Village::Hut(_)));
-    }
-
-    #[test]
-    fn wrap_tile_combines_into_a_tile_village() {
-        let mut stack = new_stack();
-        stack.focused_mut().mark_touched();
-        stack.next().unwrap();
-        let second_id = stack.focused().id;
-
-        stack.wrap_tile();
-
-        assert_eq!(stack.len(), 1);
-        assert_eq!(stack.focused().id, second_id);
-        assert!(matches!(stack.focused_village(), Village::Tile(_)));
+        assert_eq!(
+            stack.focused().id,
+            active_pane_id,
+            "wrapping the active pane in place doesn't change what's on screen"
+        );
     }
 
     #[test]
     fn cycle_innermost_bubbles_up_and_wraps() {
         let mut stack = new_stack();
-        stack.focused_mut().mark_touched();
-        stack.next().unwrap();
-        stack.wrap_tab(); // Tab[A, B], active = 1 (B)
-        let a_id = {
-            let Village::Tab(tab) = stack.focused_village() else {
-                panic!("expected a Tab-Village");
-            };
-            let Village::Hut(a) = &tab.children[0] else {
-                panic!("expected a bare Hut");
-            };
-            a.id
-        };
-        let b_id = stack.focused().id;
+        let original_id = stack.focused().id;
+        stack.wrap_tab().unwrap(); // Tab[new, original], active = 1 (original — unchanged focus)
+        assert_eq!(
+            stack.focused().id,
+            original_id,
+            "wrap doesn't change what's focused"
+        );
 
-        assert!(stack.cycle_innermost(Direction::Next), "wraps from B to A");
-        assert_eq!(stack.focused().id, a_id);
+        assert!(
+            stack.cycle_innermost(Direction::Next),
+            "moves to the freshly spawned Hut"
+        );
+        let new_id = stack.focused().id;
+        assert_ne!(new_id, original_id);
 
-        assert!(stack.cycle_innermost(Direction::Next), "back to B");
-        assert_eq!(stack.focused().id, b_id);
+        assert!(
+            stack.cycle_innermost(Direction::Next),
+            "wraps back to the original"
+        );
+        assert_eq!(stack.focused().id, original_id);
     }
 
     #[test]
@@ -782,12 +812,10 @@ mod tests {
     #[test]
     fn remove_exited_collapses_a_tab_village_left_with_one_child() {
         let mut stack = new_stack();
-        stack.focused_mut().mark_touched();
-        stack.next().unwrap();
-        stack.wrap_tab(); // Tab[A, B], active = 1 (B)
-        let b_id = stack.focused().id;
+        stack.wrap_tab().unwrap(); // Tab[original, new], active = 1 (new)
+        let new_id = stack.focused().id;
 
-        stack.remove_exited(b_id).unwrap();
+        stack.remove_exited(new_id).unwrap();
 
         assert_eq!(stack.len(), 1, "still one top-level entry");
         assert!(

@@ -383,23 +383,16 @@ impl State {
                 self.request_redraw();
             }
             Action::WrapTab => {
-                // Commit any open preview session first — `wrap_tab`
-                // combines whatever `current` is, but `current` doesn't
-                // follow a preview session until it's committed (see the
-                // Phase 3.5 "background stays frozen until commit" design).
-                // Without this, pressing wrap-tab while still holding the
-                // `stack-hold` modifier down (having only *peeked* at the
-                // next Hut in the popup, not released yet) would silently
-                // wrap the *old* frozen Hut instead of the one actually
-                // highlighted on screen.
-                self.stack.commit_preview();
-                self.stack.wrap_tab();
+                if let Err(err) = self.stack.wrap_tab() {
+                    tracing::error!("failed to spawn a new Hut for wrap-tab: {err}");
+                }
                 self.sync_visible_main_window();
                 self.request_redraw();
             }
             Action::WrapTile => {
-                self.stack.commit_preview();
-                self.stack.wrap_tile();
+                if let Err(err) = self.stack.wrap_tile() {
+                    tracing::error!("failed to spawn a new Hut for wrap-tile: {err}");
+                }
                 self.sync_visible_main_window();
                 self.request_redraw();
             }
