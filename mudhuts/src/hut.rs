@@ -138,6 +138,23 @@ impl TileHut {
             redraw.mark_dirty();
         }
     }
+
+    /// Every pane's rectangle in absolute physical-pixel space — `area`
+    /// is `State::usable_area()`'s `(x, y, w, h)`. The single computation
+    /// shared by rendering (`render.rs::build_tile_elements`), pane-click
+    /// hit-testing (`input.rs::try_click_chrome`), and the active pane's
+    /// offset alone (`state.rs::active_pane_offset`) — composable Hut
+    /// hierarchy RFC migration step 4, consolidating Q3's flagged
+    /// triplication of "usable_area() + pane_rects() + add the origin
+    /// back" into one place, so the three can never disagree about where
+    /// a pane actually is.
+    pub fn absolute_pane_rects(&self, area: (i32, i32, i32, i32)) -> Vec<(i32, i32, i32, i32)> {
+        let (area_x, area_y, area_w, area_h) = area;
+        pane_rects(self.axis, self.children.iter().map(|(_, frac)| *frac), (area_w, area_h))
+            .into_iter()
+            .map(|(x, y, w, h)| (x + area_x, y + area_y, w, h))
+            .collect()
+    }
 }
 
 fn wrapping_step(len: usize, active: usize, dir: Direction) -> usize {
@@ -489,4 +506,76 @@ pub fn pane_rects(
         offset += this_extent;
     }
     rects
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A cheap placeholder child — an empty Tab-Hut, not a real
+    /// `ConsoleHut` (which would need a spawned shell process, unlike
+    /// `stack.rs`'s tests) — good enough for tests that only care about
+    /// `TileHut`'s own rect math, never resolve to a leaf.
+    fn placeholder() -> Hut {
+        Hut::Tab(TabbedHut {
+            children: Vec::new(),
+            active: 0,
+            label_cache: Vec::new(),
+            tab_ids: Vec::new(),
+            bg_tracker: Vec::new(),
+            redraw: None,
+        })
+    }
+
+    fn tile(axis: Axis, fracs: [f64; 2]) -> TileHut {
+        TileHut {
+            axis,
+            children: vec![(placeholder(), fracs[0]), (placeholder(), fracs[1])],
+            active: 0,
+            highlight_ids: [Id::new(), Id::new(), Id::new(), Id::new()],
+            redraw: None,
+        }
+    }
+
+    #[test]
+    fn absolute_pane_rects_offsets_every_pane_by_the_areas_origin() {
+        let t = tile(Axis::Horizontal, [0.5, 0.5]);
+        let area = (100, 50, 200, 80); // x, y, w, h
+        let rects = t.absolute_pane_rects(area);
+        assert_eq!(rects.len(), 2);
+        // Same split `pane_rects` alone would produce, shifted by the
+        // area's origin — this is the whole point of the shared method
+        // (see its doc comment): every caller gets exactly this, never a
+        // hand-rolled re-derivation that could drift from it.
+        let bare = pane_rects(Axis::Horizontal, [0.5, 0.5].into_iter(), (200, 80));
+        for ((x, y, w, h), (bx, by, bw, bh)) in rects.iter().zip(bare) {
+            assert_eq!(*x, bx + 100);
+            assert_eq!(*y, by + 50);
+            assert_eq!(*w, bw);
+            assert_eq!(*h, bh);
+        }
+    }
+
+    #[test]
+    fn set_active_marks_the_attached_redraw_handle_dirty() {
+        let mut t = tile(Axis::Horizontal, [0.5, 0.5]);
+        let (ping, source) = smithay::reexports::calloop::ping::make_ping().unwrap();
+        t.redraw = Some(RedrawHandle::new(ping));
+
+        t.set_active(1);
+        assert_eq!(t.active, 1);
+
+        let mut event_loop: smithay::reexports::calloop::EventLoop<'static, ()> =
+            smithay::reexports::calloop::EventLoop::try_new().unwrap();
+        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let fired_clone = fired.clone();
+        event_loop
+            .handle()
+            .insert_source(source, move |_, _, _| fired_clone.set(true))
+            .unwrap();
+        event_loop
+            .dispatch(std::time::Duration::from_millis(0), &mut ())
+            .unwrap();
+        assert!(fired.get(), "set_active should have pinged the attached RedrawHandle");
+    }
 }

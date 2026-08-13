@@ -39,7 +39,7 @@ use smithay::wayland::viewporter::ViewporterState;
 
 use crate::keybindings::Keymap;
 use crate::stack::MruStackHut;
-use crate::hut::{Hut, pane_rects};
+use crate::hut::Hut;
 
 /// Open mudhuts' listening Wayland socket without yet wiring it into an
 /// event loop. Split out from [`State::new`] so callers can learn the
@@ -678,20 +678,15 @@ impl State {
     /// computed against the raw output as if the focused ConsoleHut's terminal
     /// still filled it edge to edge.
     pub fn active_pane_offset(&self) -> (f64, f64) {
-        let (area_x, area_y, area_w, area_h) = self.usable_area();
+        let area = self.usable_area();
         let Hut::Tile(tile) = self.stack.focused_top_level() else {
-            return (area_x as f64, area_y as f64);
+            return (area.0 as f64, area.1 as f64);
         };
         if tile.children.len() < 2 {
-            return (area_x as f64, area_y as f64);
+            return (area.0 as f64, area.1 as f64);
         }
-        let rects = pane_rects(
-            tile.axis,
-            tile.children.iter().map(|(_, frac)| *frac),
-            (area_w, area_h),
-        );
-        let (x, y, _, _) = rects[tile.active];
-        ((area_x + x) as f64, (area_y + y) as f64)
+        let (x, y, _, _) = tile.absolute_pane_rects(area)[tile.active];
+        (x as f64, y as f64)
     }
 
     /// Make `self.space` match what the focused ConsoleHut should currently be

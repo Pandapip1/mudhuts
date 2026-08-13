@@ -14,7 +14,7 @@ use smithay::utils::{Buffer, Rectangle, Scale, Transform};
 use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
 
 use crate::State;
-use crate::hut::{Hut, pane_rects};
+use crate::hut::Hut;
 use crate::{chrome, docks, switcher, village_chrome};
 
 /// The [`TextureRenderElement`] buffer-scale ([`Element::src`]/
@@ -434,31 +434,30 @@ pub fn build_frame_elements(
 }
 
 /// Build a Tile-Hut's panes side by side: each child's own terminal
-/// texture (already sized to its pane by `Hut::resize_to_pixels` —
-/// see that method and [`pane_rects`]), composited at its pane's screen
-/// position, plus a highlight border around whichever pane currently has
-/// keyboard focus. Only called once the caller's confirmed the focused
-/// top-level Hut really is a `Hut::Tile` with 2+ children.
+/// texture (already sized to its pane by `Hut::resize_to_pixels` — see
+/// that method and [`crate::hut::pane_rects`]), composited at its pane's
+/// screen position, plus a highlight border around whichever pane
+/// currently has keyboard focus. Only called once the caller's confirmed
+/// the focused top-level Hut really is a `Hut::Tile` with 2+ children.
 ///
 /// Panes are normal content — like the terminal-visible branch above,
 /// sized and positioned against [`State::usable_area`], not the raw
-/// output rect (matches `Hut::resize_to_pixels`'s own sizing via
-/// `Stack::resize_all`, and `State::active_pane_offset`'s identical
-/// rect computation for mouse-interaction routing — both must agree with
-/// what's actually drawn here).
+/// output rect. Gets its actual rects from [`crate::hut::TileHut::absolute_pane_rects`],
+/// the same computation `State::active_pane_offset` and
+/// `input.rs::try_click_chrome`'s pane hit-test share (composable Hut
+/// hierarchy RFC's Q3) — the three can never disagree about where a pane
+/// actually is, since there's only one computation left to disagree with
+/// itself.
 fn build_tile_elements(
     state: &mut State,
     renderer: &mut GlesRenderer,
 ) -> Vec<OutputRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> {
-    let (area_x, area_y, area_w, area_h) = state.usable_area();
+    let area = state.usable_area();
     let scale = state.output_scale();
     let Hut::Tile(tile) = state.stack.focused_top_level_mut() else {
         return Vec::new();
     };
-    let rects: Vec<_> = pane_rects(tile.axis, tile.children.iter().map(|(_, frac)| *frac), (area_w, area_h))
-        .into_iter()
-        .map(|(x, y, w, h)| (x + area_x, y + area_y, w, h))
-        .collect();
+    let rects = tile.absolute_pane_rects(area);
     let active = tile.active;
     let highlight_ids = tile.highlight_ids.clone();
 

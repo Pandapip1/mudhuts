@@ -17,7 +17,7 @@ use smithay::wayland::shell::wlr_layer::{KeyboardInteractivity, Layer as WlrLaye
 
 use crate::State;
 use crate::keybindings::Action;
-use crate::hut::{Hut, pane_rects};
+use crate::hut::Hut;
 use crate::{chrome, docks, village_chrome};
 
 /// Mime types mudhuts advertises for every selection it sets itself
@@ -285,19 +285,19 @@ impl State {
     fn try_click_chrome(&mut self, pos: Point<f64, Physical>) -> bool {
         let pixel = Point::<i32, Physical>::from((pos.x.round() as i32, pos.y.round() as i32));
 
-        // Rects computed against `usable_area`, not the raw output —
-        // must agree with what `render.rs`'s `build_tile_elements`
-        // actually draws (and with `State::active_pane_offset`'s own
-        // identical computation), or a click could land on the wrong
-        // pane whenever a layer-shell surface reserves part of the
-        // output.
-        let (area_x, area_y, area_w, area_h) = self.usable_area();
+        // Rects come from `TileHut::absolute_pane_rects`, the single
+        // computation shared with `render.rs`'s `build_tile_elements` and
+        // `State::active_pane_offset` (composable Hut hierarchy RFC's
+        // Q3) — a click can't land on the wrong pane by disagreeing with
+        // what's actually drawn, whenever a layer-shell surface reserves
+        // part of the output, since there's only one place left to get
+        // that wrong.
+        let area = self.usable_area();
         if let Hut::Tile(tile) = self.stack.focused_top_level_mut()
             && tile.children.len() >= 2
         {
-            let rects = pane_rects(tile.axis, tile.children.iter().map(|(_, frac)| *frac), (area_w, area_h));
+            let rects = tile.absolute_pane_rects(area);
             let Some(i) = rects.into_iter().position(|(x, y, w, h)| {
-                let (x, y) = (x + area_x, y + area_y);
                 pixel.x >= x && pixel.x < x + w && pixel.y >= y && pixel.y < y + h
             }) else {
                 return false;
