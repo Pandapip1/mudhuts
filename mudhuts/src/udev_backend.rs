@@ -440,6 +440,21 @@ fn render_surface(
         .unwrap_or((0, 0));
     let output = surface.output.clone();
 
+    // Every render pass, not just once at connector setup — matches
+    // `winit_backend.rs`'s own redraw handler, which does the same
+    // unconditionally every frame (cheap no-op via `resize_to_pixels`'s
+    // own early-return when size is already correct). Without this, a
+    // Hut spawned *after* the initial connector scan (e.g. Alt-Tabbing
+    // past the stack's end to open a new one) never gets resized past
+    // `Hut::spawn`'s tiny 80x24-cell placeholder grid.
+    state.stack.resize_all(size.0, size.1);
+
+    tracing::debug!(
+        "render_surface: focused hut={} showing_terminal_effective={} output_size={size:?}",
+        state.stack.focused().id,
+        state.showing_terminal_effective(),
+    );
+
     let elements = render::build_frame_elements(state, renderer, &output, size);
 
     // `FrameFlags::empty()`, not `::DEFAULT` — `DEFAULT` allows the
