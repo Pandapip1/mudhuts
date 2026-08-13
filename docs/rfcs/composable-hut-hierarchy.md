@@ -1,7 +1,8 @@
 # RFC: Composable Hut Hierarchy
 
-Status: draft, for discussion. No code changes in this RFC itself — migration steps 1–3 (see
-"Migration Strategy") have since landed in the actual codebase, each as its own separate commit.
+Status: draft, for discussion. No code changes in this RFC itself — migration steps 1–4 and step
+5's sub-step 1 (see "Migration Strategy") have since landed in the actual codebase, each as its
+own separate commit.
 
 Companion doc: `/home/gavin/.claude/plans/cryptic-honking-lamport.md`, "Composable Hut
 hierarchy" wishlist entry (2026-08-13) — this RFC answers the three open questions that entry
@@ -638,21 +639,40 @@ primitives against low-blast-radius targets before touching the load-bearing `Vi
    spiked the way Q1's `Composited` variant risk was in step 3 — attempting that swap now would
    mean resolving them on the fly, against the RFC's own risk-staging intent, rather than a step
    deliberately proving out one narrow, already-derisked piece before committing further.
-5. **Absorbs the deferred remainder of step 4** (the actual `Space<HutSpaceElement>`/synthetic-
-   `Output` swap, for every node, not just the one scope step 3 already validated) **together
-   with the Layer-Shell Root Hut (Q2)** — the latter was always going to depend on the former (Q2's
-   entire design *is* "one more `space_render_elements` call, against the real output, over
-   whatever `Space` the tree's real nodes already produce"), so there's no longer a reason to
-   treat them as two separate steps the way the original draft did. Blocked on first resolving
-   Open Questions 2, 3, and 6 above — not attempted until each has a real answer, not just a
-   plausible one.
+5. **Re-staged into four sub-steps, 2026-08-13, after resolving Open Questions 2/3/6 (see their
+   entries below).** Originally scoped as one step absorbing the deferred remainder of step 4
+   (the actual `Space<HutSpaceElement>`/synthetic-`Output` swap, for every node) together with the
+   Layer-Shell Root Hut (Q2). Research done to actually resolve OQ2/3/6 (not guessed — see below)
+   found that not every node kind needs its own `Space`, which shrinks this from one large atomic
+   change to four much smaller, independently-verifiable sub-steps (full detail and rationale in
+   the plan doc, `.../cryptic-honking-lamport.md`'s "RFC migration step 5" section):
+   1. **Done (2026-08-13).** Low-risk cleanup with no `Space` swap involved — finished the
+      `SubWindow`→`FloatingWindow` rename in the wire protocol and `handlers/shell.rs`'s `Role`
+      enum (OQ6's naming gap), and added `Hut::leaf_absolute_rect`/`State::leaf_absolute_rect`,
+      wired into `unconstrain_popup` (OQ3's resolution).
+   2. `ConsoleHut` gets its own `Space<HutSpaceElement>`, replacing today's single global
+      `state.space` — the most direct generalization of already-working code, so lowest risk of
+      the three real `Space`-needing node kinds.
+   3. `TileHut` gets its own `Space<HutSpaceElement>`, replacing `render.rs::build_tile_elements`'s
+      hand-rolled per-pane `TextureRenderElement` construction — builds on sub-step 2.
+   4. Layer-Shell Root Hut (Q2), on top of 2/3 — one `space_render_elements` call against the real
+      output, replacing `render.rs::layer_elements` and consolidating the hand-rolled layer-shell
+      hit-test ordering into one place. `TabbedHut`/`MruStackHut` stay pass-throughs needing no
+      `Space` of their own (per OQ2's finding) — not a sub-step, a non-change worth stating so it
+      isn't mistaken for a gap later.
 
-**Honest overall assessment**: mostly incremental — the traits and per-scope `Space` design get
-real, independent validation before the highest-risk step — but step 5 (now carrying both the
-real per-node `Space` swap and the Layer-Shell Root Hut collapse) is unavoidably a large,
-mostly-atomic change given how entangled the current `Hut`/`Stack` types already are with every
-render/input call site. Calling the whole effort "incremental" would undersell that one step's
-real size and risk.
+**Honest overall assessment, updated 2026-08-13**: genuinely incremental now, not just in
+aspiration — step 5's re-staging above means every remaining sub-step is independently small and
+verifiable, rather than one large atomic change absorbing the real per-node `Space` swap and the
+Layer-Shell Root Hut collapse at once. The original assessment (below, for the record) undersold
+how much step 5 could actually be broken down once OQ2/3/6 were given real answers instead of
+guessed at:
+
+> mostly incremental — the traits and per-scope `Space` design get real, independent validation
+> before the highest-risk step — but step 5 (now carrying both the real per-node `Space` swap and
+> the Layer-Shell Root Hut collapse) is unavoidably a large, mostly-atomic change given how
+> entangled the current `Hut`/`Stack` types already are with every render/input call site. Calling
+> the whole effort "incremental" would undersell that one step's real size and risk.
 
 ## Open Questions Still Unresolved
 
@@ -686,17 +706,34 @@ real size and risk.
    test. Worth remembering for step 4: any future comparison between old and new render paths
    needs to control for output transform/scale explicitly, or a real bug and a harness artifact
    look identical.
-2. **Per-node synthetic `Output`/`Space`/`LayerMap` memory/perf cost at real nesting depth**
-   wasn't measured — this RFC only confirms it's *architecturally* valid, not that it's free.
-   Given the plan doc's own unresolved "Investigate high memory usage" item
-   (`.../cryptic-honking-lamport.md:1030-1036`), this deserves real profiling before committing,
-   not after.
-3. **Popup positioning for a genuinely non-fullscreen leaf** (a Main Window inside a Tile-Village
-   pane, or nested several levels deep) still isn't designed — `unconstrain_popup`'s current
-   fullscreen-at-output-origin shortcut (`xdg_shell.rs:328-334`) was already flagged by the plan
-   doc as out of v1 Tile-Village scope for exactly this reason (`village.rs:10-21`), and this
-   RFC's tree makes "arbitrary nesting depth" the *point*, which reopens rather than resolves
-   it.
+2. **Resolved by research done for step 5's re-staging (2026-08-13), not a full perf spike —
+   architecture change instead.** Read Smithay's `Output::new`/`Space::default`/
+   `layer_map_for_output` directly (pinned rev `4cf0b62`): a synthetic `Output`+`Space` pair is a
+   handful of small heap allocations, not a structural cost — `LayerMap` is lazily created only if
+   a node actually calls `layer_map_for_output`, which per Q2's design is only ever the
+   Layer-Shell Root Hut. The real cost is GPU-side (an FBO-backed texture per compositing node),
+   and step 3's `hut_space.rs` prototype over-states even that: its synchronous GPU→CPU readback
+   only exists for its own byte-diff comparison harness, not something the real design needs (a
+   `Composited` element hands a live `GlesTexture` straight to the parent's `Space`, no readback).
+   More importantly: **not every node kind needs its own `Space`.** A pass-through node — shows
+   exactly one active child, never composites multiple simultaneous things — needs no
+   `Space`/`Output`/FBO at all. Per today's actual v1 scope, that's `TabbedHut` and `MruStackHut`;
+   only `ConsoleHut`, `TileHut`, and the Layer-Shell Root Hut actually need one. This is why step
+   5 is now four sub-steps instead of one atomic swap (see Migration Strategy) — the "Investigate
+   high memory usage" wishlist item stays open as a general concern, but this specific
+   architectural question has a real answer now, not a plausible one.
+3. **Resolved by `Hut::leaf_absolute_rect`/`State::leaf_absolute_rect`, step 5 sub-step 1
+   (2026-08-13, `handlers/xdg_shell.rs::unconstrain_popup`).** Confirmed a data-model gap, not an
+   algorithm gap — Smithay's own `get_unconstrained_geometry`/`get_popup_toplevel_coords` are
+   already correct, generic math; what was missing was a function answering "where is this root
+   window actually on screen," generalizing `active_pane_offset`'s one-level, focused-path-only
+   answer to an arbitrary target leaf, recursing into a Tab-Hut's active child only (never
+   subdividing the rect) and treating a Tile-Hut pane's content as its child's `focused_hut()`
+   directly (matching `render.rs::build_tile_elements` exactly, not a recursive split). Since a
+   Tile-Hut pane can't show a Main Window yet (v1 scope, unrelated to this RFC), this is currently
+   always a no-op — `unconstrain_popup`'s behavior is unchanged today — but stops being one the
+   moment that lands, closing the gap ahead of time rather than on the fly during a future
+   feature.
 4. **The full set of `input.rs` special cases above the hit-test layer** (mouse-report vs.
    text-selection vs. click-to-focus, `keyboard-shortcuts-inhibit-unstable-v1`'s per-surface
    opt-out at `input.rs:588-601`, session-lock's total override at
@@ -711,11 +748,20 @@ real size and risk.
    the first place. Worth a follow-up on whether a lint, a shared-helper-only constructor
    pattern, or a test asserting render/hit-test agreement can make this structural rather than
    disciplinary.
-6. **Sub-Window/Alert modeling** (the "third composition rule" proposal above) is a sketch, not
-   a full design — doesn't yet cover the interaction between the drag mechanics in
-   `docks.rs::DockDrag`/`advance_drag`/`finish_drag` (`docks.rs:52-63,219-281`) and the new
-   `Redrawable`/`HitTestable` traits in detail (e.g. exactly when a docked Sub-Window's handle
-   stops being `HitTestable`-as-chrome and starts needing tree-node treatment mid-drag, the
-   instant it's mapped as a real surface — `docks.rs:236-244`).
-7. **The Sub-Hut/Sub-Window naming collision** is flagged, not resolved — needs the user's own
-   call before the rename in step 1 of migration locks it in.
+6. **Sub-Window/Alert modeling — mostly still a sketch, but confirmed largely already true in
+   practice (2026-08-13).** Research for step 5's re-staging read `docks.rs`/`main_window.rs`/
+   `state.rs::sync_visible_main_window` directly and found current code already matches this
+   RFC's own recommendation: a docked Floating Window stays `HitTestable`-as-chrome (never
+   mapped, never in any `Space`); `docks.rs::advance_drag` flips `Dock::Docked`→`Dock::Floating`
+   and only *then* does `sync_visible_main_window` map it as a real element — the transition is
+   implicit (a field mutation plus a `sync_visible_main_window` side effect, not an explicit
+   hook), which is fine as-is and not something step 5 needs to formalize further. One real,
+   concrete gap this surfaced, now fixed (step 5 sub-step 1, 2026-08-13): the
+   `SubWindow`→`FloatingWindow` rename below had landed for Rust struct/field names but not for
+   the wire protocol (`mudhuts-shell.xml`'s `set_sub` request) or `handlers/shell.rs`'s internal
+   `enum Role { Sub, Alert }` — both now say `Floating` throughout. `DockDrag` itself still
+   doesn't implement `HitTestable` (only the separate `DockHandles` borrow does) — confirmed
+   fine, not a gap step 5 needs to close.
+7. **The Sub-Hut/Sub-Window naming collision is resolved** — the user chose `SubWindow` →
+   `FloatingWindow` (2026-08-13, recorded above under `MainWindowEntry`/`SubWindow`/`Alert`) and
+   it's now fully landed, Rust code and wire protocol alike (see item 6 just above).
