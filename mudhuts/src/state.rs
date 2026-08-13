@@ -205,6 +205,10 @@ pub struct State {
     /// non-desktop connector list, and active-lease list, none of which
     /// `State` otherwise has access to (same reasoning as
     /// `dmabuf_renderer` above). `None` under `winit_backend.rs`.
+    /// Also doubles as the backend handle `wlr-gamma-control-unstable-v1`'s
+    /// `set_gamma`/`get_gamma` ioctl calls go through (no separate field —
+    /// same `Inner`, same reasoning: `State` has no DRM device handle of
+    /// its own).
     pub(crate) udev_inner: Option<Rc<RefCell<crate::udev_backend::Inner>>>,
 
     /// `ext_foreign_toplevel_list_v1` — advertises every Main Window to
