@@ -6,7 +6,7 @@ use smithay::input::pointer::{Focus, GrabStartData as PointerGrabStartData};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::{wl_seat, wl_surface::WlSurface};
-use smithay::utils::{Logical, Serial, Size};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Serial, Size};
 use smithay::wayland::compositor::with_states;
 use smithay::wayland::shell::xdg::dialog::{ToplevelDialogHint, XdgDialogHandler};
 use smithay::wayland::shell::xdg::{
@@ -332,9 +332,7 @@ impl State {
         // Looked up across every ConsoleHut (not just `self.space`, which now
         // only ever holds whichever single Main Window is currently
         // visible) — a popup's parent window doesn't have to be the
-        // visible one. Every Main Window is fullscreen at the output's
-        // origin by construction, mapped or not, so its geometry is
-        // always just the output's — no per-window geometry lookup needed.
+        // visible one.
         if self.find_window_by_surface(&root).is_none() {
             return;
         };
@@ -346,7 +344,23 @@ impl State {
             return;
         };
 
-        let mut target = output_geo;
+        // `State::leaf_absolute_rect` (composable Hut hierarchy RFC's Open
+        // Question 3 resolution) gives this root's actual on-screen rect
+        // if it's a Main Window reachable through the Hut tree — narrower
+        // than the whole output once a Tile-Hut pane can show a Main
+        // Window (still out of v1 scope today, so this is currently
+        // always the same as `output_geo`, but stops being a no-op the
+        // moment that lands). Falls back to the full output rect for a
+        // Floating Window/Alert root (never Tile-Hut-paned) or a Main
+        // Window that isn't actually visible right now — both match
+        // today's pre-existing behavior exactly.
+        let mut target = match self.leaf_absolute_rect(&root) {
+            Some((x, y, w, h)) => {
+                let physical = Rectangle::<i32, Physical>::new(Point::from((x, y)), Size::from((w, h)));
+                physical.to_f64().to_logical(Scale::from(self.output_scale())).to_i32_round()
+            }
+            None => output_geo,
+        };
         target.loc -= get_popup_toplevel_coords(&PopupKind::Xdg(popup.clone()));
 
         popup.with_pending_state(|state| {

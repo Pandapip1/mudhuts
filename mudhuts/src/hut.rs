@@ -296,6 +296,50 @@ impl Hut {
         }
     }
 
+    /// `root`'s absolute physical-pixel rect right now, if it's actually
+    /// on screen — composable Hut hierarchy RFC's Open Question 3
+    /// resolution: `None` if `root` belongs to a Main Window sitting
+    /// behind an inactive Tab-Hut tab anywhere along the path, or isn't a
+    /// Main Window reachable from here at all (a Floating Window/Alert, or
+    /// a bare terminal). `area` is the starting rect — the caller passes
+    /// `State::usable_area()`, the same starting point
+    /// `State::active_pane_offset` uses.
+    ///
+    /// Mirrors actual rendering exactly, not a fresh traversal rule: a
+    /// Tab-Hut only ever shows its `active` child, so recurses into just
+    /// that one, `area` unchanged (matches `active_pane_offset`'s "only a
+    /// focused top-level Tile-Hut ever produces a sub-rect" finding — a
+    /// Tab-Hut, nested or not, never subdivides the rect). A Tile-Hut's
+    /// pane shows its child's [`Self::focused_hut`] directly — *not* a
+    /// recursive split — exactly like `render.rs::build_tile_elements`
+    /// does today (see this module's doc on why a nested Tab/Tile-Hut
+    /// inside a pane doesn't get its own split in v1).
+    pub fn leaf_absolute_rect(
+        &self,
+        root: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+        area: (i32, i32, i32, i32),
+    ) -> Option<(i32, i32, i32, i32)> {
+        match self {
+            Hut::Console(hut) => hut
+                .main_windows()
+                .iter()
+                .any(|entry| entry.matches(root))
+                .then_some(area),
+            Hut::Tab(tab) => tab.children.get(tab.active)?.leaf_absolute_rect(root, area),
+            Hut::Tile(tile) => {
+                let rects = tile.absolute_pane_rects(area);
+                tile.children.iter().zip(rects).find_map(|((child, _), rect)| {
+                    child
+                        .focused_hut()
+                        .main_windows()
+                        .iter()
+                        .any(|entry| entry.matches(root))
+                        .then_some(rect)
+                })
+            }
+        }
+    }
+
     /// Find a ConsoleHut anywhere under this Hut by id, recursively —
     /// unlike [`Self::focused_hut`], not limited to whichever child is
     /// currently active/visible (a background Main Window's owning ConsoleHut

@@ -689,6 +689,22 @@ impl State {
         (x as f64, y as f64)
     }
 
+    /// `root`'s absolute physical-pixel rect right now, if it's a Main
+    /// Window currently on screen — composable Hut hierarchy RFC's Open
+    /// Question 3 resolution, generalizing [`Self::active_pane_offset`]
+    /// (which only ever answers for whichever pane is focused) to an
+    /// arbitrary target surface, for `handlers/xdg_shell.rs`'s
+    /// `unconstrain_popup` to anchor a popup to its actual root window
+    /// instead of assuming every Main Window fills the whole output.
+    /// `None` for a Floating Window/Alert root (never Tile-Hut-paned, so
+    /// this doesn't apply to them), or for a Main Window that's currently
+    /// backgrounded or behind an inactive Hut-tab — only the *focused*
+    /// top-level Stack entry is ever actually on screen, matching every
+    /// other render/hit-test call site's scope.
+    pub fn leaf_absolute_rect(&self, root: &WlSurface) -> Option<(i32, i32, i32, i32)> {
+        self.stack.focused_top_level().leaf_absolute_rect(root, self.usable_area())
+    }
+
     /// Make `self.space` match what the focused ConsoleHut should currently be
     /// showing: unmap whatever's mapped (harmless if nothing was), then map
     /// the focused ConsoleHut's active Main Window (if it isn't showing its
