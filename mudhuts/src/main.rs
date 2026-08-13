@@ -5,6 +5,7 @@ mod gpu_term;
 mod grabs;
 mod handlers;
 mod console_hut;
+mod hut_space;
 mod input;
 mod keybindings;
 mod main_window;
