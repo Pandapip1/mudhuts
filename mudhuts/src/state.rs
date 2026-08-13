@@ -219,7 +219,21 @@ impl State {
                 // dead Hut entry in place is harmless) rather than
                 // trying to keep the "always ≥1 Hut" invariant intact
                 // through a stop-in-progress shutdown.
-                if self.stack.len() == 1 && self.stack.focused().id == id {
+                //
+                // `self.stack.len()` counts *top-level Stack entries*, not
+                // Huts — since Phase 6, one entry can be a Tab/Tile-Village
+                // wrapping several Huts. Checking `len() == 1` alone meant
+                // exiting a Tile-Village's *active* pane (its Hut id
+                // happens to equal `self.stack.focused().id`, since that
+                // resolves through the active pane) looked exactly like
+                // closing the only Hut in the whole compositor — even
+                // with a live sibling pane right next to it — silently
+                // exiting the entire compositor (and, on the real DRM
+                // backend, dropping straight back to the login greeter)
+                // instead of just falling back to that sibling. Counting
+                // every Hut in the whole tree is the correct "is this
+                // really the last one" check.
+                if self.stack.all_huts().count() == 1 && self.stack.focused().id == id {
                     tracing::info!("last Hut closed, exiting");
                     self.loop_signal.stop();
                     return;
