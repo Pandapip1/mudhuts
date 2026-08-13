@@ -168,7 +168,7 @@ pub fn build(
     }
 
     // Grow the per-child label cache/ids/bg-tracker lazily to match
-    // `children` — see `TabVillage::label_cache`'s doc comment; only
+    // `children` — see `TabbedHut::label_cache`'s doc comment; only
     // ever grows here (shrinking happens in `Hut::remove_child_hut`,
     // kept in lockstep with `children` itself).
     while tab.label_cache.len() < tab.children.len() {

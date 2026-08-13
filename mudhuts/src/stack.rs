@@ -1,6 +1,9 @@
-//! The Stack: the global MRU-ordered list of top-level Huts that
-//! Alt+Tab cycles through (see the plan's Phase 3 notes, and the
-//! Nomenclature table). Each entry is a [`Hut`] — a bare ConsoleHut, or a
+//! [`MruStackHut`] — The Stack: the global MRU-ordered list of top-level
+//! Huts that Alt+Tab cycles through (see the plan's Phase 3 notes, and the
+//! Nomenclature table; the type itself is named after the tree diagram's
+//! own "MRU Stack Hut" node in the composable Hut hierarchy RFC,
+//! `docs/rfcs/composable-hut-hierarchy.md`'s migration step 4). Each entry
+//! is a [`Hut`] — a bare ConsoleHut, or a
 //! Tab-Hut/Tile-Hut combining several (Phase 6) — but the
 //! MRU/discard machinery below is unchanged from Phase 3: it never cared
 //! *what* an entry was, only whether it's "been used"
@@ -26,7 +29,7 @@ use crate::console_hut::ConsoleHut;
 use crate::hut::{Axis, Direction, Hut};
 use crate::redraw::RedrawHandle;
 
-pub struct Stack {
+pub struct MruStackHut {
     huts: Vec<Hut>,
     current: usize,
     /// Set while a preview session (see the Phase 3.5 plan notes — the
@@ -58,14 +61,14 @@ pub struct Stack {
     /// what the Alt-Tab popup (`switcher.rs`) or the visible top-level
     /// entry should show calls `mark_dirty()` on this itself, rather than
     /// leaving it to `input.rs`'s `Action::StackNext`/`StackPrev` handlers
-    /// to remember afterward. Unlike `docks.rs`'s `DockDrag`, `Stack` is
+    /// to remember afterward. Unlike `docks.rs`'s `DockDrag`, `MruStackHut` is
     /// long-lived and constructed exactly once — in `main.rs`, where the
-    /// raw `Ping` is already available before `Stack::new` runs — so this
+    /// raw `Ping` is already available before `MruStackHut::new` runs — so this
     /// is supplied directly instead of via `Redrawable::attach_redraw_handle`.
     redraw: RedrawHandle,
 }
 
-impl Stack {
+impl MruStackHut {
     /// `first`/`first_events` must come from a single [`ConsoleHut::spawn`] call
     /// using the same `extra_env` given here.
     pub fn new(
@@ -429,10 +432,10 @@ mod tests {
         Box::leak(Box::new(event_loop)).handle()
     }
 
-    fn new_stack() -> Stack {
+    fn new_stack() -> MruStackHut {
         let (hut, events) = ConsoleHut::spawn(std::iter::empty(), 1.0).unwrap();
         let (ping, _source) = smithay::reexports::calloop::ping::make_ping().unwrap();
-        Stack::new(hut, events, loop_handle(), Vec::new(), RedrawHandle::new(ping)).unwrap()
+        MruStackHut::new(hut, events, loop_handle(), Vec::new(), RedrawHandle::new(ping)).unwrap()
     }
 
     #[test]

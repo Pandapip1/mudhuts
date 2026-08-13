@@ -15,7 +15,7 @@ use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
 
 use crate::render::OutputRenderElements;
-use crate::stack::Stack;
+use crate::stack::MruStackHut;
 
 /// Base sizes (scale 1.0) — scaled via `crate::render::scaled` wherever
 /// they're actually used, so the popup stays the same apparent size
@@ -31,7 +31,7 @@ type Element = OutputRenderElements<GlesRenderer, WaylandSurfaceRenderElement<Gl
 /// `winit_backend.rs`, which pushes these ahead of the normal background
 /// elements — index 0 renders on top), or an empty list if no preview
 /// session is open.
-pub fn build(stack: &Stack, output_size: (i32, i32), renderer: &GlesRenderer, scale: f64) -> Vec<Element> {
+pub fn build(stack: &MruStackHut, output_size: (i32, i32), renderer: &GlesRenderer, scale: f64) -> Vec<Element> {
     if !stack.is_previewing() {
         return Vec::new();
     }

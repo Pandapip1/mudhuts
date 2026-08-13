@@ -33,7 +33,7 @@ fn next_hut_id() -> u64 {
 
 pub struct ConsoleHut {
     /// Stable identity for this ConsoleHut, independent of its position in [The
-    /// Stack](crate::stack::Stack) (which shifts as entries are added
+    /// Stack](crate::stack::MruStackHut) (which shifts as entries are added
     /// and discarded) — used to route its `TermEvent` channel to the right
     /// entry once there are several.
     pub id: u64,

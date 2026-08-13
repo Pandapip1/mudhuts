@@ -38,7 +38,7 @@ use smithay::wayland::socket::ListeningSocketSource;
 use smithay::wayland::viewporter::ViewporterState;
 
 use crate::keybindings::Keymap;
-use crate::stack::Stack;
+use crate::stack::MruStackHut;
 use crate::hut::{Hut, pane_rects};
 
 /// Open mudhuts' listening Wayland socket without yet wiring it into an
@@ -117,7 +117,7 @@ pub struct State {
 
     pub seat: Seat<Self>,
 
-    pub stack: Stack,
+    pub stack: MruStackHut,
     pub keymap: Keymap,
     /// The output's current pixel size, tracked here (not just read inside
     /// `winit_backend.rs`'s redraw handler) so newly-focused Huts can be
@@ -336,7 +336,7 @@ impl State {
     pub fn new(
         event_loop: &mut EventLoop<Self>,
         display: Display<Self>,
-        stack: Stack,
+        stack: MruStackHut,
         socket: (ListeningSocketSource, OsString),
         redraw_ping: Ping,
     ) -> Result<Self, Box<dyn std::error::Error>> {

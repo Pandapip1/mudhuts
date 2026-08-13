@@ -26,7 +26,7 @@
 
 use std::fs;
 
-use crate::stack::Stack;
+use crate::stack::MruStackHut;
 
 /// Read `/proc/<pid>/environ`'s null-separated `KEY=VALUE` entries
 /// looking for `MUDHUTS_HUT_ID`. `None` if the process is gone,
@@ -63,7 +63,7 @@ fn parent_pid(pid: u32) -> Option<u32> {
 /// first), then by walking its process ancestry looking for a ConsoleHut whose
 /// shell is it or one of its ancestors. `None` if neither finds a match —
 /// callers should fall back to the currently focused ConsoleHut.
-pub fn find_owning_hut(client_pid: u32, stack: &Stack) -> Option<u64> {
+pub fn find_owning_hut(client_pid: u32, stack: &MruStackHut) -> Option<u64> {
     if let Some(id) = env_hut_id(client_pid)
         && stack.all_huts().any(|hut| hut.id == id)
     {
@@ -97,10 +97,10 @@ mod tests {
         Box::leak(Box::new(event_loop)).handle()
     }
 
-    fn new_stack() -> Stack {
+    fn new_stack() -> MruStackHut {
         let (hut, events) = ConsoleHut::spawn(std::iter::empty(), 1.0).unwrap();
         let (ping, _source) = smithay::reexports::calloop::ping::make_ping().unwrap();
-        Stack::new(
+        MruStackHut::new(
             hut,
             events,
             loop_handle(),

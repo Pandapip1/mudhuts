@@ -48,11 +48,11 @@ pub enum Hut {
     // every `Tab`/`Tile` variant) would pay `ConsoleHut`'s full size regardless
     // of which variant it actually is.
     Console(Box<ConsoleHut>),
-    Tab(TabVillage),
-    Tile(TileVillage),
+    Tab(TabbedHut),
+    Tile(TileHut),
 }
 
-pub struct TabVillage {
+pub struct TabbedHut {
     pub children: Vec<Hut>,
     pub active: usize,
     /// Each child's rendered tab-label texture, cached the same way
@@ -76,7 +76,7 @@ pub struct TabVillage {
     pub(crate) bg_tracker: Vec<ChangeTracker<bool>>,
 }
 
-pub struct TileVillage {
+pub struct TileHut {
     pub axis: Axis,
     /// Each child alongside its fraction of the tile's total extent along
     /// `axis` — expected to sum to 1.0, though nothing panics if they
@@ -113,7 +113,7 @@ impl Hut {
     /// Combine `current` (shown last, so the wrap is visually a no-op)
     /// after `other` into a new Tab-Hut.
     pub fn wrap_tab(other: Hut, current: Hut) -> Hut {
-        Hut::Tab(TabVillage {
+        Hut::Tab(TabbedHut {
             children: vec![other, current],
             active: 1,
             label_cache: vec![LabelCache::new(), LabelCache::new()],
@@ -126,7 +126,7 @@ impl Hut {
     /// along `axis`. `current`'s pane keeps keyboard focus, matching
     /// `wrap_tab`'s "visually a no-op" property.
     pub fn wrap_tile(other: Hut, current: Hut, axis: Axis) -> Hut {
-        Hut::Tile(TileVillage {
+        Hut::Tile(TileHut {
             axis,
             children: vec![(other, 0.5), (current, 0.5)],
             active: 1,
@@ -142,7 +142,7 @@ impl Hut {
     /// point: pressing wrap-tab while focused on one pane of an existing
     /// Tile-Hut should turn *that pane* into a small Tab-Hut,
     /// not disturb the Tile-Hut itself or reach for some unrelated
-    /// top-level Stack entry to combine with (`stack::Stack::wrap_tab`
+    /// top-level Stack entry to combine with (`stack::MruStackHut::wrap_tab`
     /// always passes a freshly spawned ConsoleHut as one side, never an
     /// existing entry, for exactly the same reason — see its doc
     /// comment).
@@ -155,7 +155,7 @@ impl Hut {
     /// between the two assignments; nothing ever observes it.
     pub fn wrap_focused(&mut self, make: impl FnOnce(Hut) -> Hut) {
         if matches!(self, Hut::Console(_)) {
-            let placeholder = Hut::Tab(TabVillage {
+            let placeholder = Hut::Tab(TabbedHut {
                 children: Vec::new(),
                 active: 0,
                 label_cache: Vec::new(),
@@ -174,7 +174,7 @@ impl Hut {
     }
 
     /// Whether this Hut should survive being "left behind" when The
-    /// Stack moves away from it (see `stack::Stack`'s `advance_forward`/
+    /// Stack moves away from it (see `stack::MruStackHut`'s `advance_forward`/
     /// `advance_backward`, and the plan's original Phase 3 discard rule).
     /// A bare Console Hut defers to its own [`ConsoleHut::touched`]; anything wrapped in
     /// a Tab/Tile-Hut was deliberately composed by the user out of
@@ -286,7 +286,7 @@ impl Hut {
     /// removing left exactly one child behind, [`Self::collapse_if_singleton`]
     /// replaces this Hut with that child directly — an emptied-out
     /// wrapper around one survivor is never useful to keep around. See
-    /// `stack::Stack::remove_exited`, which calls this for a ConsoleHut
+    /// `stack::MruStackHut::remove_exited`, which calls this for a ConsoleHut
     /// that's exited but isn't a bare top-level Stack entry.
     pub fn remove_child_hut(&mut self, id: u64) -> bool {
         let removed = match self {
