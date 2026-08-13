@@ -128,7 +128,7 @@ fn retag(state: &mut State, tagged_surface: &WlSurface, target: Option<(Role, Wl
         match &target {
             None => {
                 tracing::debug!("mudhuts_window_role_v1: retagged as a bare Main Window");
-                hut.push_main_window(window);
+                hut.push_main_window(window, true);
             }
             Some((role, main_surface)) => match hut.find_main_window_mut(main_surface) {
                 Some(entry) => {
@@ -148,7 +148,7 @@ fn retag(state: &mut State, tagged_surface: &WlSurface, target: Option<(Role, Wl
                     tracing::warn!(
                         "mudhuts_window_role_v1: target main window not found in the same Hut, leaving as a bare Main Window"
                     );
-                    hut.push_main_window(window);
+                    hut.push_main_window(window, true);
                 }
             },
         }

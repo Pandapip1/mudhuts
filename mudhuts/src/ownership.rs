@@ -1,11 +1,46 @@
-//! Default Hut assignment for new client toplevels: walk the connecting
-//! client's process ancestry back to a known Hut's shell PID — see the
-//! plan's Phase 4 notes. No protocol needed for this default case (that's
+//! Default Hut assignment for new client toplevels — see the plan's
+//! Phase 4 notes. No protocol needed for this default case (that's
 //! reserved for Sub-Window/Alert role assignment, Phase 5).
+//!
+//! Two resolution paths, tried in order:
+//!
+//! 1. `MUDHUTS_HUT_ID`, an env var every Hut's shell has set in its own
+//!    environment (see `Hut::spawn`) — inherited by every descendant
+//!    process regardless of `fork()`/`exec()`, and so, unlike walking
+//!    `PPid` chains, immune to a descendant being reparented away from
+//!    the shell entirely. That reparenting isn't a hypothetical: apps
+//!    that daemonize their real process on launch (VS Code/Codium's `code`
+//!    CLI is a well-known example — it backgrounds the actual Electron
+//!    process and exits immediately so the invoking shell doesn't block)
+//!    end up parented to init well before their window actually appears,
+//!    which breaks a pure ancestry walk outright — not "too slow", but
+//!    genuinely disconnected from the shell by the time it matters. This
+//!    also explains reports of ownership being wrong specifically for
+//!    slow-to-launch apps: the substantial delay is exactly the window
+//!    during which the real process gets reparented before its toplevel
+//!    ever shows up.
+//! 2. Walking the connecting client's process ancestry back to a known
+//!    Hut's shell PID — kept as a fallback for whatever `MUDHUTS_HUT_ID`
+//!    doesn't cover (e.g. a launcher that explicitly clears its child's
+//!    environment).
 
 use std::fs;
 
 use crate::stack::HutStack;
+
+/// Read `/proc/<pid>/environ`'s null-separated `KEY=VALUE` entries
+/// looking for `MUDHUTS_HUT_ID`. `None` if the process is gone,
+/// unreadable, or doesn't have it set — never panics on a malformed file.
+fn env_hut_id(pid: u32) -> Option<u64> {
+    let contents = fs::read(format!("/proc/{pid}/environ")).ok()?;
+    contents.split(|&b| b == 0).find_map(|entry| {
+        std::str::from_utf8(entry)
+            .ok()?
+            .strip_prefix("MUDHUTS_HUT_ID=")?
+            .parse()
+            .ok()
+    })
+}
 
 /// This only ever climbs a normal process tree (client -> ... -> some
 /// Hut's shell), so a real hit is always close — bounded so a
@@ -23,10 +58,18 @@ fn parent_pid(pid: u32) -> Option<u32> {
         .and_then(|rest| rest.trim().parse().ok())
 }
 
-/// Walk `client_pid`'s ancestry looking for a Hut whose shell is it or
-/// one of its ancestors. `None` if no Hut matches within the bound —
+/// Resolve which Hut owns `client_pid` — first via its own `MUDHUTS_HUT_ID`
+/// environment variable (see the module doc for why this is tried
+/// first), then by walking its process ancestry looking for a Hut whose
+/// shell is it or one of its ancestors. `None` if neither finds a match —
 /// callers should fall back to the currently focused Hut.
 pub fn find_owning_hut(client_pid: u32, stack: &HutStack) -> Option<u64> {
+    if let Some(id) = env_hut_id(client_pid)
+        && stack.huts().any(|hut| hut.id == id)
+    {
+        return Some(id);
+    }
+
     let mut pid = client_pid;
     for _ in 0..MAX_ANCESTRY_HOPS {
         if let Some(hut) = stack.huts().find(|h| h.shell_pid() == pid) {

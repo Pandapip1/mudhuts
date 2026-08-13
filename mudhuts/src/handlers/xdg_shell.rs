@@ -67,7 +67,7 @@ impl XdgShellHandler for State {
             .find_mut(owning_hut_id)
             .is_some_and(|hut| hut.main_window_count() == 0);
         if let Some(hut) = self.stack.find_mut(owning_hut_id) {
-            hut.push_main_window(window);
+            hut.push_main_window(window, was_empty);
         }
 
         // Nothing else was showing yet for this Hut specifically, so the

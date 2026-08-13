@@ -116,10 +116,14 @@ impl Hut {
     /// the shell's environment only (see [`Terminal::spawn`] — notably,
     /// this is how mudhuts points the shell at its own Wayland socket
     /// without touching the compositor's own `WAYLAND_DISPLAY`, which the
-    /// backend needs untouched to find whatever it's nested inside).
-    /// Returns the Hut plus a channel the caller must insert into the
-    /// calloop event loop to learn about terminal events (title changes,
-    /// shell exit).
+    /// backend needs untouched to find whatever it's nested inside) — on
+    /// top of `extra_env`, every Hut's shell also gets `MUDHUTS_HUT_ID`
+    /// set to this Hut's own id, inherited by every descendant process
+    /// regardless of `fork()`/`exec()` (see `ownership.rs`'s doc comment
+    /// on why this is needed alongside the PID-ancestry walk). Returns
+    /// the Hut plus a channel the caller must insert into the calloop
+    /// event loop to learn about terminal events (title changes, shell
+    /// exit).
     pub fn spawn(
         extra_env: impl IntoIterator<Item = (String, String)>,
     ) -> Result<
@@ -129,8 +133,12 @@ impl Hut {
         ),
         String,
     > {
+        let id = next_hut_id();
         let glyphs = GlyphCache::new()?;
         let cell_size = (glyphs.cell_width() as u16, glyphs.cell_height() as u16);
+        let extra_env = extra_env
+            .into_iter()
+            .chain(std::iter::once(("MUDHUTS_HUT_ID".to_string(), id.to_string())));
         let (terminal, events) = Terminal::spawn(INITIAL_COLS, INITIAL_LINES, cell_size, extra_env)
             .map_err(|e| e.to_string())?;
 
@@ -141,7 +149,7 @@ impl Hut {
 
         Ok((
             Hut {
-                id: next_hut_id(),
+                id,
                 terminal,
                 glyphs,
                 touched: false,
@@ -214,11 +222,23 @@ impl Hut {
     }
 
     /// A new client toplevel was assigned to this Hut — appended as a new
-    /// tab and made the active one (matches the existing auto-switch
-    /// spirit from Phase 2.5, now per-Hut and per-tab rather than global).
-    pub fn push_main_window(&mut self, window: Window) {
+    /// tab. Only becomes the active tab if `make_active` is set — callers
+    /// pass `true` when there was nothing else to keep showing (this
+    /// Hut's very first Main Window), matching the auto-switch spirit
+    /// from Phase 2.5, now per-Hut and per-tab rather than global.
+    /// `false` for a window arriving while this Hut is already showing a
+    /// *different* tab: it just joins the tab strip, exactly like the
+    /// existing "background Hut" case already does — without this, a
+    /// second/third window opening in a Hut that already has one visible
+    /// would silently steal the view out from under whatever the user
+    /// was looking at (`Self::main_windows`'s `active_main_window` index
+    /// changing regardless of the caller's own `should_show_now`
+    /// decision was exactly this bug — see `new_toplevel`'s notes).
+    pub fn push_main_window(&mut self, window: Window, make_active: bool) {
         self.main_windows.push(MainWindowEntry::new(window));
-        self.active_main_window = self.main_windows.len() - 1;
+        if make_active {
+            self.active_main_window = self.main_windows.len() - 1;
+        }
     }
 
     /// Whether `surface` is currently a bare (untagged) Main Window in
