@@ -1,5 +1,9 @@
-use smithay::backend::renderer::{Renderer, Texture};
-use smithay::backend::renderer::element::AsRenderElements;
+use std::sync::OnceLock;
+
+use smithay::backend::allocator::Fourcc;
+use smithay::backend::renderer::damage::OutputDamageTracker;
+use smithay::backend::renderer::{Bind, Offscreen, Renderer, Texture};
+use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree};
@@ -8,9 +12,7 @@ use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::utils::{CommitCounter, DamageBag, DamageSnapshot};
 use smithay::backend::renderer::{ImportAll, ImportMem, RendererSuper};
 use smithay::desktop::space::{Space, SpaceRenderElements, space_render_elements};
-use smithay::desktop::layer_map_for_output;
 use smithay::utils::{Buffer, Rectangle, Scale, Transform};
-use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
 
 use crate::State;
 use crate::hut::Hut;
@@ -190,62 +192,158 @@ smithay::backend::renderer::element::render_elements! {
 
 type Element = OutputRenderElements<GlesRenderer, HutSpaceRenderElement>;
 
-/// This output's layer-shell surfaces (`handlers/layer_shell.rs`), split
-/// into the same two halves Smithay's own `space_render_elements` splits
-/// them into internally: `upper` (Top + Overlay, meant to render *above*
-/// normal content) and `lower` (Background + Bottom, *below* it).
-/// `space_render_elements` only does this automatically for whichever real
-/// `Output` it's actually given — none of `build_frame_elements`'s three
-/// content branches render against the real output directly anymore since
-/// the composable Hut hierarchy RFC's migration step 5 (each renders
-/// against its own node's private, synthetic output instead — see
-/// `ConsoleHut::space_output`'s doc comment), so every one of them needs
-/// this hand-rolled equivalent now, not just the two that never went
-/// through a `Space` at all. Kept split (not flattened into one Vec) so
-/// the caller can insert its own content — a terminal texture, a whole
-/// tile's worth of panes, or a Console Hut's own composited `Space` output
-/// — into exactly the z-order slot a normal toplevel would otherwise
-/// occupy, between the two. Step 5 sub-step 4 (the Layer-Shell Root Hut)
-/// will delete this entirely once every content branch's output is
-/// consolidated through one real-output-bound `Space` instead.
-fn layer_elements(
-    state: &State,
+/// Stable identity for [`composite_normal_content`]'s single composited
+/// wrapper element — a module-level singleton (not a `State`/per-instance
+/// field) since there's only ever one "normal content" slot in the whole
+/// compositor, matching every other stable-`Id` pattern in this codebase
+/// (see e.g. `ConsoleHut::element_id`'s doc comment) in spirit, just
+/// without an owning struct instance to hang it off of.
+fn normal_content_id() -> Id {
+    static ID: OnceLock<Id> = OnceLock::new();
+    ID.get_or_init(Id::new).clone()
+}
+
+/// Whichever content this tick's focused view actually shows — a
+/// Tile-Hut's panes, the terminal, or the focused Console Hut's own
+/// `space` — built the same way each of `build_frame_elements`'s three
+/// branches always has, in the same real-output-*absolute* physical
+/// coordinates they always have (the terminal at literal `(0, 0)`; a
+/// Tile-Hut's panes and a Console Hut's Main Window/Floating
+/// Windows/Alerts at their own `usable_area()`-offset positions) — *not*
+/// re-based to be local to some smaller canvas. See
+/// [`composite_normal_content`]'s own doc comment on why that has to stay
+/// true all the way through to the offscreen texture this gets rendered
+/// into.
+fn content_elements(state: &mut State, renderer: &mut GlesRenderer) -> Vec<Element> {
+    if matches!(state.stack.focused_top_level(), Hut::Tile(tile) if tile.children.len() >= 2) {
+        return build_tile_elements(state, renderer);
+    }
+
+    if state.showing_terminal_effective() {
+        let scale = state.output_scale();
+        let hut = state.stack.focused_mut();
+        let Some(texture) = hut.redraw(renderer) else {
+            return Vec::new();
+        };
+        // `from_texture_with_damage`, not `from_static_texture` — the
+        // terminal's content genuinely changes every keystroke, and
+        // `from_static_texture` is documented by Smithay as creating an
+        // element with no damage tracking at all (see
+        // `ConsoleHut::damage_tracker`'s doc comment).
+        //
+        // Buffer scale, not an explicit `size` — see
+        // `texture_buffer_scale`'s doc comment for why leaving this `1`
+        // double-applies the output's scale once it's non-1.0, and why an
+        // explicit `size` alone isn't the right fix either.
+        let element = TextureRenderElement::from_texture_with_damage(
+            hut.element_id.clone(),
+            renderer.context_id(),
+            (0.0, 0.0),
+            texture,
+            texture_buffer_scale(scale),
+            Transform::Normal,
+            None,
+            None,
+            None,
+            None,
+            hut.element_damage_snapshot(),
+            Kind::Unspecified,
+        );
+        return vec![OutputRenderElements::from(element)];
+    }
+
+    let hut = state.stack.focused_mut();
+    match space_render_elements::<_, HutSpaceElement, _>(renderer, [&hut.space], &hut.space_output, 1.0) {
+        Ok(space_elements) => space_elements.into_iter().map(OutputRenderElements::from).collect(),
+        Err(err) => {
+            tracing::warn!("failed to collect space elements: {err}");
+            Vec::new()
+        }
+    }
+}
+
+/// Composite [`content_elements`]'s current output into one offscreen
+/// texture sized to `size` — the *real, full output* size (physical
+/// pixels; the same `size` `build_frame_elements` itself already receives
+/// from its caller), **not** just `State::usable_area()`'s smaller one.
+/// This matters for correctness, not just consistency: `content_elements`'s
+/// branches (`ConsoleHut::space`'s Main Window mapping via
+/// `State::sync_visible_main_window`, `TileHut::absolute_pane_rects`) all
+/// position things in real-output-*absolute* physical coordinates — the
+/// same coordinates `input.rs`'s click routing and
+/// `handlers/xdg_shell.rs::unconstrain_popup` also depend on staying
+/// absolute — so the offscreen canvas they're rendered into has to span
+/// the same coordinate range those positions assume, or content silently
+/// clips/misplaces itself the moment a layer-shell surface reserves any
+/// part of the output (`usable_area()`'s origin stops being `(0, 0)`).
+/// `build_frame_elements` maps the finished texture at `(0, 0)` in the
+/// real output's own `Space` accordingly — not `usable_area()`'s origin —
+/// for the same reason.
+///
+/// The "normal content" child `build_frame_elements` maps into a `Space`
+/// bound to the *real* output, alongside whatever layer-shell surfaces are
+/// mapped there, via exactly one `space_render_elements` call. Composable
+/// Hut hierarchy RFC migration step 5 sub-step 4 (the Layer-Shell Root
+/// Hut, Q2) — the production version of the original step-3 prototype's
+/// own `render_offscreen` helper (`git log` for this file's earlier
+/// `hut_space.rs` history), minus the CPU readback that only ever existed
+/// for that prototype's own byte-diff comparison.
+///
+/// Transparent clear (`[0.0, 0.0, 0.0, 0.0]`), not opaque — if
+/// `content_elements` returns nothing at all (e.g. a transient
+/// `ConsoleHut::redraw` failure), this must let whatever's mapped
+/// *underneath* it in the real `Space` (a background layer-shell surface)
+/// show through, matching exactly what happens today when a content
+/// branch simply has nothing to push.
+///
+/// `None` (logged, not panicked) on any real failure — every one of the
+/// GL/allocation calls this makes is fallible for reasons outside this
+/// compositor's control (a legitimate GPU-memory shortage, a renderer
+/// hiccup), never something to crash the whole compositor over, matching
+/// every other offscreen-render call site in this codebase
+/// (`handlers/capture.rs::render_capture`).
+fn composite_normal_content(
+    state: &mut State,
     renderer: &mut GlesRenderer,
-) -> (Vec<Element>, Vec<Element>) {
-    let Some(output) = state.output.as_ref() else {
-        return (Vec::new(), Vec::new());
-    };
-    // Layer geometry (`layer_geometry`) is genuinely Logical (see
-    // `handlers/layer_shell.rs`'s module doc) — has to be converted to
-    // physical here, same as `space_render_elements` already does
-    // internally for the Main-Window-visible branch this function stands
-    // in for (see this function's own doc comment).
+    size: (i32, i32),
+) -> Option<CompositedTexture> {
+    if size.0 <= 0 || size.1 <= 0 {
+        return None;
+    }
     let scale = state.output_scale();
-    let map = layer_map_for_output(output);
-    let (lower, upper): (Vec<_>, Vec<_>) = map
-        .layers()
-        .rev()
-        .partition(|s| matches!(s.layer(), WlrLayer::Background | WlrLayer::Bottom));
+    let elements = content_elements(state, renderer);
 
-    let mut render = |surfaces: Vec<&smithay::desktop::LayerSurface>| -> Vec<Element> {
-        surfaces
-            .into_iter()
-            .filter_map(|s| map.layer_geometry(s).map(|geo| (geo.loc, s)))
-            .flat_map(|(loc, s)| {
-                let elems: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = s.render_elements(
-                    renderer,
-                    loc.to_physical_precise_round(scale),
-                    Scale::from(scale),
-                    1.0,
-                );
-                elems
-                    .into_iter()
-                    .map(|e| Element::from(SpaceRenderElements::Surface(e)))
-            })
-            .collect()
-    };
+    let offscreen_output = synthetic_output("normal-content", size);
+    let fourcc = Fourcc::Argb8888;
+    let buffer_size: smithay::utils::Size<i32, Buffer> = size.into();
+    let mut texture = Offscreen::<GlesTexture>::create_buffer(renderer, fourcc, buffer_size)
+        .inspect_err(|err| tracing::warn!("failed to create offscreen buffer for normal content: {err}"))
+        .ok()?;
+    let mut target = renderer
+        .bind(&mut texture)
+        .inspect_err(|err| tracing::warn!("failed to bind offscreen buffer for normal content: {err}"))
+        .ok()?;
+    let mut tracker = OutputDamageTracker::from_output(&offscreen_output);
+    tracker
+        .render_output(renderer, &mut target, 0, &elements, [0.0, 0.0, 0.0, 0.0])
+        .inspect_err(|err| tracing::warn!("failed to render normal content offscreen: {err}"))
+        .ok()?;
+    drop(target);
 
-    (render(upper), render(lower))
+    // A fresh `DamageBag` every call (never persisted across frames) —
+    // its `snapshot()` has no prior commit for the outer per-element
+    // damage tracker to recognize, and `DamageSnapshot::damage_since`'s
+    // own doc comment is explicit that means "the whole element geometry
+    // should be considered as damaged." That's exactly right here: this
+    // function only ever runs during an actual demand-driven redraw pass
+    // to begin with (Phase 2.6's damage-avoidance discipline), so by the
+    // time it's called, something real already triggered it.
+    Some(CompositedTexture::new(
+        normal_content_id(),
+        texture,
+        scale,
+        DamageBag::default().snapshot(),
+    ))
 }
 
 /// Everything mudhuts draws while `state.locked` is set (see
@@ -302,9 +400,10 @@ fn lock_screen_elements(
 }
 
 /// Build one frame's worth of render elements (Alt-Tab popup, tab-strip
-/// chrome, docked-handle chrome, then either the focused ConsoleHut's terminal
-/// texture or its visible Main Window/Floating Windows/Alerts via `state.space`)
-/// in front-to-back order — shared by every backend
+/// chrome, docked-handle chrome, then the "normal content" — a Tile-Hut's
+/// panes, the terminal, or the focused Console Hut's visible Main
+/// Window/Floating Windows/Alerts — layered against the real output's own
+/// layer-shell surfaces) in front-to-back order — shared by every backend
 /// (`winit_backend.rs`/`udev_backend.rs`) so the element-assembly logic
 /// itself is written once. Backend-specific concerns (binding a
 /// framebuffer, damage tracking vs. DRM's `render_frame`, submitting/
@@ -325,6 +424,7 @@ pub fn build_frame_elements(
     }
 
     let show_terminal = state.showing_terminal_effective();
+    let is_tile = matches!(state.stack.focused_top_level(), Hut::Tile(tile) if tile.children.len() >= 2);
     let scale = state.output_scale();
     let mut elements = Vec::new();
 
@@ -346,122 +446,76 @@ pub fn build_frame_elements(
     // client window; empty when no preview session is open.
     elements.extend(switcher::build(&state.stack, size, renderer, scale));
 
-    // Tile-Hut (Phase 6) — bypasses the normal single-ConsoleHut chrome/
-    // docks/terminal-or-space pipeline entirely: every pane is visible
+    // Tile-Hut (Phase 6) still bypasses the normal single-ConsoleHut
+    // chrome/docks pipeline entirely — every pane is visible
     // simultaneously, side by side, each always showing its own ConsoleHut's
     // terminal (never a Main Window — see `village.rs`'s module doc on
-    // why that's this pass's deliberate scope). A 1-child (or empty)
-    // Tile never actually exists (`Hut::collapse_if_singleton`
-    // unwraps it immediately), but the length check stays as a defensive
-    // fallback to the normal pipeline rather than assumed.
-    if matches!(state.stack.focused_top_level(), Hut::Tile(tile) if tile.children.len() >= 2) {
-        let (layer_upper, layer_lower) = layer_elements(state, renderer);
-        elements.extend(layer_upper);
-        elements.extend(build_tile_elements(state, renderer));
-        elements.extend(layer_lower);
-        return elements;
-    }
+    // why that's this pass's deliberate scope), so there's no Hut-level
+    // tab strip / Main-Window tab strip / dock handle to draw. A 1-child
+    // (or empty) Tile never actually exists (`Hut::collapse_if_singleton`
+    // unwraps it immediately), but the length check (`is_tile`, above)
+    // stays as a defensive fallback to the normal pipeline rather than
+    // assumed.
+    if !is_tile {
+        // Hut-level tab strip(s) (Phase 6) — one per Tab-Hut along
+        // the active path, stacked from the top of the screen, outermost
+        // first (see `village_chrome.rs`'s module doc). Empty unless the
+        // focused top-level Hut actually is a Tab-Hut with 2+
+        // children; `next_y` is unchanged (0) in that case.
+        let cell_w = state.stack.focused().glyphs.cell_width().max(1);
+        let cell_h = state.stack.focused().glyphs.cell_height().max(1) as i32;
+        let (village_tab_elements, next_y) =
+            village_chrome::build(state.stack.focused_top_level_mut(), renderer, 0, cell_w, cell_h, scale);
+        elements.extend(village_tab_elements);
 
-    // Hut-level tab strip(s) (Phase 6) — one per Tab-Hut along
-    // the active path, stacked from the top of the screen, outermost
-    // first (see `village_chrome.rs`'s module doc). Empty unless the
-    // focused top-level Hut actually is a Tab-Hut with 2+
-    // children; `next_y` is unchanged (0) in that case.
-    let cell_w = state.stack.focused().glyphs.cell_width().max(1);
-    let cell_h = state.stack.focused().glyphs.cell_height().max(1) as i32;
-    let (village_tab_elements, next_y) =
-        village_chrome::build(state.stack.focused_top_level_mut(), renderer, 0, cell_w, cell_h, scale);
-    elements.extend(village_tab_elements);
+        // Tab-strip chrome (Phase 4) — pushed below any Hut-level strips
+        // above it, still on top of the terminal/window content and still
+        // below the Alt-Tab popup above. Empty when the focused ConsoleHut has no
+        // Main Windows.
+        elements.extend(chrome::build(state.stack.focused_mut(), renderer, next_y, scale));
 
-    // Tab-strip chrome (Phase 4) — pushed below any Hut-level strips
-    // above it, still on top of the terminal/window content and still
-    // below the Alt-Tab popup above. Empty when the focused ConsoleHut has no
-    // Main Windows.
-    elements.extend(chrome::build(state.stack.focused_mut(), renderer, next_y, scale));
-
-    // Docked Floating Window handles (Phase 5) — same z-order slot as the tab
-    // strip, only shown alongside the Main Window they belong to (never
-    // while the terminal itself is the visible view).
-    if !show_terminal {
-        elements.extend(docks::build(state.stack.focused_mut(), renderer, size, scale));
-    }
-
-    if show_terminal {
-        // Layer-shell surfaces around the terminal texture — the
-        // Main-Window-visible branch below gets this automatically from
-        // `space_render_elements`; this branch doesn't go through a
-        // `Space` at all, so it needs the hand-rolled equivalent (see
-        // `layer_elements`'s doc comment).
-        let (layer_upper, layer_lower) = layer_elements(state, renderer);
-        elements.extend(layer_upper);
-        let scale = state.output_scale();
-        let hut = state.stack.focused_mut();
-        if let Some(texture) = hut.redraw(renderer) {
-            // `from_texture_with_damage`, not `from_static_texture` — the
-            // terminal's content genuinely changes every keystroke, and
-            // `from_static_texture` is documented by Smithay as creating
-            // an element with no damage tracking at all (see
-            // `ConsoleHut::damage_tracker`'s doc comment).
-            //
-            // Buffer scale, not an explicit `size` — see
-            // `texture_buffer_scale`'s doc comment for why leaving this
-            // `1` double-applies the output's scale once it's non-1.0,
-            // and why an explicit `size` alone isn't the right fix either.
-            let element = TextureRenderElement::from_texture_with_damage(
-                hut.element_id.clone(),
-                renderer.context_id(),
-                (0.0, 0.0),
-                texture,
-                texture_buffer_scale(scale),
-                Transform::Normal,
-                None,
-                None,
-                None,
-                None,
-                hut.element_damage_snapshot(),
-                Kind::Unspecified,
-            );
-            elements.push(OutputRenderElements::from(element));
+        // Docked Floating Window handles (Phase 5) — same z-order slot as the tab
+        // strip, only shown alongside the Main Window they belong to (never
+        // while the terminal itself is the visible view).
+        if !show_terminal {
+            elements.extend(docks::build(state.stack.focused_mut(), renderer, size, scale));
         }
-        elements.extend(layer_lower);
-    } else {
-        // Composable Hut hierarchy RFC migration step 5 sub-step 2: the
-        // focused ConsoleHut's own `Space<HutSpaceElement>` + synthetic
-        // `space_output`, not the old global `state.space` + the real
-        // output — `space_output` is always mapped at `(0, 0)` within
-        // `hut.space` (see `ConsoleHut::spawn`), so every element's
-        // resulting location comes out identical to what mapping directly
-        // against the real output always produced (`render_location() -
-        // region.loc` in Smithay's own `render_elements_for_region`, with
-        // `region.loc` always zero here) — a real screen-relative physical
-        // position, pushed straight into `elements` with no further
-        // translation needed, exactly like the terminal-visible branch
-        // above already does for its own texture.
-        //
-        // Regression fix, 2026-08-13: `space_render_elements` only
-        // automatically includes layer-shell surfaces for whichever real
-        // `Output` it's actually given — that stopped being true here the
-        // moment this branch started rendering against `hut.space_output`
-        // (a private, never-globalized synthetic output no layer-shell
-        // client is ever registered against) instead of the real one, so
-        // this now needs the same hand-rolled `layer_elements` split the
-        // terminal-visible branch above already uses, or a status bar
-        // etc. silently vanishes the instant a Main Window is shown.
-        // Interim fix — RFC migration step 5 sub-step 4 (the Layer-Shell
-        // Root Hut) properly subsumes this by consolidating every content
-        // branch's output through one real-output-bound `Space`, at which
-        // point this hand-rolled split goes away again along with
-        // `layer_elements` itself.
-        let (layer_upper, layer_lower) = layer_elements(state, renderer);
-        elements.extend(layer_upper);
-        let hut = state.stack.focused_mut();
-        match space_render_elements::<_, HutSpaceElement, _>(renderer, [&hut.space], &hut.space_output, 1.0) {
+    }
+
+    // "Normal content" (Q1/Q2's own term for it) — the Layer-Shell Root
+    // Hut's one job: composite whatever `content_elements` currently
+    // produces (already built for real inside `composite_normal_content`)
+    // into a single texture, map it into a `Space<HutSpaceElement>` bound
+    // to the *real* output alongside every layer-shell surface, and pull
+    // the whole thing together with one `space_render_elements` call —
+    // which handles Background/Bottom-vs-Top/Overlay ordering
+    // automatically, the same way it always has for a real, non-synthetic
+    // output. Replaces every one of the three content branches' own former
+    // hand-rolled `layer_elements` wrap (now deleted) with this one,
+    // uniform path. Still done even if `composite_normal_content` itself
+    // returns `None` (an offscreen-render failure, or a genuinely empty
+    // frame) — layer-shell surfaces still need to render on their own in
+    // that case, exactly like they always have.
+    //
+    // `size` (the real, full output size), not `usable_area()`'s smaller
+    // one, and mapped at `(0, 0)`, not `usable_area()`'s own origin — see
+    // `composite_normal_content`'s own doc comment on why: the content
+    // inside it is already positioned in real-output-absolute coordinates,
+    // so the canvas it's rendered onto (and where that canvas then lands)
+    // has to match that same coordinate range, not a smaller, re-based one.
+    let composited = composite_normal_content(state, renderer, size);
+    if let Some(output) = state.output.clone() {
+        let mut root_space = Space::<HutSpaceElement>::default();
+        root_space.map_output(&output, (0, 0));
+        if let Some(composited) = composited {
+            root_space.map_element(HutSpaceElement::Composited(composited), (0, 0), false);
+        }
+        match space_render_elements::<_, HutSpaceElement, _>(renderer, [&root_space], &output, 1.0) {
             Ok(space_elements) => {
                 elements.extend(space_elements.into_iter().map(OutputRenderElements::from))
             }
-            Err(err) => tracing::warn!("failed to collect space elements: {err}"),
+            Err(err) => tracing::warn!("failed to collect root space elements: {err}"),
         }
-        elements.extend(layer_lower);
     }
 
     elements
