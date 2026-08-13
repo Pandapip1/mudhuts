@@ -5,7 +5,7 @@ use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::winit::{self, WinitEvent};
 use smithay::input::keyboard::KeyboardSource;
-use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
+use smithay::output::{Mode, Output, PhysicalProperties, Scale as OutputScale, Subpixel};
 use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::calloop::ping::PingSource;
 use smithay::utils::Transform;
@@ -35,6 +35,17 @@ pub fn init_winit(
         size: backend.borrow().window_size(),
         refresh: 60_000,
     };
+    // Real detection, not hardcoded: the host window's own DPI scale
+    // (winit already tracks this for us — the same value a native
+    // toolkit app running directly on the host would see). Read once at
+    // startup and never revisited — see `State::output_scale`'s doc
+    // comment on why mudhuts has no live-rescale mechanism to hook a
+    // later `WinitEvent::Resized { scale_factor, .. }` change into (the
+    // nested window being dragged to a different-DPI monitor mid-session
+    // is a real but accepted gap, matching how little else about this
+    // backend is meant for more than local development against the real
+    // udev/DRM one).
+    let scale = backend.borrow().scale_factor();
 
     let output = Output::new(
         "winit".to_string(),
@@ -50,7 +61,7 @@ pub fn init_winit(
     output.change_current_state(
         Some(mode),
         Some(Transform::Flipped180),
-        None,
+        Some(OutputScale::Fractional(scale)),
         Some((0, 0).into()),
     );
     output.set_preferred(mode);
@@ -92,8 +103,12 @@ pub fn init_winit(
                     // `new_toplevel`'s fullscreen size hint is only ever
                     // sent once, at creation — already-mapped Main
                     // Windows (visible or not) need a fresh configure to
-                    // actually resize when the output does.
-                    let (_, _, usable_w, usable_h) = state.usable_area();
+                    // actually resize when the output does. A real
+                    // `xdg_toplevel` configure is client-facing protocol
+                    // state, always logical regardless of how many
+                    // physical pixels mudhuts itself renders into — see
+                    // `State::usable_area_logical`'s doc comment.
+                    let (_, _, usable_w, usable_h) = state.usable_area_logical();
                     let usable_logical = smithay::utils::Size::<i32, smithay::utils::Logical>::from((usable_w, usable_h));
                     xdg_shell::resize_all_main_windows(&state.stack, usable_logical);
                     // Nothing else re-pushes capture buffer constraints on

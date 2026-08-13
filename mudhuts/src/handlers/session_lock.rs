@@ -109,7 +109,15 @@ impl SessionLockHandler for State {
             return;
         };
         if let Some(mode) = out.current_mode() {
-            let size = (mode.size.w.max(0) as u32, mode.size.h.max(0) as u32);
+            // Logical, not the mode's raw physical pixel size — this is a
+            // real client-facing configure, same reasoning as
+            // `handlers/xdg_shell.rs`'s `new_toplevel`/`State::usable_area_logical`.
+            let logical: smithay::utils::Size<i32, smithay::utils::Logical> = mode
+                .size
+                .to_f64()
+                .to_logical(out.current_scale().fractional_scale())
+                .to_i32_round();
+            let size = (logical.w.max(0) as u32, logical.h.max(0) as u32);
             surface.with_pending_state(|state| {
                 state.size = Some(Size::from(size));
             });

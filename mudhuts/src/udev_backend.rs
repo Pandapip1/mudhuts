@@ -101,7 +101,7 @@ use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{self, UdevBackend, UdevEvent};
 use smithay::input::pointer::{CursorIcon, CursorImageAttributes, CursorImageStatus};
-use smithay::output::{Mode as WlMode, Output, PhysicalProperties};
+use smithay::output::{Mode as WlMode, Output, PhysicalProperties, Scale as OutputScale};
 use smithay::reexports::calloop::ping::PingSource;
 use smithay::reexports::calloop::{EventLoop, LoopHandle};
 use smithay::reexports::drm::control::{Device as _, ModeTypeFlags, connector, crtc};
@@ -552,6 +552,50 @@ fn rescan_connectors(state: &mut State, inner: &Rc<RefCell<Inner>>, handle: &Loo
     }
 }
 
+/// Real (not hardcoded) HiDPI detection for a newly-connected desktop
+/// connector: `MUDHUTS_OUTPUT_SCALE` wins if set — an escape hatch for
+/// panels whose EDID physical size is wrong or absent, a real and fairly
+/// common hardware quirk, not a hypothetical — otherwise a plain pixel-
+/// density heuristic derived from `connector.size()`'s own reported
+/// physical dimensions, using roughly the same ~192 DPI threshold most
+/// desktop environments already default to for "treat this as a HiDPI
+/// panel." Diagonal DPI, not width/height checked separately, so this
+/// doesn't need to reconcile two different figures for a non-square
+/// aspect ratio.
+///
+/// Deliberately coarse: rounds to a whole-number scale rather than
+/// trying to guess an in-between fractional one, since 2x is
+/// overwhelmingly the common real case — including this backend's own
+/// motivating hardware target, Apple Silicon's built-in Retina panel.
+/// Computed once at connector-connect time and never revisited: mudhuts
+/// has no live-rescale mechanism (see `State::output_scale`'s doc
+/// comment), and a real monitor's physical size/pixel count can't change
+/// without a fresh connector-connect event of its own anyway.
+fn detect_output_scale(phys_size_mm: (i32, i32), pixels: (i32, i32)) -> f64 {
+    if let Some(scale) = std::env::var("MUDHUTS_OUTPUT_SCALE")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|scale| *scale > 0.0)
+    {
+        return scale;
+    }
+
+    let (phys_w_mm, phys_h_mm) = phys_size_mm;
+    let (px_w, px_h) = pixels;
+    if phys_w_mm <= 0 || phys_h_mm <= 0 || px_w <= 0 || px_h <= 0 {
+        return 1.0;
+    }
+
+    let diag_px = ((px_w * px_w + px_h * px_h) as f64).sqrt();
+    let diag_in = ((phys_w_mm * phys_w_mm + phys_h_mm * phys_h_mm) as f64).sqrt() / 25.4;
+    if diag_in <= 0.0 {
+        return 1.0;
+    }
+
+    let dpi = diag_px / diag_in;
+    if dpi >= 192.0 { 2.0 } else { 1.0 }
+}
+
 fn connector_connected(
     state: &mut State,
     inner: &Rc<RefCell<Inner>>,
@@ -619,6 +663,8 @@ fn connector_connected(
     let wl_mode = WlMode::from(drm_mode);
 
     let (phys_w, phys_h) = connector.size().unwrap_or((0, 0));
+    let scale = detect_output_scale((phys_w as i32, phys_h as i32), (wl_mode.size.w, wl_mode.size.h));
+    tracing::info!("connector {output_name}: detected output scale {scale}");
     let output = Output::new(
         output_name.clone(),
         PhysicalProperties {
@@ -631,7 +677,12 @@ fn connector_connected(
     );
     let _global = output.create_global::<State>(&state.display_handle);
     output.set_preferred(wl_mode);
-    output.change_current_state(Some(wl_mode), None, None, Some((0, 0).into()));
+    output.change_current_state(
+        Some(wl_mode),
+        None,
+        Some(OutputScale::Fractional(scale)),
+        Some((0, 0).into()),
+    );
 
     let drm_output = {
         let mut inner_mut = inner.borrow_mut();
@@ -924,11 +975,26 @@ fn build_cursor_elements(
 
     pointer_element.set_status(state.cursor_status.clone());
 
+    // `state.pointer_location`/`hotspot` are both genuinely Logical (see
+    // `state.rs`'s `pointer_location` doc comment; `hotspot` in the
+    // `Named` case above comes from the xcursor theme's base-size image,
+    // whose nominal size — like `XCURSOR_SIZE` itself — is a logical, not
+    // physical, unit) — converted to physical here, at the render
+    // boundary, same as everywhere else in this compositor.
+    //
+    // Still picks the theme's base-size image regardless of output scale
+    // (`.frame(1, ...)` above, not `.frame(scale as u32, ...)`) — a real
+    // but cosmetic-only gap (the cursor renders correctly positioned, just
+    // not at full HiDPI crispness), matching anvil's own reference
+    // (`anvil/src/udev.rs`'s `// TODO get scale from the rendersurface
+    // when supporting HiDPI`) rather than a click-accuracy concern this
+    // pass is scoped to fix.
+    let scale = state.output_scale();
     let cursor_pos = (state.pointer_location - hotspot.to_f64())
-        .to_physical(Scale::from(1.0))
+        .to_physical(Scale::from(scale))
         .to_i32_round();
 
-    pointer_element.render_elements(renderer, cursor_pos, Scale::from(1.0), 1.0)
+    pointer_element.render_elements(renderer, cursor_pos, Scale::from(scale), 1.0)
 }
 
 fn frame_finish(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Handle) {

@@ -162,6 +162,12 @@ fn layer_elements(
     let Some(output) = state.space.outputs().next() else {
         return (Vec::new(), Vec::new());
     };
+    // Layer geometry (`layer_geometry`) is genuinely Logical (see
+    // `handlers/layer_shell.rs`'s module doc) — has to be converted to
+    // physical here, same as `space_render_elements` already does
+    // internally for the Main-Window-visible branch this function stands
+    // in for (see this function's own doc comment).
+    let scale = state.output_scale();
     let map = layer_map_for_output(output);
     let (lower, upper): (Vec<_>, Vec<_>) = map
         .layers()
@@ -175,8 +181,8 @@ fn layer_elements(
             .flat_map(|(loc, s)| {
                 let elems: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = s.render_elements(
                     renderer,
-                    loc.to_physical_precise_round(1.0),
-                    Scale::from(1.0),
+                    loc.to_physical_precise_round(scale),
+                    Scale::from(scale),
                     1.0,
                 );
                 elems
@@ -217,7 +223,7 @@ fn lock_screen_elements(
             renderer,
             surface.wl_surface(),
             smithay::utils::Point::<i32, smithay::utils::Physical>::from((0, 0)),
-            Scale::from(1.0),
+            Scale::from(state.output_scale()),
             1.0,
             Kind::Unspecified,
         );
