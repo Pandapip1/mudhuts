@@ -7,14 +7,14 @@ use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::utils::{CommitCounter, DamageBag, DamageSnapshot};
 use smithay::backend::renderer::{ImportAll, ImportMem, RendererSuper};
-use smithay::desktop::space::{SpaceRenderElements, space_render_elements};
+use smithay::desktop::space::{Space, SpaceRenderElements, space_render_elements};
 use smithay::desktop::layer_map_for_output;
 use smithay::utils::{Buffer, Rectangle, Scale, Transform};
 use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
 
 use crate::State;
 use crate::hut::Hut;
-use crate::space_element::{HutSpaceElement, HutSpaceRenderElement};
+use crate::space_element::{CompositedTexture, HutSpaceElement, HutSpaceRenderElement, synthetic_output};
 use crate::{chrome, docks, switcher, village_chrome};
 
 /// The [`TextureRenderElement`] buffer-scale ([`Element::src`]/
@@ -448,9 +448,25 @@ pub fn build_frame_elements(
 /// Build a Tile-Hut's panes side by side: each child's own terminal
 /// texture (already sized to its pane by `Hut::resize_to_pixels` — see
 /// that method and [`crate::hut::pane_rects`]), composited at its pane's
-/// screen position, plus a highlight border around whichever pane
-/// currently has keyboard focus. Only called once the caller's confirmed
-/// the focused top-level Hut really is a `Hut::Tile` with 2+ children.
+/// screen position via a private `Space<HutSpaceElement>` (composable Hut
+/// hierarchy RFC migration step 5 sub-step 3 — each pane's texture is a
+/// `HutSpaceElement::Composited`, mapped and rendered the same generic way
+/// `ConsoleHut::space` already composites its own content, rather than
+/// hand-rolled `TextureRenderElement` construction), plus a highlight
+/// border around whichever pane currently has keyboard focus. Only called
+/// once the caller's confirmed the focused top-level Hut really is a
+/// `Hut::Tile` with 2+ children.
+///
+/// The `Space` here is a fresh, per-call local, *not* a persistent
+/// `TileHut` field the way `ConsoleHut::space` is — unlike a Console Hut's
+/// Main Window (a real, persistent `Window` `sync_visible_main_window`
+/// only remaps on focus/visibility changes), every pane's content here is
+/// an ephemeral, single-use `CompositedTexture` rebuilt fresh every frame
+/// regardless (v1 scope: a pane only ever shows its Console Hut's
+/// terminal, never a real Main Window — see `hut.rs`'s module doc), so
+/// there's no frame-to-frame state actually worth keeping — mirrors
+/// `hut_space.rs`'s original step-3 prototype's own local-`Space` pattern,
+/// now for real.
 ///
 /// Panes are normal content — like the terminal-visible branch above,
 /// sized and positioned against [`State::usable_area`], not the raw
@@ -459,7 +475,13 @@ pub fn build_frame_elements(
 /// `input.rs::try_click_chrome`'s pane hit-test share (composable Hut
 /// hierarchy RFC's Q3) — the three can never disagree about where a pane
 /// actually is, since there's only one computation left to disagree with
-/// itself.
+/// itself. The pane `Space`'s own synthetic output is always mapped at
+/// `(0, 0)` within it (same reasoning as `ConsoleHut::space_output`), so
+/// mapping each pane's element at its *absolute* screen position (not
+/// re-derived relative to the pane `Space`'s own origin) still comes out
+/// byte-identical to what direct `TextureRenderElement` construction
+/// produced before — confirmed against `Space::render_elements_for_region`'s
+/// own math (it subtracts the output's own location, which is zero here).
 fn build_tile_elements(
     state: &mut State,
     renderer: &mut GlesRenderer,
@@ -506,26 +528,32 @@ fn build_tile_elements(
         }
     }
 
+    let (_, _, area_w, area_h) = area;
+    let pane_output = synthetic_output("tile-hut-space", (area_w, area_h));
+    let mut pane_space = Space::<HutSpaceElement>::default();
+    pane_space.map_output(&pane_output, (0, 0));
     for ((child, _), (x, y, _, _)) in tile.children.iter_mut().zip(rects) {
         let hut = child.focused_hut_mut();
         let Some(texture) = hut.redraw(renderer) else {
             continue;
         };
-        let element = TextureRenderElement::from_texture_with_damage(
+        let composited = CompositedTexture::new(
             hut.element_id.clone(),
-            renderer.context_id(),
-            (x as f64, y as f64),
             texture,
-            texture_buffer_scale(scale),
-            Transform::Normal,
-            None,
-            None,
-            None,
-            None,
+            scale,
             hut.element_damage_snapshot(),
-            Kind::Unspecified,
         );
-        elements.push(OutputRenderElements::from(element));
+        // Absolute (real screen) coordinates, not re-derived relative to
+        // `pane_space`'s own origin — see this function's doc comment on
+        // why that's still correct: `pane_output` is always mapped at
+        // `(0, 0)` within `pane_space`.
+        pane_space.map_element(HutSpaceElement::Composited(composited), (x, y), false);
+    }
+    match space_render_elements::<_, HutSpaceElement, _>(renderer, [&pane_space], &pane_output, 1.0) {
+        Ok(space_elements) => {
+            elements.extend(space_elements.into_iter().map(OutputRenderElements::from))
+        }
+        Err(err) => tracing::warn!("failed to collect tile-pane space elements: {err}"),
     }
 
     elements

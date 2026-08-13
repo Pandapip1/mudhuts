@@ -21,12 +21,13 @@ use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::element::{AsRenderElements, Kind};
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
+use smithay::backend::renderer::utils::DamageSnapshot;
 use smithay::backend::renderer::{Renderer, Texture};
 use smithay::backend::renderer::element::Id;
 use smithay::desktop::Window;
 use smithay::desktop::space::SpaceElement;
 use smithay::output::{Mode, Output, PhysicalProperties, Scale as OutputScale, Subpixel};
-use smithay::utils::{IsAlive, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
+use smithay::utils::{Buffer, IsAlive, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
 /// A single already-rendered texture, wrapped so it can sit in a
 /// [`Space<HutSpaceElement>`](smithay::desktop::space::Space) as a
@@ -42,17 +43,43 @@ use smithay::utils::{IsAlive, Logical, Physical, Point, Rectangle, Scale, Size, 
 pub struct CompositedTexture {
     id: Id,
     texture: GlesTexture,
-    /// This assumes scale `1.0` compositing (see `synthetic_output`'s doc
-    /// comment on why), so the texture's own physical pixel size doubles
-    /// as its `Logical` bbox size with no conversion needed.
     size: Size<i32, Logical>,
+    /// The integer buffer-scale used to derive `size` from `texture`'s own
+    /// physical-pixel size, and passed to
+    /// `TextureRenderElement::from_texture_with_damage` below — has to be
+    /// the *same* value in both places, or the two disagree about this
+    /// element's real on-screen size (see `render::texture_buffer_scale`'s
+    /// own doc comment: the buffer-scale argument, not an explicit `size`
+    /// override, is what avoids double-applying the output's scale).
+    buffer_scale: i32,
+    /// Real damage tracking, threaded through from whatever produced
+    /// `texture` (e.g. `ConsoleHut::element_damage_snapshot`) — *not*
+    /// `from_static_texture`'s implicit "no damage" snapshot, which is
+    /// only correct for genuinely static content. A `CompositedTexture`
+    /// commonly wraps something that changes every frame (a terminal
+    /// grid); `from_static_texture` here would silently break the outer,
+    /// per-element damage tracker under the udev/DRM backend specifically
+    /// (`DrmCompositor` — the winit backend's simpler single-buffer
+    /// tracker wouldn't show the bug, but it's real all the same; see
+    /// `ConsoleHut::damage_tracker`'s own doc comment for the exact same
+    /// trap in a different guise).
+    damage: DamageSnapshot<i32, Buffer>,
     marker: Rc<()>,
 }
 
 impl CompositedTexture {
-    pub fn new(id: Id, texture: GlesTexture) -> Self {
-        let size = texture.size().to_logical(1, Transform::Normal);
-        Self { id, texture, size, marker: Rc::new(()) }
+    /// `scale` is the real output scale (the same fractional value
+    /// `State::output_scale()` reports), rounded to the nearest integer
+    /// buffer-scale internally via `render::texture_buffer_scale` —
+    /// matching every other texture element in this codebase. Getting this
+    /// wrong (e.g. hardcoding `1`, as an earlier prototype version of this
+    /// type deliberately did — see the RFC's step 3 notes, "this prototype
+    /// only ever composites at scale 1.0") would silently mis-scale
+    /// whatever this wraps on any real, non-1.0-scale display.
+    pub fn new(id: Id, texture: GlesTexture, scale: f64, damage: DamageSnapshot<i32, Buffer>) -> Self {
+        let buffer_scale = crate::render::texture_buffer_scale(scale);
+        let size = texture.size().to_logical(buffer_scale, Transform::Normal);
+        Self { id, texture, size, buffer_scale, damage, marker: Rc::new(()) }
     }
 }
 
@@ -98,24 +125,21 @@ impl AsRenderElements<GlesRenderer> for CompositedTexture {
         _scale: Scale<f64>,
         alpha: f32,
     ) -> Vec<C> {
-        // `from_static_texture`, not `from_texture_with_damage` — normally
-        // the wrong call for an on-screen-persistent element (see
-        // `ConsoleHut::damage_tracker`'s doc comment on why "no damage
-        // tracking" is a real bug there), but exactly right here: every
-        // `CompositedTexture` is single-use, rendered into one throwaway
-        // pass and discarded, never compared against a *later* frame of
-        // itself the way an on-screen element would be.
-        let element = TextureRenderElement::from_static_texture(
+        // `from_texture_with_damage`, not `from_static_texture` — see
+        // `Self::damage`'s doc comment on why real damage tracking matters
+        // here, the same reasoning as `ConsoleHut::damage_tracker`'s.
+        let element = TextureRenderElement::from_texture_with_damage(
             self.id.clone(),
             renderer.context_id(),
             location.to_f64(),
             self.texture.clone(),
-            1,
+            self.buffer_scale,
             Transform::Normal,
             Some(alpha),
             None,
             None,
             None,
+            self.damage.clone(),
             Kind::Unspecified,
         );
         vec![C::from(element)]
