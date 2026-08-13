@@ -650,9 +650,22 @@ primitives against low-blast-radius targets before touching the load-bearing `Vi
       `SubWindow`→`FloatingWindow` rename in the wire protocol and `handlers/shell.rs`'s `Role`
       enum (OQ6's naming gap), and added `Hut::leaf_absolute_rect`/`State::leaf_absolute_rect`,
       wired into `unconstrain_popup` (OQ3's resolution).
-   2. `ConsoleHut` gets its own `Space<HutSpaceElement>`, replacing today's single global
-      `state.space` — the most direct generalization of already-working code, so lowest risk of
-      the three real `Space`-needing node kinds.
+   2. **Done (2026-08-13, 4 commits).** `ConsoleHut` got its own `Space<HutSpaceElement>`,
+      replacing the single global `state.space` entirely (now deleted) — the most direct
+      generalization of already-working code, confirmed the lowest-risk of the three real
+      `Space`-needing node kinds in practice: `State::sync_visible_main_window`,
+      `render.rs`'s Main-Window-visible branch, and every other window-composition call site
+      (click-to-focus, drag grabs, frame-callback delivery) were each re-scoped to `hut.space`
+      without needing new logic, just a different `Space` to operate on — `hut.space_output`
+      (a synthetic output sized to that Console Hut's own content, always mapped at `(0, 0)`
+      within `hut.space`) meant every element's rendered position came out byte-identical to
+      before, no coordinate translation required. `HutSpaceElement`/`CompositedTexture`/
+      `synthetic_output`, already live-verified in step 3's prototype, were promoted to real
+      production types in a new `space_element.rs`, and that prototype's comparison-only
+      scaffolding was deleted once real code superseded it. Verified via the 52-test suite plus
+      three live smoke tests across the four commits (clean start/map, cosmic-term actually
+      mapped as a Main Window, 9+ seconds of confirmed frame-callback delivery) — no panics, no
+      warnings, no visible regressions in what limited interactive testing this sandbox allows.
    3. `TileHut` gets its own `Space<HutSpaceElement>`, replacing `render.rs::build_tile_elements`'s
       hand-rolled per-pane `TextureRenderElement` construction — builds on sub-step 2.
    4. Layer-Shell Root Hut (Q2), on top of 2/3 — one `space_render_elements` call against the real
