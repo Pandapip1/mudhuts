@@ -677,11 +677,23 @@ primitives against low-blast-radius targets before touching the load-bearing `Vi
       testing). Verified via the test suite/clippy/a live smoke test, but not interactively
       (triggering wrap-tile needs a keyboard chord this session's sandbox can't send) — full
       detail in the plan doc's mirrored write-up.
-   4. Layer-Shell Root Hut (Q2), on top of 2/3 — one `space_render_elements` call against the real
-      output, replacing `render.rs::layer_elements` and consolidating the hand-rolled layer-shell
-      hit-test ordering into one place. `TabbedHut`/`MruStackHut` stay pass-throughs needing no
-      `Space` of their own (per OQ2's finding) — not a sub-step, a non-change worth stating so it
-      isn't mistaken for a gap later.
+   4. **Render-path done (2026-08-13); hit-test path remaining.** Layer-Shell Root Hut (Q2), on
+      top of 2/3. While starting this, found and immediately fixed a real regression sub-step 2
+      had introduced (the Main-Window-visible branch had been missing layer-shell surfaces
+      entirely since it started rendering against a private synthetic output). That fix alone
+      already closed Q2's actual correctness gap, which raised a real scope question — asked the
+      user directly rather than deciding solo — over whether the rest of Q2's original design
+      (an offscreen composite + one real `Space`) still pulled its weight given the bug was
+      already fixed. **User chose the full original design.** Implemented as
+      `render.rs::content_elements`/`composite_normal_content`, replacing `layer_elements`
+      (deleted) with one `space_render_elements` call against the real output — full detail,
+      including three Smithay-internals correctness details confirmed via source reading and one
+      real coordinate-scoping bug caught before it shipped, in the plan doc's mirrored write-up.
+      `TabbedHut`/`MruStackHut` stay pass-throughs needing no `Space` of their own (per OQ2's
+      finding) — not a sub-step, a non-change worth stating so it isn't mistaken for a gap later.
+      Hit-test consolidation (`state.rs::surface_under`, `input.rs`'s two layer-surface-click
+      functions sharing one ordering function) is the one piece of sub-step 4 — and so of step 5
+      as a whole — still open.
 
 **Honest overall assessment, updated 2026-08-13**: genuinely incremental now, not just in
 aspiration — step 5's re-staging above means every remaining sub-step is independently small and
