@@ -54,6 +54,7 @@ use smithay::backend::renderer::element::AsRenderElements;
 use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::ImportDma;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{self, UdevBackend, UdevEvent};
@@ -66,6 +67,7 @@ use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::utils::{DeviceFd, IsAlive, Point, Scale, Transform};
 use smithay::wayland::compositor::with_states;
+use smithay::wayland::dmabuf::DmabufFeedbackBuilder;
 use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 
 use crate::State;
@@ -92,7 +94,12 @@ struct SurfaceData {
 }
 
 struct Inner {
-    renderer: GlesRenderer,
+    /// `Rc<RefCell<_>>`, not owned outright — `State::dmabuf_renderer`
+    /// holds a clone of the same renderer so `DmabufHandler::dmabuf_imported`
+    /// (`handlers/mod.rs`) can attempt a client buffer import, since
+    /// `State` otherwise has no renderer of its own (that's normally
+    /// backend-private state — see this module's doc).
+    renderer: Rc<RefCell<GlesRenderer>>,
     drm_output_manager: OutputManager,
     drm_scanner: DrmScanner,
     surfaces: HashMap<crtc::Handle, SurfaceData>,
@@ -228,6 +235,33 @@ pub fn init_udev(
         .copied();
     let drm_output_manager =
         DrmOutputManager::new(drm_device, allocator, exporter, Some(gbm), color_formats, render_formats);
+
+    // Client-buffer dmabuf import (`zwp_linux_dmabuf_v1`): lets clients
+    // hand over a GPU buffer directly rather than a plain SHM buffer that
+    // has to be copied/re-uploaded to the GPU on every commit — real
+    // GPU-rendering toolkits (Qt, iced/libcosmic) submit far more
+    // frequent, often fullscreen-sized commits than this compositor's
+    // own terminal rendering does, making that copy a genuine, avoidable
+    // cost at this output's resolution. `renderer` needs to be shared
+    // (`Rc<RefCell<_>>`) from here on: `State::dmabuf_renderer` keeps its
+    // own clone so `DmabufHandler::dmabuf_imported` can reach it (`State`
+    // has no renderer of its own otherwise).
+    let renderer = Rc::new(RefCell::new(renderer));
+    state.dmabuf_renderer = Some(renderer.clone());
+    let dmabuf_formats: Vec<_> = renderer.borrow().dmabuf_formats().iter().copied().collect();
+    match DmabufFeedbackBuilder::new(node.dev_id(), dmabuf_formats).build() {
+        Ok(default_feedback) => {
+            let global = state
+                .dmabuf_state
+                .create_global_with_default_feedback::<State>(&state.display_handle, &default_feedback);
+            state.dmabuf_global = Some(global);
+        }
+        Err(err) => {
+            tracing::warn!(
+                "failed to build dmabuf feedback, client dmabuf import unavailable (falling back to SHM): {err}"
+            );
+        }
+    }
 
     let inner = Rc::new(RefCell::new(Inner {
         renderer,
@@ -420,6 +454,8 @@ fn connector_connected(
     let drm_output = {
         let mut inner_mut = inner.borrow_mut();
         let inner_mut = &mut *inner_mut;
+        let mut renderer = inner_mut.renderer.borrow_mut();
+        let renderer = &mut *renderer;
         let result = inner_mut
             .drm_output_manager
             .lock()
@@ -429,7 +465,7 @@ fn connector_connected(
                 &[connector.handle()],
                 &output,
                 None,
-                &mut inner_mut.renderer,
+                renderer,
                 &DrmOutputRenderElements::default(),
             );
         match result {
@@ -488,6 +524,8 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
         pointer_image_cache,
         ..
     } = &mut *inner_mut;
+    let mut renderer = renderer.borrow_mut();
+    let renderer = &mut *renderer;
     let Some(surface) = surfaces.get_mut(&crtc) else {
         tracing::debug!("render_surface: no surface for {crtc:?}, dropping the render chain here");
         return;

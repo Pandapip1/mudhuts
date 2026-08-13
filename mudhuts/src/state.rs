@@ -1,6 +1,9 @@
+use std::cell::RefCell;
 use std::ffi::OsString;
+use std::rc::Rc;
 use std::sync::Arc;
 
+use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::desktop::{PopupManager, Space, Window};
 use smithay::input::pointer::CursorImageStatus;
 use smithay::input::{Seat, SeatState};
@@ -12,6 +15,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Display, DisplayHandle};
 use smithay::utils::{Logical, Point};
 use smithay::wayland::compositor::{CompositorClientState, CompositorState};
+use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::shell::xdg::XdgShellState;
@@ -91,6 +95,23 @@ pub struct State {
     /// relies on its host compositor's own cursor and never reads it.
     pub cursor_status: CursorImageStatus,
 
+    /// dmabuf client-buffer import (`zwp_linux_dmabuf_v1`) — lets clients
+    /// hand over a GPU buffer directly instead of a plain SHM buffer that
+    /// has to be copied/re-uploaded on every commit. Always present (an
+    /// empty `DmabufState` costs nothing), but the actual global is only
+    /// created by `udev_backend.rs::init_udev` once a GBM-backed renderer
+    /// exists — `winit_backend.rs` never populates `dmabuf_global`, so no
+    /// global ever gets advertised there, matching this compositor's
+    /// existing SHM-only behavior under that backend.
+    pub dmabuf_state: DmabufState,
+    /// Just needs to stay alive — dropping it would remove the global.
+    pub dmabuf_global: Option<DmabufGlobal>,
+    /// Shared with `udev_backend.rs`'s own `Inner::renderer` — needed so
+    /// `DmabufHandler::dmabuf_imported` (`handlers/mod.rs`) can actually
+    /// attempt the import; `State` doesn't otherwise have a renderer of
+    /// its own; that's normally backend-private state.
+    pub dmabuf_renderer: Option<Rc<RefCell<GlesRenderer>>>,
+
     /// Wakes up the winit backend's redraw handler (see `winit_backend.rs`,
     /// the only place that owns the actual window handle needed to call
     /// its `request_redraw()`) from anywhere else that changes something
@@ -162,6 +183,9 @@ impl State {
             dock_drag: None,
             pointer_location: Point::from((0.0, 0.0)),
             cursor_status: CursorImageStatus::default_named(),
+            dmabuf_state: DmabufState::new(),
+            dmabuf_global: None,
+            dmabuf_renderer: None,
             redraw_ping,
         })
     }
