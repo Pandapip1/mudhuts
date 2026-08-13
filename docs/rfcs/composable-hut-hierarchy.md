@@ -666,8 +666,17 @@ primitives against low-blast-radius targets before touching the load-bearing `Vi
       three live smoke tests across the four commits (clean start/map, cosmic-term actually
       mapped as a Main Window, 9+ seconds of confirmed frame-callback delivery) — no panics, no
       warnings, no visible regressions in what limited interactive testing this sandbox allows.
-   3. `TileHut` gets its own `Space<HutSpaceElement>`, replacing `render.rs::build_tile_elements`'s
-      hand-rolled per-pane `TextureRenderElement` construction — builds on sub-step 2.
+   3. **Done (2026-08-13).** `TileHut` panes got their own `Space<HutSpaceElement>`,
+      replacing `render.rs::build_tile_elements`'s hand-rolled per-pane `TextureRenderElement`
+      construction with a fresh, per-call-local `Space` (not a persistent field, unlike
+      `ConsoleHut::space` — every pane's content is an ephemeral single-use texture rebuilt
+      every frame regardless). Fixed two real bugs in `CompositedTexture` before it became live
+      code: a hardcoded buffer-scale of `1` (would've mis-scaled everything on a non-1.0
+      display) and `from_static_texture`'s implicit no-damage-ever (would've broken the outer
+      damage tracker under the udev/DRM backend specifically, invisible under winit-only
+      testing). Verified via the test suite/clippy/a live smoke test, but not interactively
+      (triggering wrap-tile needs a keyboard chord this session's sandbox can't send) — full
+      detail in the plan doc's mirrored write-up.
    4. Layer-Shell Root Hut (Q2), on top of 2/3 — one `space_render_elements` call against the real
       output, replacing `render.rs::layer_elements` and consolidating the hand-rolled layer-shell
       hit-test ordering into one place. `TabbedHut`/`MruStackHut` stay pass-throughs needing no
