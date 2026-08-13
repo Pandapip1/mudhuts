@@ -5,8 +5,9 @@ use smithay::reexports::wayland_server::Client;
 use smithay::reexports::wayland_server::protocol::{wl_buffer, wl_surface::WlSurface};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
-    CompositorClientState, CompositorHandler, CompositorState, get_parent, is_sync_subsurface,
+    CompositorClientState, CompositorHandler, CompositorState, get_parent, is_sync_subsurface, with_states,
 };
+use smithay::wayland::fractional_scale::{FractionalScaleHandler, with_fractional_scale};
 use smithay::wayland::shm::{ShmHandler, ShmState};
 
 use super::{layer_shell, xdg_shell};
@@ -54,6 +55,24 @@ impl CompositorHandler for State {
 
 impl BufferHandler for State {
     fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
+}
+
+/// `wp_fractional_scale_v1` — see `state.rs`'s `fractional_scale_manager_state`
+/// doc comment. mudhuts is single-output, so there's no anvil-style
+/// "which output does this surface actually scan out from" question to
+/// answer here — every surface gets the one output's scale, full stop.
+impl FractionalScaleHandler for State {
+    fn new_fractional_scale(&mut self, surface: WlSurface) {
+        let Some(output) = self.space.outputs().next() else {
+            return;
+        };
+        let scale = output.current_scale().fractional_scale();
+        with_states(&surface, |states| {
+            with_fractional_scale(states, |fractional_scale| {
+                fractional_scale.set_preferred_scale(scale);
+            });
+        });
+    }
 }
 
 impl ShmHandler for State {

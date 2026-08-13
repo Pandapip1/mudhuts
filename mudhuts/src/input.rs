@@ -9,7 +9,7 @@ use smithay::desktop::{WindowSurfaceType, layer_map_for_output};
 use smithay::input::keyboard::{FilterResult, KeysymHandle, ModifiersState, keysyms};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Logical, Point, SERIAL_COUNTER, Serial};
+use smithay::utils::{Logical, Physical, Point, SERIAL_COUNTER, Scale, Serial};
 use smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitorSeat;
 use smithay::wayland::selection::data_device::set_data_device_selection;
 use smithay::wayland::selection::primary_selection::set_primary_selection;
@@ -132,6 +132,17 @@ impl State {
         mods_from(&raw)
     }
 
+    /// Convert a genuinely-Logical seat position (`pointer.current_location()`,
+    /// or anything already headed into `self.surface_under`/`pointer.motion`)
+    /// into mudhuts' own physical-pixel rendering space — the space
+    /// `try_click_chrome`, `docks::start_drag`, and the terminal's
+    /// `pixel_to_cell` all expect, matching `output_size`/`usable_area()`.
+    /// See `handle_pointer_motion`'s doc comment for why both spaces are
+    /// needed at once rather than picking just one.
+    fn to_physical(&self, pos: Point<f64, Logical>) -> Point<f64, Physical> {
+        pos.to_physical(Scale::from(self.output_scale()))
+    }
+
     /// Shared tail of pointer-motion handling, called from both
     /// `InputEvent::PointerMotionAbsolute` (winit: the host already gives
     /// an absolute position) and `InputEvent::PointerMotion` (real
@@ -139,8 +150,22 @@ impl State {
     /// accumulated and clamped by the caller before reaching here) —
     /// everything past "here's the new absolute position" is identical
     /// either way.
+    ///
+    /// `pos` is genuinely Logical (both callers now derive it from
+    /// `self.space.output_geometry`/its own scale-divided bounds — see
+    /// `InputEvent::PointerMotionAbsolute`/`PointerMotion` below), which
+    /// is what `self.surface_under`/`pointer.motion` need: Smithay's own
+    /// `Space`/layer-shell hit-testing, and the position a client's
+    /// `wl_pointer.motion` ultimately gets, are both Logical throughout.
+    /// But this function *also* drives mudhuts' own physical-pixel-native
+    /// hit-testing (the terminal's `pixel_to_cell`, `docks::advance_drag`)
+    /// — those get a locally-converted physical copy instead of Logical
+    /// `pos` directly, rather than picking just one space for everything
+    /// (see `State::usable_area`'s doc comment on why physical is what
+    /// mudhuts' own rendering needs).
     fn handle_pointer_motion(&mut self, pos: smithay::utils::Point<f64, smithay::utils::Logical>, time: u32) {
         self.pointer_location = pos;
+        let pos_physical = self.to_physical(pos);
         // Under winit this is a no-op ping (the host draws the cursor,
         // and `winit_backend.rs`'s own input handler already force-
         // redraws on every input event regardless) — but the udev
@@ -155,12 +180,15 @@ impl State {
         let serial = SERIAL_COUNTER.next_serial();
 
         if self.dock_drag.is_some() {
-            docks::advance_drag(self, pos);
+            docks::advance_drag(self, pos_physical);
         }
 
         if self.showing_terminal_effective() {
             let (ox, oy) = self.active_pane_offset();
-            let (col, row, left_half) = self.stack.focused().pixel_to_cell(pos.x - ox, pos.y - oy);
+            let (col, row, left_half) = self
+                .stack
+                .focused()
+                .pixel_to_cell(pos_physical.x - ox, pos_physical.y - oy);
             if let Some(held) = self.mouse_report_button_held {
                 if self.stack.focused().terminal.wants_drag_reports()
                     && let Some(xbutton) = xterm_button(held)
@@ -238,8 +266,14 @@ impl State {
     /// visible. Otherwise, checked in front-to-back z-order matching that
     /// same function's element push order: Village-level tabs first
     /// (topmost), then the Hut-level strip below them.
-    fn try_click_chrome(&mut self, pos: Point<f64, Logical>) -> bool {
-        let pixel = Point::<i32, Logical>::from((pos.x.round() as i32, pos.y.round() as i32));
+    ///
+    /// `pos` is physical — every rect this checks against (tile panes,
+    /// Village/Hut tab strips) is mudhuts' own drawn chrome, sized
+    /// against `usable_area()`/`output_size`, not a real Wayland surface
+    /// Smithay tracks in Logical space. The caller converts from the
+    /// seat's Logical position before calling this.
+    fn try_click_chrome(&mut self, pos: Point<f64, Physical>) -> bool {
+        let pixel = Point::<i32, Physical>::from((pos.x.round() as i32, pos.y.round() as i32));
 
         // Rects computed against `usable_area`, not the raw output —
         // must agree with what `render.rs`'s `build_tile_elements`
@@ -282,10 +316,9 @@ impl State {
         }
 
         let strip_y = village_chrome::stack_height(self.stack.focused_village(), cell_h);
-        let physical_pixel = smithay::utils::Point::<i32, smithay::utils::Physical>::from((pixel.x, pixel.y));
         let hit = chrome::tab_layout(self.stack.focused(), strip_y)
             .into_iter()
-            .find(|t| t.rect.contains(physical_pixel));
+            .find(|t| t.rect.contains(pixel));
         if let Some(hit) = hit {
             let hut = self.stack.focused_mut();
             if hit.index == 0 {
@@ -667,8 +700,14 @@ impl State {
                 // persisted `pointer_location` and clamp to the output's
                 // bounds (mirrors `.smithay-ref/anvil/src/
                 // input_handler.rs`'s `clamp_coords`, simplified since
-                // mudhuts is single-output).
-                let (max_x, max_y) = self.output_size;
+                // mudhuts is single-output). `pointer_location` and
+                // `event.delta()` are both genuinely Logical (anvil's own
+                // reference clamps against `space.output_geometry`, not a
+                // raw physical mode size, for the same reason) — clamped
+                // against the output's *Logical* bounds, not
+                // `self.output_size` (physical), to keep both sides of
+                // the clamp in the same space.
+                let (max_x, max_y) = self.output_size_logical();
                 let mut new_location = self.pointer_location + event.delta();
                 new_location.x = new_location.x.clamp(0.0, max_x.max(0) as f64);
                 new_location.y = new_location.y.clamp(0.0, max_y.max(0) as f64);
@@ -698,7 +737,10 @@ impl State {
                     docks::finish_drag(self);
                 }
 
-                if pressed && button == BTN_LEFT && self.try_click_chrome(pointer.current_location()) {
+                if pressed
+                    && button == BTN_LEFT
+                    && self.try_click_chrome(self.to_physical(pointer.current_location()))
+                {
                     // Handled as a chrome click (a Village-level tab, a
                     // Hut-level Main-Window tab, or a Tile-Village pane) —
                     // skip the normal terminal/window click handling
@@ -712,7 +754,9 @@ impl State {
                     // so they're checked before the terminal/window
                     // branches below for this press.
                 } else if self.showing_terminal_effective() {
-                    let pos = pointer.current_location();
+                    // Physical, like `active_pane_offset()`/`pixel_to_cell`
+                    // — mudhuts' own terminal grid, not a real surface.
+                    let pos = self.to_physical(pointer.current_location());
                     let (ox, oy) = self.active_pane_offset();
                     let (col, row, left_half) = self.stack.focused().pixel_to_cell(pos.x - ox, pos.y - oy);
                     let mods = self.current_mods();
@@ -758,8 +802,13 @@ impl State {
                         }
                     }
                 } else if pressed && !pointer.is_grabbed() {
+                    // `pos` (Logical) is what `space.element_under`/
+                    // `try_click_layer_surface` below need — `docks.rs`'s
+                    // handle hit-testing needs physical instead (its own
+                    // drawn chrome, not a real surface), so it gets a
+                    // separately-converted copy rather than sharing `pos`.
                     let pos = pointer.current_location();
-                    if docks::start_drag(self, pos) {
+                    if docks::start_drag(self, self.to_physical(pos)) {
                         // Handled as a docked handle's drag-start instead
                         // of a normal click-to-focus below.
                     } else if let Some((window, _loc)) = self
@@ -840,7 +889,7 @@ impl State {
                 if self.showing_terminal_effective() && vertical_amount != 0.0 {
                     if self.stack.focused().terminal.wants_mouse_reports() {
                         if let Some(pointer) = self.seat.get_pointer() {
-                            let pos = pointer.current_location();
+                            let pos = self.to_physical(pointer.current_location());
                             let (ox, oy) = self.active_pane_offset();
                             let (col, row, _) = self.stack.focused().pixel_to_cell(pos.x - ox, pos.y - oy);
                             let mods = self.current_mods();

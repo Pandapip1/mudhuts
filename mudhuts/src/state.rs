@@ -21,6 +21,7 @@ use smithay::wayland::compositor::{CompositorClientState, CompositorState};
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
 use smithay::wayland::foreign_toplevel_list::ForeignToplevelListState;
+use smithay::wayland::fractional_scale::FractionalScaleManagerState;
 use smithay::wayland::image_capture_source::{ImageCaptureSourceState, OutputCaptureSourceState};
 use smithay::wayland::image_copy_capture::{ImageCopyCaptureState, Session};
 use smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitState;
@@ -34,6 +35,7 @@ use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shell::xdg::dialog::XdgDialogState;
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::socket::ListeningSocketSource;
+use smithay::wayland::viewporter::ViewporterState;
 
 use crate::keybindings::Keymap;
 use crate::stack::HutStack;
@@ -81,6 +83,29 @@ pub struct State {
     /// same `SeatData`) — this is a second protocol surface, not a second
     /// independent selection system.
     pub primary_selection_state: PrimarySelectionState,
+    /// `wp_viewporter` — lets a client crop/scale its own buffer to an
+    /// arbitrary destination size independent of the buffer's native
+    /// pixel dimensions. No handler trait at all (unlike every other
+    /// `*State` field here) — `handlers/compositor.rs`'s `commit()`
+    /// already calls `on_commit_buffer_handler`, which (per that
+    /// protocol's own module doc) calls `ensure_viewport_valid` for every
+    /// surface itself, so this needs no wiring beyond existing here to
+    /// keep the global registered.
+    pub viewporter_state: ViewporterState,
+    /// `wp_fractional_scale_v1` — tells a client the output's *exact*
+    /// scale factor (e.g. `1.5`), not just the coarse integer `wl_output`
+    /// clients otherwise have to round up to. Paired with
+    /// `viewporter_state` above: together they're what let a HiDPI-aware
+    /// client render its own content at the output's real scale instead
+    /// of over- or under-sampling. Driven by
+    /// `FractionalScaleHandler::new_fractional_scale`
+    /// (`handlers/compositor.rs`), which pushes `State::output_scale()`
+    /// to a surface the moment it asks for one — mudhuts is single-
+    /// output and never changes scale mid-session (see `output_scale()`'s
+    /// doc comment), so unlike anvil's `post_repaint`, there's no
+    /// ongoing per-frame re-push loop needed here: nothing could ever
+    /// change between one push and the next.
+    pub fractional_scale_manager_state: FractionalScaleManagerState,
     /// `ext_data_control_v1` — lets a privileged client (a clipboard
     /// manager/history tool) see and set *both* selections above on this
     /// seat's behalf, rather than just this compositor. Reuses
@@ -123,6 +148,16 @@ pub struct State {
     /// `input.rs`'s `InputEvent::PointerMotion` handling. Unused under
     /// the winit backend, which computes an absolute position fresh
     /// from each event instead.
+    ///
+    /// Genuinely [`Logical`] (scale-divided), matching every other value
+    /// that flows through `self.space`/`pointer.motion()`/
+    /// `surface_under()` — *not* physical output pixels, unlike
+    /// `output_size`/`usable_area()` below. `input.rs`'s
+    /// `handle_pointer_motion` converts to physical once, locally, for
+    /// the handful of call sites (chrome/dock hit-testing, terminal
+    /// cell math) that need mudhuts' own native pixel space instead —
+    /// see that function's doc comment for why the two can't just be
+    /// unified onto one space.
     pub pointer_location: Point<f64, Logical>,
 
     /// The pointer's current appearance as last requested by a client
@@ -322,6 +357,8 @@ impl State {
         // data-control clients too, so it must come after.
         let data_control_state =
             DataControlState::new::<Self, _>(&dh, Some(&primary_selection_state), |_| true);
+        let viewporter_state = ViewporterState::new::<Self>(&dh);
+        let fractional_scale_manager_state = FractionalScaleManagerState::new::<Self>(&dh);
         dh.create_global::<Self, mudhuts_protocols::server::mudhuts_shell_v1::MudhutsShellV1, _>(
             2,
             smithay::wayland::GlobalData,
@@ -368,6 +405,8 @@ impl State {
             data_device_state,
             primary_selection_state,
             data_control_state,
+            viewporter_state,
+            fractional_scale_manager_state,
             popups,
             seat,
             stack,
@@ -507,6 +546,26 @@ impl State {
         Ok(())
     }
 
+    /// This output's current scale factor — `1.0` if there's no output
+    /// yet (matches every other single-output fallback in this file).
+    ///
+    /// Set once, at output creation (`winit_backend.rs`/`udev_backend.rs`),
+    /// from real detection (the host window's own DPI scale under winit;
+    /// a physical-size/mode-resolution heuristic, overridable via
+    /// `MUDHUTS_OUTPUT_SCALE`, under udev) and never changed again —
+    /// mudhuts has no runtime "change display scale" mechanism (no
+    /// settings UI, no hotplug-driven rescale), so there's nothing that
+    /// would ever need this to be anything other than a fixed value read
+    /// fresh from the `Output` each time it's needed, rather than cached
+    /// anywhere.
+    pub fn output_scale(&self) -> f64 {
+        self.space
+            .outputs()
+            .next()
+            .map(|o| o.current_scale().fractional_scale())
+            .unwrap_or(1.0)
+    }
+
     /// The rectangle (physical pixels, output-relative) that Hut/Main-
     /// Window *content* should actually be sized/positioned against —
     /// the full output, minus whatever every mapped layer-shell surface's
@@ -520,12 +579,64 @@ impl State {
     /// rect unconditionally — a real, accepted v1 gap (a top-anchored
     /// panel and mudhuts' own tab strip can visually collide) rather than
     /// threading this through every chrome element too.
+    ///
+    /// `layer_map_for_output`'s own `non_exclusive_zone()` is genuinely
+    /// [`Logical`] (Smithay arranges layer-shell surfaces against the
+    /// output's scale-divided size, same as everything else it manages —
+    /// see `handlers/layer_shell.rs`'s module doc) — converted to
+    /// physical here so this keeps meaning what its own doc/name always
+    /// have, for the ~10 call sites (`render.rs`, `docks.rs`, `input.rs`,
+    /// both backends' resize/redraw handlers) that size/hit-test mudhuts'
+    /// own pixel-native rendering against it. [`Self::usable_area_logical`]
+    /// is the *other* half: the same zone, unconverted, for the couple of
+    /// call sites that configure real Wayland clients instead.
     pub fn usable_area(&self) -> (i32, i32, i32, i32) {
         let Some(output) = self.space.outputs().next() else {
             return (0, 0, self.output_size.0, self.output_size.1);
         };
         let zone = layer_map_for_output(output).non_exclusive_zone();
+        let physical: smithay::utils::Rectangle<i32, smithay::utils::Physical> =
+            zone.to_physical_precise_round(self.output_scale());
+        (physical.loc.x, physical.loc.y, physical.size.w, physical.size.h)
+    }
+
+    /// [`Self::usable_area`]'s raw, unconverted counterpart — genuinely
+    /// [`Logical`] (scale-divided), for the two call sites
+    /// (`handlers/xdg_shell.rs`'s `new_toplevel`,
+    /// `winit_backend.rs`'s `WinitEvent::Resized`) that build an
+    /// `xdg_toplevel` configure size: that's real client-facing protocol
+    /// state, which Wayland always expresses in logical coordinates
+    /// regardless of how many physical pixels mudhuts itself renders a
+    /// Main Window's fullscreen content into. Falls back to
+    /// `self.output_size` (physical) with no output mapped yet — matches
+    /// `usable_area()`'s identical fallback, and only ever actually
+    /// matters before the first output exists, when physical and logical
+    /// aren't meaningfully different yet anyway.
+    pub fn usable_area_logical(&self) -> (i32, i32, i32, i32) {
+        let Some(output) = self.space.outputs().next() else {
+            return (0, 0, self.output_size.0, self.output_size.1);
+        };
+        let zone = layer_map_for_output(output).non_exclusive_zone();
         (zone.loc.x, zone.loc.y, zone.size.w, zone.size.h)
+    }
+
+    /// The whole output's current size, genuinely [`Logical`] (scale-
+    /// divided) — as opposed to `self.output_size`, which is always
+    /// physical. Used wherever a physical-pixel-native value (a dragged
+    /// Sub-Window's position/size, read back from `self.space` and
+    /// therefore already Logical) needs to be compared against "the
+    /// output's size" in the *same* space — see `grabs.rs`'s `unset` and
+    /// `docks.rs`'s `finish_drag`, both computing whether a drop point is
+    /// near an edge. Falls back to `self.output_size` with no output
+    /// mapped yet, same reasoning as `usable_area_logical`.
+    pub fn output_size_logical(&self) -> (i32, i32) {
+        let Some(output) = self.space.outputs().next() else {
+            return self.output_size;
+        };
+        match self.space.output_geometry(output) {
+            Some(geo) => (geo.size.w, geo.size.h),
+            None => self.output_size,
+        }
     }
 
     /// Whether the focused Hut's terminal (vs. its active Main Window)

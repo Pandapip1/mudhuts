@@ -12,6 +12,16 @@
 //! same way `text_selecting` tracks a plain terminal-selection drag —
 //! not a full `PointerGrab`, since there's no client surface/serial to
 //! grab in the first place until the window is actually mapped.
+//!
+//! Handle layout/hit-testing (this module) is genuinely [`Physical`] —
+//! the handle is mudhuts' own drawn chrome, pixel-native like
+//! `chrome.rs`'s tab strip, not a real surface Smithay's `Space` knows
+//! about. Only once a drag actually detaches and the Sub-Window becomes
+//! a real mapped element (`Dock::Floating`, read/written by
+//! `sync_visible_main_window`/`grabs.rs`'s `MoveSurfaceGrab` too) does
+//! its position need to cross over into genuinely `Logical` space to
+//! match `self.space`'s own contract — see [`advance_drag`]/[`finish_drag`]
+//! for exactly where that conversion happens.
 
 use smithay::backend::renderer::Renderer;
 use smithay::backend::renderer::element::Id;
@@ -22,7 +32,7 @@ use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::utils::{CommitCounter, DamageSnapshot};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Buffer, Logical, Point, Rectangle, Size, Transform};
+use smithay::utils::{Buffer, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use crate::State;
 use crate::chrome::{to_color32f, window_title};
@@ -41,10 +51,9 @@ const MAX_TITLE_CHARS: usize = 18;
 const FG: mudhuts_term::palette::Rgb = [220, 220, 220];
 const BG: mudhuts_term::palette::Rgb = [50, 50, 60];
 
-/// How far (in logical/physical pixels — treated as equivalent, same as
-/// `grabs.rs`'s redock threshold) a drag has to travel from a handle
-/// before it detaches into a floating window, rather than being read as
-/// just a click.
+/// How far (in physical pixels — this module's native space, see the
+/// module doc) a drag has to travel from a handle before it detaches
+/// into a floating window, rather than being read as just a click.
 const DETACH_THRESHOLD: f64 = 12.0;
 
 type Element = OutputRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>;
@@ -54,8 +63,10 @@ type Element = OutputRenderElements<GlesRenderer, WaylandSurfaceRenderElement<Gl
 pub struct DockDrag {
     pub surface: WlSurface,
     /// Pointer location when the drag started, for measuring whether
-    /// it's moved past [`DETACH_THRESHOLD`] yet.
-    pub start: Point<f64, Logical>,
+    /// it's moved past [`DETACH_THRESHOLD`] yet. Physical, like
+    /// everything else this module hit-tests against — see the module
+    /// doc.
+    pub start: Point<f64, Physical>,
     /// Whether it's already flipped to floating and been mapped this
     /// drag — once true, further motion just repositions it directly,
     /// same as a real floating-window move.
@@ -65,10 +76,11 @@ pub struct DockDrag {
 /// One docked handle's clickable/drawable rectangle, plus which surface
 /// and title it's for — shared between [`build`] (drawing) and
 /// `input.rs` (hit-testing clicks), so the two can never disagree about
-/// where a handle actually is.
+/// where a handle actually is. Physical, like `chrome::TabRect` — see
+/// the module doc.
 pub struct Handle {
     pub surface: WlSurface,
-    pub rect: Rectangle<i32, Logical>,
+    pub rect: Rectangle<i32, Physical>,
     pub title: String,
 }
 
@@ -189,7 +201,7 @@ pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer, output_size: (i32, i32)
             .unwrap_or_else(Id::new);
         let background = SolidColorRenderElement::new(
             bg_id,
-            handle.rect.to_f64().to_physical(1.0).to_i32_round(),
+            handle.rect,
             CommitCounter::default(),
             to_color32f(BG),
             Kind::Unspecified,
@@ -202,8 +214,10 @@ pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer, output_size: (i32, i32)
 
 /// Start dragging `handle`'s Sub-Window out from its dock, if the pointer
 /// just went down on it. Called from `input.rs`'s `PointerButton` press
-/// handling, before it falls through to normal click-to-focus.
-pub fn start_drag(state: &mut State, pos: Point<f64, Logical>) -> bool {
+/// handling, before it falls through to normal click-to-focus. `pos` is
+/// physical, like [`Handle::rect`] — `input.rs` converts the seat's
+/// (genuinely Logical) pointer position before calling this.
+pub fn start_drag(state: &mut State, pos: Point<f64, Physical>) -> bool {
     let handles = handle_layout(state.stack.focused(), state.output_size);
     let Some(handle) = handles.into_iter().find(|h| h.rect.to_f64().contains(pos)) else {
         return false;
@@ -219,8 +233,12 @@ pub fn start_drag(state: &mut State, pos: Point<f64, Logical>) -> bool {
 /// Advance an in-progress handle drag on pointer motion: flips the
 /// Sub-Window to floating and maps it for the first time once the drag
 /// crosses [`DETACH_THRESHOLD`], then just repositions it directly on
-/// every motion after that.
-pub fn advance_drag(state: &mut State, pos: Point<f64, Logical>) {
+/// every motion after that. `pos` is physical (see [`start_drag`]) —
+/// converted to genuinely Logical right before it's written anywhere
+/// `self.space` will read it back from ([`Dock::Floating`],
+/// `map_element`), since those are Smithay's own contract, not this
+/// module's.
+pub fn advance_drag(state: &mut State, pos: Point<f64, Physical>) {
     let Some(drag) = &state.dock_drag else {
         return;
     };
@@ -233,8 +251,9 @@ pub fn advance_drag(state: &mut State, pos: Point<f64, Logical>) {
         if delta.x.hypot(delta.y) <= DETACH_THRESHOLD {
             return;
         }
+        let logical = pos.to_logical(Scale::from(state.output_scale())).to_i32_round();
         if let Some(sub) = state.stack.focused_mut().sub_window_mut(&surface) {
-            sub.dock = Dock::Floating(pos.to_i32_round());
+            sub.dock = Dock::Floating(logical);
         }
         if let Some(drag) = &mut state.dock_drag {
             drag.detached = true;
@@ -244,7 +263,8 @@ pub fn advance_drag(state: &mut State, pos: Point<f64, Logical>) {
     }
 
     if let Some(window) = state.find_window_by_surface(&surface) {
-        state.space.map_element(window, pos.to_i32_round(), true);
+        let logical = pos.to_logical(Scale::from(state.output_scale())).to_i32_round();
+        state.space.map_element(window, logical, true);
     }
 }
 
@@ -269,7 +289,12 @@ pub fn finish_drag(state: &mut State) {
         return;
     };
     let size = window.geometry().size;
-    let redock_edge = nearest_edge_within_threshold(state.output_size, location, size);
+    // `location`/`size` come from `self.space`, so they're genuinely
+    // Logical — compared against the output's Logical size here, not
+    // `state.output_size` (physical), to keep both sides of every
+    // distance check in the same space (see `State::output_size_logical`'s
+    // doc comment).
+    let redock_edge = nearest_edge_within_threshold(state.output_size_logical(), location, size);
     if let Some(sub) = state.stack.focused_mut().sub_window_mut(&drag.surface) {
         sub.dock = match redock_edge {
             Some(edge) => Dock::Docked(edge),

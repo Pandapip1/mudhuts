@@ -42,7 +42,11 @@ impl XdgShellHandler for State {
             // Sized to the *usable* area, not the raw output geometry —
             // shrunk by any layer-shell surface's exclusive zone (a
             // status bar, say) — see `State::usable_area`'s doc comment.
-            let (_, _, usable_w, usable_h) = self.usable_area();
+            // Logical, not physical: this is a real `xdg_toplevel`
+            // configure, which Wayland always expresses in logical
+            // coordinates — see `State::usable_area_logical`'s doc
+            // comment.
+            let (_, _, usable_w, usable_h) = self.usable_area_logical();
             surface.with_pending_state(|state| {
                 state.states.set(xdg_toplevel::State::Fullscreen);
                 state.size = Some(smithay::utils::Size::from((usable_w, usable_h)));

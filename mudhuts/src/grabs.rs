@@ -20,10 +20,12 @@ use smithay::utils::{Logical, Point};
 use crate::State;
 use crate::main_window::{Dock, Edge};
 
-/// How close (in logical/physical pixels, treated as equivalent —
-/// mudhuts doesn't do scale-aware window-management math anywhere else
-/// either) to an output edge a released Sub-Window needs to be to snap
-/// back to docked, rather than staying floating where it was dropped.
+/// How close (in genuinely Logical pixels — `location`/`size` below
+/// always come from `self.space`, which is Logical throughout, so this
+/// threshold has to be too, unlike `docks.rs`'s physical-native
+/// `DETACH_THRESHOLD`) to an output edge a released Sub-Window needs to
+/// be to snap back to docked, rather than staying floating where it was
+/// dropped.
 const REDOCK_THRESHOLD: i32 = 40;
 
 pub struct MoveSurfaceGrab {
@@ -192,7 +194,12 @@ impl PointerGrab<State> for MoveSurfaceGrab {
         }
 
         let size = self.window.geometry().size;
-        let redock_edge = nearest_edge_within_threshold(data.output_size, location, size);
+        // `location`/`size` are genuinely Logical (from `self.space`) —
+        // compared against the output's Logical size, not
+        // `data.output_size` (physical), to keep both sides of the
+        // distance check in the same space (see
+        // `State::output_size_logical`'s doc comment).
+        let redock_edge = nearest_edge_within_threshold(data.output_size_logical(), location, size);
         if let Some(sub) = data.stack.focused_mut().sub_window_mut(&self.surface) {
             sub.dock = match redock_edge {
                 Some(edge) => Dock::Docked(edge),
