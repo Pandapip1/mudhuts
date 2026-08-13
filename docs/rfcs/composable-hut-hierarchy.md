@@ -780,20 +780,32 @@ answers instead of guessed at:
    always a no-op — `unconstrain_popup`'s behavior is unchanged today — but stops being one the
    moment that lands, closing the gap ahead of time rather than on the fly during a future
    feature.
-4. **The full set of `input.rs` special cases above the hit-test layer** (mouse-report vs.
-   text-selection vs. click-to-focus, `keyboard-shortcuts-inhibit-unstable-v1`'s per-surface
-   opt-out at `input.rs:588-601`, session-lock's total override at
-   `input.rs:387-410,548-561`) weren't individually re-verified against the proposed `Hit` enum
-   — Q3's proposal is scoped to the spatial-routing portion `state.rs::surface_under` already
-   covers today, and this RFC didn't exhaustively check that none of those other special cases
-   secretly assume something about `Space`/`self.space` specifically rather than "whatever the
-   hit-test layer returns."
-5. **`hit_test` using the same rect math as `render`** is proposed as a convention (share one
-   `child_rects`-style helper), not something enforced by the type system — nothing stops a
-   future node-kind impl from drifting the same way the pre-redesign duplication happened in
-   the first place. Worth a follow-up on whether a lint, a shared-helper-only constructor
-   pattern, or a test asserting render/hit-test agreement can make this structural rather than
-   disciplinary.
+4. **Resolved (2026-08-13).** Read every one of `input.rs`'s special cases above the hit-test
+   layer (mouse-report vs. text-selection vs. click-to-focus, `keyboard-shortcuts-inhibit-
+   unstable-v1`'s per-surface opt-out, session-lock's total override) against the current, fully
+   migrated implementation — no functional bugs: each already correctly uses either the focused
+   Console Hut's own per-instance `space`, or doesn't touch a `Space` at all (the keyboard-
+   shortcuts-inhibit and session-lock paths are pure keyboard-focus/surface checks, never
+   spatial). The real finding was 9 stale doc comments (`input.rs`, `state.rs`, `grabs.rs`,
+   `docks.rs`, `handlers/compositor.rs`, `handlers/xdg_shell.rs`, `main_window.rs`,
+   `console_hut.rs`) still referencing the deleted global `state.space` field or the deleted
+   `layer_elements` function, left behind by earlier migration commits that changed the code but
+   not every comment describing it — fixed, no functional changes.
+5. **Resolved (2026-08-13) — deliberately staying a convention, not enforced.** Confirmed (fresh
+   `grep` audit, not assumed) that no new rect-math duplication has crept in since this RFC was
+   written: every node kind that needs "where are my children" math still funnels through exactly
+   one shared function per concern (`TileHut::absolute_pane_rects`, `village_chrome::level_layout`,
+   `chrome::tab_layout`, `docks::handle_layout`, and now `state.rs`'s
+   `layer_surface_under`/`under_layer`, added by step 5 sub-step 4's own hit-test consolidation) —
+   so today's actual risk is unrealized, not live. Decided against building enforcement machinery
+   (a custom lint, a marker-type-only constructor pattern) preemptively for a problem that hasn't
+   recurred since the pattern was established: a real test asserting "these two code paths agree"
+   would only re-confirm what's already guaranteed by construction (one shared function, not two
+   independently-maintained ones) rather than catching anything new, and the two more ambitious
+   options are real, speculative infrastructure investment against a risk that's currently just
+   "a future contributor might not notice the existing helper and reach for `.unwrap()` instead" —
+   a discoverability problem this section (and each shared helper's own doc comment, already
+   cross-referencing its render/hit-test sibling) is a proportionate answer to.
 6. **Sub-Window/Alert modeling — mostly still a sketch, but confirmed largely already true in
    practice (2026-08-13).** Research for step 5's re-staging read `docks.rs`/`main_window.rs`/
    `state.rs::sync_visible_main_window` directly and found current code already matches this
