@@ -2,6 +2,7 @@ use std::ffi::OsString;
 use std::sync::Arc;
 
 use smithay::desktop::{PopupManager, Space, Window};
+use smithay::input::pointer::CursorImageStatus;
 use smithay::input::{Seat, SeatState};
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::ping::Ping;
@@ -83,6 +84,13 @@ pub struct State {
     /// from each event instead.
     pub pointer_location: Point<f64, Logical>,
 
+    /// The pointer's current appearance as last requested by a client
+    /// (`wl_pointer.set_cursor`) — updated by `SeatHandler::cursor_image`
+    /// (`handlers/mod.rs`). Only the udev/DRM backend actually draws a
+    /// cursor from this (see `cursor.rs`'s module doc); the winit backend
+    /// relies on its host compositor's own cursor and never reads it.
+    pub cursor_status: CursorImageStatus,
+
     /// Wakes up the winit backend's redraw handler (see `winit_backend.rs`,
     /// the only place that owns the actual window handle needed to call
     /// its `request_redraw()`) from anywhere else that changes something
@@ -153,6 +161,7 @@ impl State {
             mouse_report_button_held: None,
             dock_drag: None,
             pointer_location: Point::from((0.0, 0.0)),
+            cursor_status: CursorImageStatus::default_named(),
             redraw_ping,
         })
     }

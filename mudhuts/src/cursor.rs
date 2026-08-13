@@ -1,0 +1,230 @@
+//! Compositor-drawn mouse cursor for the udev/DRM backend (the "real
+//! xcursor-theme cursor rendering" gap the Phase 7 plan notes deliberately
+//! deferred past the initial pass). Loads the user's configured Xcursor
+//! theme (respecting `XCURSOR_THEME`/`XCURSOR_SIZE`, same env vars every
+//! X11/Wayland app already honors) and composites the current frame's
+//! image at the tracked pointer position.
+//!
+//! Ported from Smithay's own `anvil` demo (`anvil/src/cursor.rs` and
+//! `anvil/src/drawing.rs`'s `PointerElement`/`PointerRenderElement`),
+//! with its `.unwrap()`/`.expect()` calls replaced by skip-and-log
+//! fallbacks per this project's standing no-panics rule.
+//!
+//! Not used by `winit_backend.rs` at all: under that backend mudhuts is
+//! nested inside a host compositor, which already draws a normal cursor
+//! for the window — drawing our own on top would be redundant.
+
+use std::time::Duration;
+
+use smithay::backend::renderer::element::memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement};
+use smithay::backend::renderer::element::surface::{
+    WaylandSurfaceRenderElement, render_elements_from_surface_tree,
+};
+use smithay::backend::renderer::element::{AsRenderElements, Kind};
+use smithay::backend::renderer::{ImportAll, ImportMem, Renderer, Texture};
+use smithay::input::pointer::CursorImageStatus;
+use smithay::utils::{Physical, Point, Scale};
+use xcursor::CursorTheme;
+use xcursor::parser::{Image, parse_xcursor};
+
+/// A tiny procedurally-drawn arrow, used only if the configured Xcursor
+/// theme can't be loaded at all (e.g. no theme installed anywhere on the
+/// system). Every pixel is grayscale (R=G=B), so getting the exact
+/// channel order backwards wouldn't be visually distinguishable —
+/// sidesteps needing to verify that precisely for this rarely-hit
+/// fallback path.
+fn fallback_image() -> Image {
+    const SIZE: u32 = 24;
+    let mut pixels_rgba = vec![0u8; (SIZE * SIZE * 4) as usize];
+    for y in 0..SIZE {
+        let body_width = (y * 2 / 3 + 2).min(SIZE - 2);
+        for x in 0..SIZE {
+            let inside = x <= body_width;
+            let idx = ((y * SIZE + x) * 4) as usize;
+            let (gray, alpha) = if !inside {
+                (0, 0)
+            } else if x == 0 || y == 0 || x == body_width {
+                (0, 255)
+            } else {
+                (255, 255)
+            };
+            pixels_rgba[idx] = gray;
+            pixels_rgba[idx + 1] = gray;
+            pixels_rgba[idx + 2] = gray;
+            pixels_rgba[idx + 3] = alpha;
+        }
+    }
+    Image {
+        size: SIZE,
+        width: SIZE,
+        height: SIZE,
+        xhot: 0,
+        yhot: 0,
+        delay: 1,
+        pixels_rgba,
+        pixels_argb: Vec::new(),
+    }
+}
+
+fn load_icon(theme: &CursorTheme) -> Result<Vec<Image>, String> {
+    let icon_path = theme
+        .load_icon("default")
+        .ok_or_else(|| "theme has no default cursor".to_string())?;
+    let cursor_data = std::fs::read(&icon_path).map_err(|err| format!("{icon_path:?}: {err}"))?;
+    parse_xcursor(&cursor_data).ok_or_else(|| "failed to parse Xcursor file".to_string())
+}
+
+/// Loads and picks frames from the user's configured Xcursor theme.
+pub struct Cursor {
+    icons: Vec<Image>,
+    size: u32,
+}
+
+impl Cursor {
+    pub fn load() -> Self {
+        let name = std::env::var("XCURSOR_THEME").unwrap_or_else(|_| "default".to_string());
+        let size = std::env::var("XCURSOR_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(24);
+
+        let theme = CursorTheme::load(&name);
+        let icons = load_icon(&theme).unwrap_or_else(|err| {
+            tracing::warn!(
+                "failed to load Xcursor theme {name:?}, using a built-in fallback cursor: {err}"
+            );
+            vec![fallback_image()]
+        });
+
+        Self { icons, size }
+    }
+
+    /// The frame to show at `time` for the given output `scale`, or
+    /// `None` if this `Cursor` has no icons at all — shouldn't happen
+    /// (`load` always ensures at least the fallback is present), but
+    /// stays skip-and-log-safe rather than assuming that invariant.
+    pub fn frame(&self, scale: u32, time: Duration) -> Option<&Image> {
+        frame(time.as_millis() as u32, self.size * scale, &self.icons)
+    }
+}
+
+fn nearest_images(size: u32, images: &[Image]) -> Vec<&Image> {
+    let Some(nearest) = images
+        .iter()
+        .min_by_key(|image| (size as i32 - image.size as i32).abs())
+    else {
+        return Vec::new();
+    };
+    images
+        .iter()
+        .filter(|image| image.width == nearest.width && image.height == nearest.height)
+        .collect()
+}
+
+fn frame(mut millis: u32, size: u32, images: &[Image]) -> Option<&Image> {
+    let candidates = nearest_images(size, images);
+    if candidates.is_empty() {
+        return None;
+    }
+    let total: u32 = candidates.iter().map(|image| image.delay).sum();
+    if total == 0 {
+        return candidates.first().copied();
+    }
+    millis %= total;
+    for image in &candidates {
+        if millis < image.delay {
+            return Some(image);
+        }
+        millis -= image.delay;
+    }
+    // Unreachable in practice (the loop above always finds a match once
+    // `millis` has been reduced modulo `total`) — falling back to the
+    // first candidate instead of an `unreachable!()` panic costs nothing.
+    candidates.first().copied()
+}
+
+smithay::backend::renderer::element::render_elements! {
+    pub PointerRenderElement<R> where R: ImportAll + ImportMem;
+    Surface = WaylandSurfaceRenderElement<R>,
+    Memory = MemoryRenderBufferRenderElement<R>,
+}
+
+/// Tracks the pointer's current on-screen appearance: a client-requested
+/// [`CursorImageStatus`] plus (for the `Named` case) the current
+/// xcursor-theme frame's uploaded texture — set once per render pass by
+/// `udev_backend.rs`, which owns the frame-to-buffer cache.
+pub struct PointerElement {
+    buffer: Option<MemoryRenderBuffer>,
+    status: CursorImageStatus,
+}
+
+impl Default for PointerElement {
+    fn default() -> Self {
+        Self {
+            buffer: None,
+            status: CursorImageStatus::default_named(),
+        }
+    }
+}
+
+impl PointerElement {
+    pub fn set_status(&mut self, status: CursorImageStatus) {
+        self.status = status;
+    }
+
+    pub fn set_buffer(&mut self, buffer: MemoryRenderBuffer) {
+        self.buffer = Some(buffer);
+    }
+}
+
+impl<T, R> AsRenderElements<R> for PointerElement
+where
+    T: Texture + Clone + Send + 'static,
+    R: Renderer<TextureId = T> + ImportAll + ImportMem,
+{
+    type RenderElement = PointerRenderElement<R>;
+
+    fn render_elements<E>(
+        &self,
+        renderer: &mut R,
+        location: Point<i32, Physical>,
+        scale: Scale<f64>,
+        alpha: f32,
+    ) -> Vec<E>
+    where
+        E: From<PointerRenderElement<R>>,
+    {
+        match &self.status {
+            CursorImageStatus::Hidden => Vec::new(),
+            // The client wants the compositor's own default cursor —
+            // that's the xcursor-theme buffer `udev_backend.rs` keeps
+            // updated via `set_buffer`.
+            CursorImageStatus::Named(_) => {
+                let Some(buffer) = self.buffer.as_ref() else {
+                    return Vec::new();
+                };
+                match MemoryRenderBufferRenderElement::from_buffer(
+                    renderer,
+                    location.to_f64(),
+                    buffer,
+                    None,
+                    None,
+                    None,
+                    Kind::Cursor,
+                ) {
+                    Ok(element) => vec![E::from(PointerRenderElement::<R>::from(element))],
+                    Err(err) => {
+                        tracing::warn!("failed to import the cursor buffer: {err:?}");
+                        Vec::new()
+                    }
+                }
+            }
+            CursorImageStatus::Surface(surface) => {
+                render_elements_from_surface_tree(renderer, surface, location, scale, alpha, Kind::Cursor)
+                    .into_iter()
+                    .map(|el: PointerRenderElement<R>| E::from(el))
+                    .collect()
+            }
+        }
+    }
+}

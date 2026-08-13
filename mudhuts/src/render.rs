@@ -98,11 +98,15 @@ impl<T: PartialEq> TextureChangeTracker<T> {
 // at an explicit size/location), just wrapping a different Hut's cached
 // texture. `SolidColor` backs the popup's background panel and highlight
 // border (`SolidColorRenderElement` isn't generic over `R` at all).
+// `Pointer` backs the udev/DRM backend's own compositor-drawn cursor
+// (see `cursor.rs`) — unused (never constructed) under the winit
+// backend, which relies on the host compositor's own cursor instead.
 smithay::backend::renderer::element::render_elements! {
     pub OutputRenderElements<R, E> where R: ImportAll + ImportMem;
     Space = SpaceRenderElements<R, E>,
     Terminal = TextureRenderElement<<R as RendererSuper>::TextureId>,
     SolidColor = SolidColorRenderElement,
+    Pointer = crate::cursor::PointerRenderElement<R>,
 }
 
 /// Build one frame's worth of render elements (Alt-Tab popup, tab-strip

@@ -10,7 +10,9 @@
 //! plan's Phase 7 notes for the full list of what's deliberately
 //! deferred: multi-GPU `GpuManager`/`MultiRenderer`, DRM leasing,
 //! explicit GPU sync via drm-syncobj, 10-bit color, dmabuf client-buffer
-//! import, and real xcursor-theme cursor rendering).
+//! import). Cursor rendering (`cursor.rs`) is no longer on that list —
+//! implemented once real GUI clients confirmed the rest of the backend
+//! actually worked.
 //!
 //! Rendering is demand-driven, same principle as `winit_backend.rs`'s use
 //! of `redraw_ping`/`request_redraw()`: nothing here polls on a timer.
@@ -48,21 +50,26 @@ use smithay::backend::drm::output::{DrmOutput, DrmOutputManager, DrmOutputRender
 use smithay::backend::drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmNode};
 use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
+use smithay::backend::renderer::element::AsRenderElements;
+use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{self, UdevBackend, UdevEvent};
+use smithay::input::pointer::{CursorImageAttributes, CursorImageStatus};
 use smithay::output::{Mode as WlMode, Output, PhysicalProperties};
 use smithay::reexports::calloop::ping::PingSource;
 use smithay::reexports::calloop::{EventLoop, LoopHandle};
 use smithay::reexports::drm::control::{ModeTypeFlags, connector, crtc};
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
-use smithay::utils::DeviceFd;
+use smithay::utils::{DeviceFd, IsAlive, Point, Scale, Transform};
+use smithay::wayland::compositor::with_states;
 use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 
 use crate::State;
+use crate::cursor::{Cursor, PointerElement};
 use crate::render::{self, OutputRenderElements};
 
 type Allocator = GbmAllocator<DrmDeviceFd>;
@@ -89,6 +96,17 @@ struct Inner {
     drm_output_manager: OutputManager,
     drm_scanner: DrmScanner,
     surfaces: HashMap<crtc::Handle, SurfaceData>,
+    /// The loaded Xcursor theme (see `cursor.rs`) and the last-seen
+    /// `CursorImageStatus`'s composited render state — both persist
+    /// across frames rather than being rebuilt each render pass.
+    pointer_image: Cursor,
+    pointer_element: PointerElement,
+    /// Caches one uploaded `MemoryRenderBuffer` per distinct xcursor
+    /// frame `Image` (an animated cursor theme has only a handful of
+    /// these) — without this, every single render pass would re-upload
+    /// the same pixel data to a fresh GPU texture even when the cursor's
+    /// visible frame hasn't changed since the last one.
+    pointer_image_cache: Vec<(xcursor::parser::Image, MemoryRenderBuffer)>,
 }
 
 pub fn init_udev(
@@ -216,6 +234,9 @@ pub fn init_udev(
         drm_output_manager,
         drm_scanner: DrmScanner::new(),
         surfaces: HashMap::new(),
+        pointer_image: Cursor::load(),
+        pointer_element: PointerElement::default(),
+        pointer_image_cache: Vec::new(),
     }));
 
     let loop_handle = event_loop.handle();
@@ -460,7 +481,12 @@ fn connector_disconnected(
 fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Handle) {
     let mut inner_mut = inner.borrow_mut();
     let Inner {
-        renderer, surfaces, ..
+        renderer,
+        surfaces,
+        pointer_image,
+        pointer_element,
+        pointer_image_cache,
+        ..
     } = &mut *inner_mut;
     let Some(surface) = surfaces.get_mut(&crtc) else {
         tracing::debug!("render_surface: no surface for {crtc:?}, dropping the render chain here");
@@ -497,7 +523,20 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
         state.showing_terminal_effective(),
     );
 
-    let elements = render::build_frame_elements(state, renderer, &output, size);
+    let mut elements = render::build_frame_elements(state, renderer, &output, size);
+
+    // Prepended, not appended — elements render front-to-back (index 0
+    // on top, per the same convention `switcher::build`'s doc comment
+    // already relies on), and the cursor must stay above absolutely
+    // everything else, including the Alt-Tab popup.
+    let cursor_elements = build_cursor_elements(
+        state,
+        renderer,
+        pointer_image,
+        pointer_element,
+        pointer_image_cache,
+    );
+    elements.splice(0..0, cursor_elements);
 
     // `FrameFlags::empty()`, not `::DEFAULT` — `DEFAULT` allows the
     // `DrmCompositor` to attempt direct scanout via overlay/cursor
@@ -549,6 +588,70 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
     state.space.refresh();
     state.popups.cleanup();
     let _ = state.display_handle.flush_clients();
+}
+
+/// Build this frame's cursor render element(s) at `state.pointer_location`
+/// — either the loaded Xcursor theme's current frame (the common case,
+/// `CursorImageStatus::Named`) or a client-provided cursor surface
+/// (`CursorImageStatus::Surface`, set via `wl_pointer.set_cursor`), or
+/// nothing at all if the client asked to hide the cursor.
+fn build_cursor_elements(
+    state: &mut State,
+    renderer: &mut GlesRenderer,
+    pointer_image: &Cursor,
+    pointer_element: &mut PointerElement,
+    pointer_image_cache: &mut Vec<(xcursor::parser::Image, MemoryRenderBuffer)>,
+) -> Vec<Elements> {
+    // A client's cursor surface can be destroyed without the client ever
+    // telling us to switch away from it (e.g. the client itself exits) —
+    // fall back rather than keep pointing at a dead surface.
+    if let CursorImageStatus::Surface(surface) = &state.cursor_status
+        && !surface.alive()
+    {
+        state.cursor_status = CursorImageStatus::default_named();
+    }
+
+    let hotspot = match &state.cursor_status {
+        CursorImageStatus::Surface(surface) => with_states(surface, |states| {
+            states
+                .data_map
+                .get::<std::sync::Mutex<CursorImageAttributes>>()
+                .and_then(|attrs| attrs.lock().ok())
+                .map(|guard| guard.hotspot)
+                .unwrap_or_default()
+        }),
+        _ => match pointer_image.frame(1, state.start_time.elapsed()) {
+            Some(image) => {
+                let buffer = pointer_image_cache
+                    .iter()
+                    .find(|(cached, _)| cached == image)
+                    .map(|(_, buffer)| buffer.clone())
+                    .unwrap_or_else(|| {
+                        let buffer = MemoryRenderBuffer::from_slice(
+                            &image.pixels_rgba,
+                            Fourcc::Argb8888,
+                            (image.width as i32, image.height as i32),
+                            1,
+                            Transform::Normal,
+                            None,
+                        );
+                        pointer_image_cache.push((image.clone(), buffer.clone()));
+                        buffer
+                    });
+                pointer_element.set_buffer(buffer);
+                Point::from((image.xhot as i32, image.yhot as i32))
+            }
+            None => Point::from((0, 0)),
+        },
+    };
+
+    pointer_element.set_status(state.cursor_status.clone());
+
+    let cursor_pos = (state.pointer_location - hotspot.to_f64())
+        .to_physical(Scale::from(1.0))
+        .to_i32_round();
+
+    pointer_element.render_elements(renderer, cursor_pos, Scale::from(1.0), 1.0)
 }
 
 fn frame_finish(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Handle) {

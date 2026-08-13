@@ -1,4 +1,5 @@
 mod chrome;
+mod cursor;
 mod docks;
 mod gpu_term;
 mod grabs;
