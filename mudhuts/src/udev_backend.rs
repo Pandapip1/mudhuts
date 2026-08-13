@@ -627,6 +627,12 @@ fn connector_connected(
     state.output_size = (wl_mode.size.w, wl_mode.size.h);
     let (_, _, usable_w, usable_h) = state.usable_area();
     state.stack.resize_all(usable_w, usable_h);
+    // Nothing else re-pushes capture buffer constraints when the output's
+    // mode changes (the only point that happens under this backend, since
+    // it has no runtime mode-switching) — without this, a capture session
+    // created against a previous connector's size would fail every later
+    // capture attempt (see `State::refresh_capture_constraints`).
+    state.refresh_capture_constraints();
 
     inner.borrow_mut().surfaces.insert(
         crtc,
@@ -806,6 +812,10 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
     });
     state.space.refresh();
     state.popups.cleanup();
+    // `session_destroyed` only removes mudhuts' own owned `Session`s
+    // (`state.image_copy_sessions`) — it doesn't touch `ImageCopyCaptureState`'s
+    // separate internal tracking Vecs, so those need this periodic sweep too.
+    state.image_copy_capture_state.cleanup();
     let _ = state.display_handle.flush_clients();
 }
 

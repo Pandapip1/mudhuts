@@ -25,6 +25,11 @@ pub fn init_winit(
     // but only one of them can own it outright. calloop is single-threaded
     // here, so `Rc<RefCell<_>>` (not `Arc<Mutex<_>>`) is enough.
     let backend = Rc::new(RefCell::new(backend));
+    // Also stashed on `State` itself (mirroring `dmabuf_renderer` under
+    // udev) — screenshot capture (`handlers/capture.rs`) fires from a
+    // Wayland `Dispatch` callback, not tied to this module's own redraw
+    // closure, so it needs its own way to reach the renderer.
+    state.winit_backend = Some(backend.clone());
 
     let mode = Mode {
         size: backend.borrow().window_size(),
@@ -91,6 +96,12 @@ pub fn init_winit(
                     let (_, _, usable_w, usable_h) = state.usable_area();
                     let usable_logical = smithay::utils::Size::<i32, smithay::utils::Logical>::from((usable_w, usable_h));
                     xdg_shell::resize_all_main_windows(&state.stack, usable_logical);
+                    // Nothing else re-pushes capture buffer constraints on
+                    // a size change — without this, a capture session
+                    // outlives the first resize and every later capture
+                    // attempt fails buffer-size validation against a now-
+                    // stale size (see `State::refresh_capture_constraints`).
+                    state.refresh_capture_constraints();
                     backend.borrow().window().request_redraw();
                 }
                 WinitEvent::Input(event) => {
@@ -179,6 +190,11 @@ pub fn init_winit(
 
                     state.space.refresh();
                     state.popups.cleanup();
+                    // `session_destroyed` only removes mudhuts' own owned
+                    // `Session`s (`state.image_copy_sessions`) — it doesn't
+                    // touch `ImageCopyCaptureState`'s separate internal
+                    // tracking Vecs, so those need this periodic sweep too.
+                    state.image_copy_capture_state.cleanup();
                     let _ = state.display_handle.flush_clients();
                 }
                 WinitEvent::Focus(false) => {

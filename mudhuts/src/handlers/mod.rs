@@ -1,3 +1,4 @@
+pub(crate) mod capture;
 mod compositor;
 pub(crate) mod layer_shell;
 mod session_lock;
