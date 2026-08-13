@@ -160,8 +160,8 @@ pub struct State {
     /// from each event instead.
     ///
     /// Genuinely [`Logical`] (scale-divided), matching every other value
-    /// that flows through `self.space`/`pointer.motion()`/
-    /// `surface_under()` — *not* physical output pixels, unlike
+    /// that flows through `pointer.motion()`/`surface_under()`/a Console
+    /// Hut's own `space` — *not* physical output pixels, unlike
     /// `output_size`/`usable_area()` below. `input.rs`'s
     /// `handle_pointer_motion` converts to physical once, locally, for
     /// the handful of call sites (chrome/dock hit-testing, terminal
@@ -657,8 +657,8 @@ impl State {
     /// The whole output's current size, genuinely [`Logical`] (scale-
     /// divided) — as opposed to `self.output_size`, which is always
     /// physical. Used wherever a physical-pixel-native value (a dragged
-    /// Floating Window's position/size, read back from `self.space` and
-    /// therefore already Logical) needs to be compared against "the
+    /// Floating Window's position/size, read back from a Console Hut's own
+    /// `space` and therefore already Logical) needs to be compared against "the
     /// output's size" in the *same* space — see `grabs.rs`'s `unset` and
     /// `docks.rs`'s `finish_drag`, both computing whether a drop point is
     /// near an edge. Falls back to `self.output_size` with no output
@@ -795,9 +795,9 @@ impl State {
 
     /// Find a window (Main Window, Floating Window, or Alert) by its surface
     /// across *every* ConsoleHut, not just whatever's currently visible in
-    /// `self.space` — a background ConsoleHut's windows still need commit/
-    /// configure handling while hidden, and so do docked Floating Windows that
-    /// aren't mapped at all.
+    /// the focused one's own `space` — a background ConsoleHut's windows
+    /// still need commit/configure handling while hidden, and so do docked
+    /// Floating Windows that aren't mapped at all.
     pub fn find_window_by_surface(&self, surface: &WlSurface) -> Option<Window> {
         self.stack.all_huts().find_map(|h| {
             h.main_windows().iter().find_map(|entry| {
@@ -821,12 +821,12 @@ impl State {
     /// `build_frame_elements` actually draws: a `wlr-layer-shell` Top or
     /// Overlay surface first (drawn above normal content — see
     /// `composite_normal_content`'s doc comment), then whatever's mapped in
-    /// `self.space` (the focused ConsoleHut's visible Main Window/Floating Windows/
-    /// Alerts), then a Bottom or Background layer surface last. Doesn't
-    /// need to special-case the terminal-visible branch: while the
-    /// terminal itself is showing, it occupies the whole usable area and
-    /// nothing in `self.space` is mapped there for it to compete with,
-    /// so a layer surface only ever gets picked up here when there's
+    /// the focused ConsoleHut's own `space` (its visible Main Window/
+    /// Floating Windows/Alerts), then a Bottom or Background layer surface
+    /// last. Doesn't need to special-case the terminal-visible branch:
+    /// while the terminal itself is showing, it occupies the whole usable
+    /// area and nothing in that `space` is mapped there for it to compete
+    /// with, so a layer surface only ever gets picked up here when there's
     /// genuinely nothing else on top of it at that point.
     pub fn surface_under(
         &self,

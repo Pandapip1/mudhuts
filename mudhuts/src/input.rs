@@ -162,7 +162,7 @@ impl State {
     /// either way.
     ///
     /// `pos` is genuinely Logical (both callers now derive it from
-    /// `self.space.output_geometry`/its own scale-divided bounds — see
+    /// `State::real_output_geometry`/its own scale-divided bounds — see
     /// `InputEvent::PointerMotionAbsolute`/`PointerMotion` below), which
     /// is what `self.surface_under`/`pointer.motion` need: Smithay's own
     /// `Space`/layer-shell hit-testing, and the position a client's
@@ -267,10 +267,10 @@ impl State {
     /// for this press.
     ///
     /// A genuinely tiled Tile-Hut (2+ panes) is checked *exclusively*
-    /// — mirroring `render.rs`'s `build_frame_elements`, which bypasses
-    /// the Hut-tab/ConsoleHut-tab chrome pipeline entirely while tiled (see
-    /// its own early return): neither strip is ever actually drawn there,
-    /// so hit-testing against them too would risk a click inside a tile
+    /// — mirroring `render.rs`'s `build_frame_elements`, which skips
+    /// building the Hut-tab/ConsoleHut-tab chrome pipeline entirely while
+    /// tiled (its `is_tile` check): neither strip is ever actually drawn
+    /// there, so hit-testing against them too would risk a click inside a tile
     /// pane spuriously landing on some *other* ConsoleHut's tab layout that
     /// happens to overlap the same screen position but was never
     /// visible. Otherwise, checked in front-to-back z-order matching that
@@ -772,9 +772,10 @@ impl State {
                 {
                     // Handled by a Top/Overlay layer-shell surface (a
                     // status bar, launcher, etc.) — those render above
-                    // normal content (see `render.rs`'s `layer_elements`),
-                    // so they're checked before the terminal/window
-                    // branches below for this press.
+                    // normal content (see `render.rs`'s
+                    // `composite_normal_content`), so they're checked
+                    // before the terminal/window branches below for this
+                    // press.
                 } else if self.showing_terminal_effective() {
                     // Physical, like `active_pane_offset()`/`pixel_to_cell`
                     // — mudhuts' own terminal grid, not a real surface.

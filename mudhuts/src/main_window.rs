@@ -68,9 +68,9 @@ impl FloatingWindow {
 
 /// Always floating, never docked/minimized — see the plan's Phase 5 notes
 /// on Alerts. Tracks its own position explicitly (rather than relying on
-/// `state.space` to remember it) since `sync_visible_main_window` unmaps
-/// and remaps everything on every focus/visibility change, which would
-/// otherwise lose it.
+/// its owning Console Hut's own `space` to remember it) since
+/// `sync_visible_main_window` unmaps and remaps everything on every
+/// focus/visibility change, which would otherwise lose it.
 pub struct Alert {
     pub window: Window,
     pub position: Point<i32, Logical>,

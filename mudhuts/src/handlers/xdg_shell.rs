@@ -334,10 +334,10 @@ impl State {
         let Ok(root) = find_popup_root_surface(&PopupKind::Xdg(popup.clone())) else {
             return;
         };
-        // Looked up across every ConsoleHut (not just `self.space`, which now
-        // only ever holds whichever single Main Window is currently
-        // visible) — a popup's parent window doesn't have to be the
-        // visible one.
+        // Looked up across every ConsoleHut (not just the focused one's own
+        // `space`, which only ever holds whichever single Main Window is
+        // currently visible) — a popup's parent window doesn't have to be
+        // the visible one.
         if self.find_window_by_surface(&root).is_none() {
             return;
         };

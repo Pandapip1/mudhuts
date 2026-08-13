@@ -133,9 +133,11 @@ pub struct ConsoleHut {
     /// scoped per-instance instead. Bound to [`Self::space_output`], a
     /// synthetic output sized to [`Self::pixel_size`] (kept in sync by
     /// [`Self::resize_to_pixels`]), not the real one — see
-    /// `docs/rfcs/composable-hut-hierarchy.md`'s Q1. Structural only for
-    /// now: nothing populates or reads this yet (the next migration piece
-    /// wires `State::sync_visible_main_window`/`render.rs` to it).
+    /// `docs/rfcs/composable-hut-hierarchy.md`'s Q1. Populated by
+    /// `State::sync_visible_main_window` whenever this is the focused
+    /// ConsoleHut, and read by `render.rs`'s `content_elements`,
+    /// `State::surface_under`, `input.rs`'s click routing, and
+    /// `docks.rs`/`grabs.rs`'s drag handling.
     pub space: Space<HutSpaceElement>,
     pub(crate) space_output: Output,
 }

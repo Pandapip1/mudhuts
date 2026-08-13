@@ -21,7 +21,8 @@ use crate::State;
 use crate::main_window::{Dock, Edge};
 
 /// How close (in genuinely Logical pixels — `location`/`size` below
-/// always come from `self.space`, which is Logical throughout, so this
+/// always come from the focused Console Hut's own `space`
+/// (`ConsoleHut::space`), which is Logical throughout, so this
 /// threshold has to be too, unlike `docks.rs`'s physical-native
 /// `DETACH_THRESHOLD`) to an output edge a released Floating Window needs to
 /// be to snap back to docked, rather than staying floating where it was
@@ -202,8 +203,9 @@ impl PointerGrab<State> for MoveSurfaceGrab {
         }
 
         let size = self.window.geometry().size;
-        // `location`/`size` are genuinely Logical (from `self.space`) —
-        // compared against the output's Logical size, not
+        // `location`/`size` are genuinely Logical (from the focused
+        // Console Hut's own `space`) — compared against the output's
+        // Logical size, not
         // `data.output_size` (physical), to keep both sides of the
         // distance check in the same space (see
         // `State::output_size_logical`'s doc comment).

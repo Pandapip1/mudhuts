@@ -39,9 +39,9 @@ impl CompositorHandler for State {
             while let Some(parent) = get_parent(&root) {
                 root = parent;
             }
-            // Looked up across every ConsoleHut, not just `self.space` — a
-            // background ConsoleHut's window still needs its commit bookkeeping
-            // even while it isn't the visible one.
+            // Looked up across every ConsoleHut, not just the focused one's
+            // own `space` — a background ConsoleHut's window still needs
+            // its commit bookkeeping even while it isn't the visible one.
             if let Some(window) = self.find_window_by_surface(&root) {
                 window.on_commit();
             }

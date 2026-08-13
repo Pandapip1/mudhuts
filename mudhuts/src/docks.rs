@@ -20,8 +20,9 @@
 //! a real mapped element (`Dock::Floating`, read/written by
 //! `sync_visible_main_window`/`grabs.rs`'s `MoveSurfaceGrab` too) does
 //! its position need to cross over into genuinely `Logical` space to
-//! match `self.space`'s own contract — see [`advance_drag`]/[`finish_drag`]
-//! for exactly where that conversion happens.
+//! match `ConsoleHut::space`'s own contract — see
+//! [`advance_drag`]/[`finish_drag`] for exactly where that conversion
+//! happens.
 //!
 //! First real adopter of `crate::redraw`'s `Redrawable`/`HitTestable`
 //! traits (composable Hut hierarchy RFC, migration step 1) — chosen as
@@ -291,7 +292,7 @@ pub fn start_drag(state: &mut State, pos: Point<f64, Physical>) -> bool {
 /// crosses [`DETACH_THRESHOLD`], then just repositions it directly on
 /// every motion after that. `pos` is physical (see [`start_drag`]) —
 /// converted to genuinely Logical right before it's written anywhere
-/// `self.space` will read it back from ([`Dock::Floating`],
+/// `ConsoleHut::space` will read it back from ([`Dock::Floating`],
 /// `map_element`), since those are Smithay's own contract, not this
 /// module's.
 pub fn advance_drag(state: &mut State, pos: Point<f64, Physical>) {
@@ -354,8 +355,9 @@ pub fn finish_drag(state: &mut State) {
         return;
     };
     let size = window.geometry().size;
-    // `location`/`size` come from `self.space`, so they're genuinely
-    // Logical — compared against the output's Logical size here, not
+    // `location`/`size` come from the focused Console Hut's own `space`,
+    // so they're genuinely Logical — compared against the output's
+    // Logical size here, not
     // `state.output_size` (physical), to keep both sides of every
     // distance check in the same space (see `State::output_size_logical`'s
     // doc comment).
