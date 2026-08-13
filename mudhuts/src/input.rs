@@ -140,7 +140,8 @@ impl State {
         }
 
         if self.showing_terminal_effective() {
-            let (col, row, left_half) = self.stack.focused().pixel_to_cell(pos.x, pos.y);
+            let (ox, oy) = self.active_pane_offset();
+            let (col, row, left_half) = self.stack.focused().pixel_to_cell(pos.x - ox, pos.y - oy);
             if let Some(held) = self.mouse_report_button_held {
                 if self.stack.focused().terminal.wants_drag_reports()
                     && let Some(xbutton) = xterm_button(held)
@@ -272,21 +273,39 @@ impl State {
                 }
                 self.request_redraw();
             }
+            // Innermost-first resolution (see the plan's Meta+Left/Right
+            // notes): the focused Hut's own Main Window tabs win if it
+            // has 2+; only then does this bubble up to the nearest
+            // ancestor Tab/Tile-Village and cycle *its* children instead
+            // (`HutStack::cycle_innermost` recurses to find that level on
+            // its own — a no-op if there isn't one, e.g. a lone Hut).
             Action::TabNext => {
-                self.stack.focused_mut().cycle_tab(true);
+                if self.stack.focused().main_window_count() >= 2 {
+                    self.stack.focused_mut().cycle_tab(true);
+                } else {
+                    self.stack.cycle_innermost(crate::village::Direction::Next);
+                }
                 self.sync_visible_main_window();
                 self.request_redraw();
             }
             Action::TabPrev => {
-                self.stack.focused_mut().cycle_tab(false);
+                if self.stack.focused().main_window_count() >= 2 {
+                    self.stack.focused_mut().cycle_tab(false);
+                } else {
+                    self.stack.cycle_innermost(crate::village::Direction::Prev);
+                }
                 self.sync_visible_main_window();
                 self.request_redraw();
             }
-            // Depends on the Village management layer (Phase 6).
-            // Recognized and intercepted now so rebinding it already
-            // works even though it doesn't do anything yet.
-            Action::WrapTab | Action::WrapTile => {
-                tracing::debug!("{action:?} triggered (not implemented yet)");
+            Action::WrapTab => {
+                self.stack.wrap_tab();
+                self.sync_visible_main_window();
+                self.request_redraw();
+            }
+            Action::WrapTile => {
+                self.stack.wrap_tile();
+                self.sync_visible_main_window();
+                self.request_redraw();
             }
         }
     }
@@ -397,7 +416,8 @@ impl State {
 
                 if self.showing_terminal_effective() {
                     let pos = pointer.current_location();
-                    let (col, row, left_half) = self.stack.focused().pixel_to_cell(pos.x, pos.y);
+                    let (ox, oy) = self.active_pane_offset();
+                    let (col, row, left_half) = self.stack.focused().pixel_to_cell(pos.x - ox, pos.y - oy);
                     let mods = self.current_mods();
 
                     if self.stack.focused().terminal.wants_mouse_reports() {
@@ -506,7 +526,8 @@ impl State {
                     if self.stack.focused().terminal.wants_mouse_reports() {
                         if let Some(pointer) = self.seat.get_pointer() {
                             let pos = pointer.current_location();
-                            let (col, row, _) = self.stack.focused().pixel_to_cell(pos.x, pos.y);
+                            let (ox, oy) = self.active_pane_offset();
+                            let (col, row, _) = self.stack.focused().pixel_to_cell(pos.x - ox, pos.y - oy);
                             let mods = self.current_mods();
                             let wheel_button = if vertical_amount > 0.0 {
                                 mudhuts_term::mouse::BUTTON_WHEEL_DOWN

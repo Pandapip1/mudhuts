@@ -65,14 +65,14 @@ fn parent_pid(pid: u32) -> Option<u32> {
 /// callers should fall back to the currently focused Hut.
 pub fn find_owning_hut(client_pid: u32, stack: &HutStack) -> Option<u64> {
     if let Some(id) = env_hut_id(client_pid)
-        && stack.huts().any(|hut| hut.id == id)
+        && stack.all_huts().any(|hut| hut.id == id)
     {
         return Some(id);
     }
 
     let mut pid = client_pid;
     for _ in 0..MAX_ANCESTRY_HOPS {
-        if let Some(hut) = stack.huts().find(|h| h.shell_pid() == pid) {
+        if let Some(hut) = stack.all_huts().find(|h| h.shell_pid() == pid) {
             return Some(hut.id);
         }
         pid = parent_pid(pid)?;

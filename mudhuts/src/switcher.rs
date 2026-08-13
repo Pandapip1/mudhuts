@@ -42,7 +42,7 @@ pub fn build(stack: &HutStack, output_size: (i32, i32), renderer: &GlesRenderer)
     let preview_index = stack.preview_index();
     let mut elements = Vec::new();
 
-    for (i, hut) in stack.huts().enumerate() {
+    for (i, hut) in stack.top_level_huts().enumerate() {
         let x = panel_x + PADDING + i as i32 * (THUMB_SIZE.0 + GAP);
         let y = panel_y + PADDING;
 

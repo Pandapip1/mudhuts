@@ -117,7 +117,7 @@ fn retag(state: &mut State, tagged_surface: &WlSurface, target: Option<(Role, Wl
     // State` themselves, so they're called after the loop's borrow has
     // ended rather than from inside it.
     let mut handled = false;
-    for hut in state.stack.huts_mut() {
+    for hut in state.stack.all_huts_mut() {
         let Some(window) = hut
             .take_bare_main_window(tagged_surface)
             .or_else(|| hut.take_nested_window(tagged_surface))

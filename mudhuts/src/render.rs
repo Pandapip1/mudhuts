@@ -12,7 +12,8 @@ use smithay::output::Output;
 use smithay::utils::{Buffer, Rectangle, Transform};
 
 use crate::State;
-use crate::{chrome, docks, switcher};
+use crate::village::{Village, pane_rects};
+use crate::{chrome, docks, switcher, village_chrome};
 
 /// Tracks whether some comparable value changed since the last check,
 /// bumping a [`CommitCounter`] when it has. Backs real damage tracking for
@@ -160,7 +161,7 @@ pub fn build_frame_elements(
     // second `redraw` call in the same tick is a no-op cache hit, since
     // damage was already reset by the first).
     if state.stack.is_previewing() {
-        for hut in state.stack.huts_mut() {
+        for hut in state.stack.top_level_huts_mut() {
             hut.redraw(renderer);
         }
     }
@@ -171,10 +172,29 @@ pub fn build_frame_elements(
     // client window; empty when no preview session is open.
     elements.extend(switcher::build(&state.stack, size, renderer));
 
+    // Tile-Village (Phase 6) — bypasses the normal single-Hut chrome/
+    // docks/terminal-or-space pipeline entirely: every pane is visible
+    // simultaneously, side by side, each always showing its own Hut's
+    // terminal (never a Main Window — see `village.rs`'s module doc on
+    // why that's this pass's deliberate scope). A 1-child (or empty)
+    // Tile never actually exists (`Village::collapse_if_singleton`
+    // unwraps it immediately), but the length check stays as a defensive
+    // fallback to the normal pipeline rather than assumed.
+    if matches!(state.stack.focused_village(), Village::Tile(tile) if tile.children.len() >= 2) {
+        elements.extend(build_tile_elements(state, renderer, size));
+        return elements;
+    }
+
     // Tab-strip chrome (Phase 4) — on top of the terminal/window content
     // but still below the Alt-Tab popup above. Empty when the focused
     // Hut has no Main Windows.
     elements.extend(chrome::build(state.stack.focused_mut(), renderer));
+
+    // Village-level tab strip (Phase 6) — along the bottom edge, so it
+    // never collides with the per-Hut strip above (see
+    // `village_chrome.rs`'s module doc). Empty unless the focused
+    // top-level Village is a Tab-Village with 2+ children.
+    elements.extend(village_chrome::build(&mut state.stack, renderer, size));
 
     // Docked Sub-Window handles (Phase 5) — same z-order slot as the tab
     // strip, only shown alongside the Main Window they belong to (never
@@ -213,6 +233,84 @@ pub fn build_frame_elements(
                 elements.extend(space_elements.into_iter().map(OutputRenderElements::from))
             }
             Err(err) => tracing::warn!("failed to collect space elements: {err}"),
+        }
+    }
+
+    elements
+}
+
+/// Build a Tile-Village's panes side by side: each child's own terminal
+/// texture (already sized to its pane by `Village::resize_to_pixels` —
+/// see that method and [`pane_rects`]), composited at its pane's screen
+/// position, plus a highlight border around whichever pane currently has
+/// keyboard focus. Only called once the caller's confirmed the focused
+/// top-level Village really is a `Village::Tile` with 2+ children.
+fn build_tile_elements(
+    state: &mut State,
+    renderer: &mut GlesRenderer,
+    size: (i32, i32),
+) -> Vec<OutputRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> {
+    let Village::Tile(tile) = state.stack.focused_village_mut() else {
+        return Vec::new();
+    };
+    let rects = pane_rects(tile.axis, tile.children.iter().map(|(_, frac)| *frac), size);
+    let active = tile.active;
+    let highlight_ids = tile.highlight_ids.clone();
+
+    let mut elements = Vec::new();
+    let mut active_rect = None;
+    for (i, ((child, _), (x, y, w, h))) in tile.children.iter_mut().zip(rects).enumerate() {
+        if i == active {
+            active_rect = Some((x, y, w, h));
+        }
+        let hut = child.focused_hut_mut();
+        let Some(texture) = hut.redraw(renderer) else {
+            continue;
+        };
+        let element = TextureRenderElement::from_texture_with_damage(
+            hut.element_id.clone(),
+            renderer.context_id(),
+            (x as f64, y as f64),
+            texture,
+            1,
+            Transform::Normal,
+            None,
+            None,
+            None,
+            None,
+            hut.element_damage_snapshot(),
+            Kind::Unspecified,
+        );
+        elements.push(OutputRenderElements::from(element));
+    }
+
+    // Drawn last (so it renders in *front* of every pane's content, per
+    // the front-to-back push order every other chrome element in this
+    // module already follows) — a border, not a filled rect: four thin
+    // solid-color strips around the active pane's edges, since a single
+    // filled rectangle would just hide its content instead of framing
+    // it.
+    if let Some((x, y, w, h)) = active_rect {
+        const BORDER: i32 = 3;
+        let color = [0.3, 0.6, 1.0, 1.0];
+        let strips = [
+            (x, y, w, BORDER),               // top
+            (x, y + h - BORDER, w, BORDER),  // bottom
+            (x, y, BORDER, h),               // left
+            (x + w - BORDER, y, BORDER, h),  // right
+        ];
+        for (id, (sx, sy, sw, sh)) in highlight_ids.into_iter().zip(strips) {
+            let background = SolidColorRenderElement::new(
+                id,
+                Rectangle::<i32, smithay::utils::Physical>::new(
+                    smithay::utils::Point::from((sx, sy)),
+                    smithay::utils::Size::from((sw, sh)),
+                ),
+                CommitCounter::default(),
+                color,
+                Kind::Unspecified,
+            );
+            elements.push(OutputRenderElements::from(background));
         }
     }
 

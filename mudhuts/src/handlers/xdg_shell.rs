@@ -104,7 +104,7 @@ impl XdgShellHandler for State {
             .focused()
             .active_window()
             .is_some_and(|w| w.toplevel().is_some_and(|t| t.wl_surface() == wl_surface));
-        for hut in self.stack.huts_mut() {
+        for hut in self.stack.all_huts_mut() {
             if hut.remove_window(wl_surface) {
                 break;
             }
@@ -230,7 +230,7 @@ pub fn handle_commit(popups: &mut PopupManager, window: Option<Window>, surface:
 /// Windows are fullscreen — Sub-Windows/Alerts float at whatever size
 /// their own CSD/content wants, so they're left alone here.
 pub(crate) fn resize_all_main_windows(stack: &crate::stack::HutStack, size: Size<i32, Logical>) {
-    for hut in stack.huts() {
+    for hut in stack.all_huts() {
         for entry in hut.main_windows() {
             let Some(toplevel) = entry.window.toplevel() else {
                 continue;

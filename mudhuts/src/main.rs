@@ -14,6 +14,8 @@ mod stack;
 mod state;
 mod switcher;
 mod udev_backend;
+mod village;
+mod village_chrome;
 mod winit_backend;
 
 use smithay::reexports::calloop::EventLoop;

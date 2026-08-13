@@ -24,6 +24,7 @@ use smithay::wayland::socket::ListeningSocketSource;
 
 use crate::keybindings::Keymap;
 use crate::stack::HutStack;
+use crate::village::{Village, pane_rects};
 
 /// Open mudhuts' listening Wayland socket without yet wiring it into an
 /// event loop. Split out from [`State::new`] so callers can learn the
@@ -283,8 +284,45 @@ impl State {
     /// should currently be the visible view — `Hut::showing_terminal`,
     /// but forced true when that Hut has no Main Windows to toggle to.
     pub fn showing_terminal_effective(&self) -> bool {
+        // A genuinely tiled Tile-Village (2+ panes) always shows every
+        // pane's terminal, regardless of any individual Hut's own
+        // `showing_terminal` flag — see `render.rs`'s Tile-Village
+        // compositing and `village.rs`'s module doc on why Main Windows
+        // aren't shown in a tile pane in v1. Without this, a Hut that had
+        // toggled to a Main Window before being tiled would report
+        // `false` here while still visually showing its terminal,
+        // desyncing mouse-interaction routing (selection/mouse-reports)
+        // from what's actually on screen.
+        if matches!(self.stack.focused_village(), Village::Tile(tile) if tile.children.len() >= 2)
+        {
+            return true;
+        }
         let hut = self.stack.focused();
         hut.showing_terminal || hut.main_window_count() == 0
+    }
+
+    /// Screen-space offset of whichever pane currently has effective
+    /// focus — `(0.0, 0.0)` unless the focused top-level Village is a
+    /// Tile-Village (see `render.rs`'s Tile-Village compositing, which
+    /// places each pane at exactly this same offset) — so mouse
+    /// interaction (selection, click, scroll) lines up with the pane
+    /// that's actually on screen there, rather than being computed
+    /// against the whole output as if the focused Hut's terminal still
+    /// filled it.
+    pub fn active_pane_offset(&self) -> (f64, f64) {
+        let Village::Tile(tile) = self.stack.focused_village() else {
+            return (0.0, 0.0);
+        };
+        if tile.children.len() < 2 {
+            return (0.0, 0.0);
+        }
+        let rects = pane_rects(
+            tile.axis,
+            tile.children.iter().map(|(_, frac)| *frac),
+            self.output_size,
+        );
+        let (x, y, _, _) = rects[tile.active];
+        (x as f64, y as f64)
     }
 
     /// Make `self.space` match what the focused Hut should currently be
@@ -327,7 +365,7 @@ impl State {
     /// configure handling while hidden, and so do docked Sub-Windows that
     /// aren't mapped at all.
     pub fn find_window_by_surface(&self, surface: &WlSurface) -> Option<Window> {
-        self.stack.huts().find_map(|h| {
+        self.stack.all_huts().find_map(|h| {
             h.main_windows().iter().find_map(|entry| {
                 if entry.matches(surface) {
                     return Some(entry.window.clone());
