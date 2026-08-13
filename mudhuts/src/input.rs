@@ -83,6 +83,16 @@ const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
 const BTN_MIDDLE: u32 = 0x112;
 
+/// How much accumulated `PointerAxis` `vertical_amount` (the same
+/// physical-pixel-ish unit libinput/Wayland's `wp_pointer.axis` always
+/// uses) counts as one discrete wheel "click" — matches the 15px/click
+/// convention this file already assumes elsewhere (the `amount_v120`
+/// fallback that synthesizes a continuous amount from discrete-only
+/// devices). Used to gate both scrollback-view line-scrolling and
+/// SGR mouse-wheel reports to a TUI app that's grabbed the mouse — see
+/// `PointerAxis`'s handler for why gating matters at all.
+const WHEEL_CLICK_PX: f64 = 15.0;
+
 /// Map an evdev button code to the xterm mouse-reporting button number, or
 /// `None` for buttons that don't have one (reporting is just skipped then).
 fn xterm_button(code: u32) -> Option<u32> {
@@ -887,40 +897,64 @@ impl State {
                 }
 
                 if self.showing_terminal_effective() && vertical_amount != 0.0 {
-                    if self.stack.focused().terminal.wants_mouse_reports() {
-                        if let Some(pointer) = self.seat.get_pointer() {
-                            let pos = self.to_physical(pointer.current_location());
-                            let (ox, oy) = self.active_pane_offset();
-                            let (col, row, _) = self.stack.focused().pixel_to_cell(pos.x - ox, pos.y - oy);
-                            let mods = self.current_mods();
-                            let wheel_button = if vertical_amount > 0.0 {
-                                mudhuts_term::mouse::BUTTON_WHEEL_DOWN
-                            } else {
-                                mudhuts_term::mouse::BUTTON_WHEEL_UP
-                            };
-                            self.stack.focused().terminal.report_mouse_button(
-                                wheel_button,
-                                mods,
-                                true,
-                                col + 1,
-                                row + 1,
-                            );
-                        }
-                    } else {
-                        // No app has grabbed the mouse — scroll this
-                        // Hut's own scrollback instead of doing nothing.
-                        // `vertical_amount > 0.0` is "scroll down" (same
-                        // convention as the wheel-report mapping above);
-                        // `Terminal::scroll`'s sign is the opposite
-                        // (positive moves further *up* into history).
-                        let lines = -(vertical_amount / 15.0 * 3.0).round() as i32;
-                        let lines = if lines != 0 {
-                            lines
+                    // Accumulate raw `vertical_amount` (the same
+                    // physical-pixel-ish unit libinput/Wayland's
+                    // `wp_pointer.axis` always uses) and only act once a
+                    // full `WHEEL_CLICK_PX` has built up, carrying the
+                    // remainder — rather than treating every single
+                    // `PointerAxis` event as "at least one click," which
+                    // is what both branches below used to do. A real
+                    // discrete mouse wheel already sends ~15px (one
+                    // click) per event, so this changes nothing for it;
+                    // a trackpad's continuous `AxisSource::Finger` events
+                    // are much smaller and much more frequent, and
+                    // treating each of those as its own click was making
+                    // a single gentle swipe register as dozens of clicks
+                    // — both scrolling a TUI app's (vim/less/btop/...)
+                    // own scrollback far faster than the same physical
+                    // motion should, and (when no app has grabbed the
+                    // mouse) mudhuts' own terminal scrollback the same
+                    // way.
+                    let hut = self.stack.focused_mut();
+                    hut.scroll_accum += vertical_amount;
+                    let clicks = (hut.scroll_accum / WHEEL_CLICK_PX).trunc() as i32;
+                    if clicks != 0 {
+                        hut.scroll_accum -= clicks as f64 * WHEEL_CLICK_PX;
+
+                        if self.stack.focused().terminal.wants_mouse_reports() {
+                            if let Some(pointer) = self.seat.get_pointer() {
+                                let pos = self.to_physical(pointer.current_location());
+                                let (ox, oy) = self.active_pane_offset();
+                                let (col, row, _) =
+                                    self.stack.focused().pixel_to_cell(pos.x - ox, pos.y - oy);
+                                let mods = self.current_mods();
+                                let wheel_button = if clicks > 0 {
+                                    mudhuts_term::mouse::BUTTON_WHEEL_DOWN
+                                } else {
+                                    mudhuts_term::mouse::BUTTON_WHEEL_UP
+                                };
+                                for _ in 0..clicks.abs() {
+                                    self.stack.focused().terminal.report_mouse_button(
+                                        wheel_button,
+                                        mods,
+                                        true,
+                                        col + 1,
+                                        row + 1,
+                                    );
+                                }
+                            }
                         } else {
-                            -vertical_amount.signum() as i32
-                        };
-                        self.stack.focused().terminal.scroll(lines);
-                        self.request_redraw();
+                            // No app has grabbed the mouse — scroll this
+                            // Hut's own scrollback instead of doing
+                            // nothing, 3 lines per click (unchanged from
+                            // before this fix). `clicks > 0` is "scroll
+                            // down" (same convention as the wheel-report
+                            // mapping above); `Terminal::scroll`'s sign is
+                            // the opposite (positive moves further *up*
+                            // into history).
+                            self.stack.focused().terminal.scroll(-clicks * 3);
+                            self.request_redraw();
+                        }
                     }
                 }
 

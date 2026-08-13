@@ -112,6 +112,14 @@ pub struct Hut {
     /// showing. Ignored (treated as `true`) while `main_windows` is
     /// empty — see `State::showing_terminal_effective`.
     pub showing_terminal: bool,
+    /// Fractional scroll-wheel/trackpad distance (physical pixels,
+    /// signed the same way `input.rs`'s `PointerAxis` handling reads
+    /// `vertical_amount`) not yet converted into a whole line of
+    /// scrollback movement. See `input.rs`'s `PointerAxis` handler for
+    /// why accumulating this (instead of flooring every event to at
+    /// least one line) matters for continuous-scroll devices like a
+    /// trackpad, which send many small events per swipe.
+    pub scroll_accum: f64,
 }
 
 impl Hut {
@@ -171,6 +179,7 @@ impl Hut {
                 main_windows: Vec::new(),
                 active_main_window: 0,
                 showing_terminal: true,
+                scroll_accum: 0.0,
             },
             events,
         ))
