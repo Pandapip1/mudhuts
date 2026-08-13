@@ -526,6 +526,29 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
         }
         Err(err) => tracing::warn!("render_frame failed: {err}"),
     }
+
+    // Missing here entirely until now — `winit_backend.rs`'s redraw
+    // handler has always done this, but nothing under this backend ever
+    // did. Without `send_frame`, a well-behaved client (anything pacing
+    // its own rendering off `wl_surface.frame` callbacks — which is
+    // effectively every real client) draws once and then waits forever
+    // for a callback that never comes, looking exactly like "doesn't
+    // work". `flush_clients` matters just as much: `dispatch_clients`
+    // (wired up in `state.rs`'s `init_wayland_listener`) only reads
+    // *incoming* client requests — nothing anywhere else flushes
+    // *outgoing* protocol messages (configures, frame callbacks, ...) to
+    // client sockets under this backend.
+    state.space.elements().for_each(|window| {
+        window.send_frame(
+            &output,
+            state.start_time.elapsed(),
+            Some(std::time::Duration::ZERO),
+            |_, _| Some(output.clone()),
+        )
+    });
+    state.space.refresh();
+    state.popups.cleanup();
+    let _ = state.display_handle.flush_clients();
 }
 
 fn frame_finish(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Handle) {
