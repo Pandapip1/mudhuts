@@ -1,6 +1,7 @@
 # RFC: Composable Hut Hierarchy
 
-Status: draft, for discussion. No code changes in this RFC.
+Status: draft, for discussion. No code changes in this RFC itself — migration steps 1–3 (see
+"Migration Strategy") have since landed in the actual codebase, each as its own separate commit.
 
 Companion doc: `/home/gavin/.claude/plans/cryptic-honking-lamport.md`, "Composable Hut
 hierarchy" wishlist entry (2026-08-13) — this RFC answers the three open questions that entry
@@ -240,9 +241,11 @@ today, just as *positioning input to a Space* rather than *positioning input to 
   this is more GPU memory and per-frame Space bookkeeping than today's single `state.space`. The
   existing "Investigate high memory usage" wishlist entry (plan doc, near the end) is reason to
   treat this as a real, not hypothetical, cost — see Open Questions.
-- **Risk**: `Space<HutSpaceElement>` requires `HutSpaceElement` to implement `SpaceElement`
-  (geometry, z-order, opaque-region reporting, etc.) for the `Composited` texture variant. This
-  RFC proposes the shape but hasn't prototyped the actual trait impl — flagged as unresolved.
+- **Risk, resolved**: `Space<HutSpaceElement>` requires `HutSpaceElement` to implement
+  `SpaceElement` (geometry, z-order, opaque-region reporting, etc.) for the `Composited` texture
+  variant. This RFC originally proposed the shape without prototyping the actual trait impl —
+  since built and live-verified as migration step 3 (`mudhuts/src/hut_space.rs`); see Open
+  Question 1's resolution.
 
 ## Question 2: Collapsing layer-shell's three compositing paths into one
 
@@ -582,11 +585,12 @@ primitives against low-blast-radius targets before touching the load-bearing `Vi
 2. Convert the switcher popup (`switcher.rs`) the same way — still self-contained, still
    non-Hut, validates that `Redrawable` alone (no `HitTestable`, since the switcher isn't
    currently click-driven) is a real, useful partial adoption.
-3. Prove out Q1's per-node `Space<HutSpaceElement>` design for exactly one scope — the
-   currently-focused Console Hut's Main-Window-visible case — rendering into its own texture via
-   a synthetic `Output`, side by side with (not replacing) `state.space`/
-   `sync_visible_main_window`, gated so it can be compared against the existing path's output
-   before anything is removed.
+3. **Done (2026-08-13, `mudhuts/src/hut_space.rs`).** Prove out Q1's per-node
+   `Space<HutSpaceElement>` design for exactly one scope — the currently-focused Console Hut's
+   Main-Window-visible case — rendering into its own texture via a synthetic `Output`, side by
+   side with (not replacing) `state.space`/`sync_visible_main_window`, gated (env var, off by
+   default) so it can be compared against the existing path's output before anything is
+   removed. See Open Question 1's resolution below for what this actually found.
 4. Only once 1–3 are validated, replace `Village`'s `Tab`/`Tile` enum variants and `HutStack`'s
    bespoke MRU bookkeeping with real generic Hut-tree node kinds (an `MruStackHut`, `TileHut`,
    `TabbedHut`, and the renamed Console Hut) implementing the traits proven out above. Be
@@ -609,10 +613,36 @@ one step's real size and risk.
 
 ## Open Questions Still Unresolved
 
-1. **`HutSpaceElement`'s actual `SpaceElement` impl** for the `Composited` (pre-rendered
-   texture) variant wasn't prototyped — geometry/opaque-region/z-order requirements for a
-   texture-backed `SpaceElement` need a real spike before Q1/Q2 can be trusted as fully
-   buildable, not just plausible from reading Smithay's trait definitions.
+1. **Resolved by migration step 3's spike (`mudhuts/src/hut_space.rs`, 2026-08-13).**
+   `HutSpaceElement`'s `SpaceElement`/`AsRenderElements` impls for the `Composited` variant are
+   now real, working code — confirmed there is no existing precedent anywhere in Smithay,
+   anvil, or smallvil for a texture-backed (non-`Window`) `SpaceElement` (`Window`, `X11Surface`,
+   and anvil's `WindowElement` are the only implementors, and all three are ultimately
+   `Window`-backed), so this genuinely was a novel impl, not an adaptation. Required 5 methods
+   with no default (`bbox`, `is_in_input_region`, `set_activate`, `output_enter`,
+   `output_leave`) plus `IsAlive::alive` — all trivial no-ops/constants for a texture with no
+   persistent identity (freshly built and discarded every use), and a `PartialEq` impl by a
+   fresh per-instance `Rc<()>` marker (`GlesTexture` itself has no `PartialEq`, so this couldn't
+   be derived). Live-verified, not just compiled: a private `Space<HutSpaceElement>` bound to a
+   synthetic `Output`, holding the same real `Window`s `state.space` maps today at translated
+   local coordinates, rendered byte-for-byte identically to the existing path against a real
+   client (`cosmic-term`) — and a `Window` and a `Composited` texture were confirmed to coexist
+   in the same `Space` and render correctly together (not something today's Main-Window-visible
+   scope alone can exercise, since there's no non-leaf Console-Hut child yet to produce a
+   `Composited` element from in real use — this pushed the focused Console Hut's own cached
+   terminal texture in alongside the real window purely to spike the mechanism ahead of step 4
+   needing it).
+
+   **One real gotcha surfaced by getting the comparison wrong the first time**: an initial
+   attempt reused the real "winit" `Output` for the old-path half of the comparison and saw a
+   spurious ~56%-of-pixels "divergence" — caused by `OutputDamageTracker::render_output` baking
+   in that output's own `Transform::Flipped180` (a `winit_backend.rs`-specific workaround) and
+   the host's real DPI scale, neither of which has anything to do with whether
+   `HutSpaceElement` composites correctly. Fixed by rendering *both* paths through matching
+   clean `Transform::Normal`/scale-`1.0` stand-in outputs, isolating the actual variable under
+   test. Worth remembering for step 4: any future comparison between old and new render paths
+   needs to control for output transform/scale explicitly, or a real bug and a harness artifact
+   look identical.
 2. **Per-node synthetic `Output`/`Space`/`LayerMap` memory/perf cost at real nesting depth**
    wasn't measured — this RFC only confirms it's *architecturally* valid, not that it's free.
    Given the plan doc's own unresolved "Investigate high memory usage" item
