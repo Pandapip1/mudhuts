@@ -8,6 +8,7 @@ use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::{wl_seat, wl_surface::WlSurface};
 use smithay::utils::{Logical, Serial, Size};
 use smithay::wayland::compositor::with_states;
+use smithay::wayland::shell::xdg::dialog::{ToplevelDialogHint, XdgDialogHandler};
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
     XdgToplevelSurfaceData,
@@ -201,24 +202,65 @@ impl XdgShellHandler for State {
     }
 }
 
+/// `xdg-wm-dialog-v1` — a toolkit calling `get_xdg_dialog`/`set_modal` only
+/// ever does so *before* a toplevel's first commit (see `handle_commit`'s
+/// doc comment for why that's the only point the fullscreen hint can be
+/// safely revised), so by the time this fires the initial configure
+/// hasn't gone out yet in the common case and there's nothing to correct
+/// here — `handle_commit` reads the same `dialog_hint` field fresh, right
+/// before that first `send_configure()`, so it always sees this change.
+/// Left a no-op rather than trying to react here too: doing so would just
+/// duplicate that check for a case (a *second*, corrective configure
+/// after the first already went out fullscreen) that no known toolkit
+/// actually triggers, since they set the hint before ever committing.
+impl XdgDialogHandler for State {
+    fn dialog_hint_changed(&mut self, _toplevel: ToplevelSurface, _hint: ToplevelDialogHint) {}
+}
+
 /// Should be called on `WlSurface::commit`.
+///
+/// This is the right (and only reliable) place to decide whether a
+/// toplevel is a dialog, not `new_toplevel`: `new_toplevel` fires
+/// synchronously inside the client's `xdg_surface.get_toplevel` request,
+/// before a well-behaved client has had a chance to send
+/// `xdg_toplevel.set_parent` or `xdg_wm_dialog_v1.get_xdg_dialog`/
+/// `set_modal` — those all arrive later in the same initial request
+/// batch, but strictly before the client's first `wl_surface.commit`.
+/// Right before the initial configure goes out is the first point both
+/// signals are reliably populated.
 pub fn handle_commit(popups: &mut PopupManager, window: Option<Window>, surface: &WlSurface) {
     if let Some(window) = window {
         let Some(toplevel) = window.toplevel() else {
             return;
         };
-        let initial_configure_sent = with_states(surface, |states| {
+        let (initial_configure_sent, dialog_hint) = with_states(surface, |states| {
             states
                 .data_map
                 .get::<XdgToplevelSurfaceData>()
                 .map(|data| match data.lock() {
-                    Ok(guard) => guard.initial_configure_sent,
-                    Err(_) => true,
+                    Ok(guard) => (guard.initial_configure_sent, guard.dialog_hint),
+                    Err(_) => (true, ToplevelDialogHint::Unknown),
                 })
-                .unwrap_or(true)
+                .unwrap_or((true, ToplevelDialogHint::Unknown))
         });
 
         if !initial_configure_sent {
+            // A dialog (whether flagged via the newer xdg-dialog-v1, or
+            // just via the older, coarser `set_parent` a dialog-aware
+            // toolkit sets regardless) shouldn't come up fullscreen like
+            // a normal Main Window — `new_toplevel` already staged that
+            // hint for every toplevel unconditionally (it can't tell the
+            // difference yet at that point — see this function's doc
+            // comment), so undo it here now that we can actually tell.
+            // Checked in addition to, not instead of, `dialog_hint`:
+            // plenty of dialog-ish toolkits set a parent without ever
+            // touching xdg-dialog-v1.
+            if toplevel.parent().is_some() || dialog_hint != ToplevelDialogHint::Unknown {
+                toplevel.with_pending_state(|state| {
+                    state.states.unset(xdg_toplevel::State::Fullscreen);
+                    state.size = None;
+                });
+            }
             toplevel.send_configure();
         }
     }
