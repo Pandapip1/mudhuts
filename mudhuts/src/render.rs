@@ -185,16 +185,22 @@ pub fn build_frame_elements(
         return elements;
     }
 
-    // Tab-strip chrome (Phase 4) — on top of the terminal/window content
-    // but still below the Alt-Tab popup above. Empty when the focused
-    // Hut has no Main Windows.
-    elements.extend(chrome::build(state.stack.focused_mut(), renderer));
+    // Village-level tab strip(s) (Phase 6) — one per Tab-Village along
+    // the active path, stacked from the top of the screen, outermost
+    // first (see `village_chrome.rs`'s module doc). Empty unless the
+    // focused top-level Village actually is a Tab-Village with 2+
+    // children; `next_y` is unchanged (0) in that case.
+    let cell_w = state.stack.focused().glyphs.cell_width().max(1);
+    let cell_h = state.stack.focused().glyphs.cell_height().max(1) as i32;
+    let (village_tab_elements, next_y) =
+        village_chrome::build(state.stack.focused_village_mut(), renderer, 0, cell_w, cell_h);
+    elements.extend(village_tab_elements);
 
-    // Village-level tab strip (Phase 6) — along the bottom edge, so it
-    // never collides with the per-Hut strip above (see
-    // `village_chrome.rs`'s module doc). Empty unless the focused
-    // top-level Village is a Tab-Village with 2+ children.
-    elements.extend(village_chrome::build(&mut state.stack, renderer, size));
+    // Tab-strip chrome (Phase 4) — pushed below any Village-level strips
+    // above it, still on top of the terminal/window content and still
+    // below the Alt-Tab popup above. Empty when the focused Hut has no
+    // Main Windows.
+    elements.extend(chrome::build(state.stack.focused_mut(), renderer, next_y));
 
     // Docked Sub-Window handles (Phase 5) — same z-order slot as the tab
     // strip, only shown alongside the Main Window they belong to (never
@@ -258,39 +264,14 @@ fn build_tile_elements(
     let highlight_ids = tile.highlight_ids.clone();
 
     let mut elements = Vec::new();
-    let mut active_rect = None;
-    for (i, ((child, _), (x, y, w, h))) in tile.children.iter_mut().zip(rects).enumerate() {
-        if i == active {
-            active_rect = Some((x, y, w, h));
-        }
-        let hut = child.focused_hut_mut();
-        let Some(texture) = hut.redraw(renderer) else {
-            continue;
-        };
-        let element = TextureRenderElement::from_texture_with_damage(
-            hut.element_id.clone(),
-            renderer.context_id(),
-            (x as f64, y as f64),
-            texture,
-            1,
-            Transform::Normal,
-            None,
-            None,
-            None,
-            None,
-            hut.element_damage_snapshot(),
-            Kind::Unspecified,
-        );
-        elements.push(OutputRenderElements::from(element));
-    }
 
-    // Drawn last (so it renders in *front* of every pane's content, per
-    // the front-to-back push order every other chrome element in this
-    // module already follows) — a border, not a filled rect: four thin
-    // solid-color strips around the active pane's edges, since a single
-    // filled rectangle would just hide its content instead of framing
-    // it.
-    if let Some((x, y, w, h)) = active_rect {
+    // Pushed first — frontmost, per this module's front-to-back push
+    // order (index 0 renders on top) — so the border actually renders
+    // *above* the active pane's content instead of being hidden behind
+    // it. A border, not a filled rect: four thin solid-color strips
+    // around the pane's edges, since a single filled rectangle would
+    // just hide its content instead of framing it.
+    if let Some(&(x, y, w, h)) = rects.get(active) {
         const BORDER: i32 = 3;
         let color = [0.3, 0.6, 1.0, 1.0];
         let strips = [
@@ -312,6 +293,28 @@ fn build_tile_elements(
             );
             elements.push(OutputRenderElements::from(background));
         }
+    }
+
+    for ((child, _), (x, y, _, _)) in tile.children.iter_mut().zip(rects) {
+        let hut = child.focused_hut_mut();
+        let Some(texture) = hut.redraw(renderer) else {
+            continue;
+        };
+        let element = TextureRenderElement::from_texture_with_damage(
+            hut.element_id.clone(),
+            renderer.context_id(),
+            (x as f64, y as f64),
+            texture,
+            1,
+            Transform::Normal,
+            None,
+            None,
+            None,
+            None,
+            hut.element_damage_snapshot(),
+            Kind::Unspecified,
+        );
+        elements.push(OutputRenderElements::from(element));
     }
 
     elements

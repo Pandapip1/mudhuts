@@ -1,15 +1,17 @@
-//! Phase 6's Village-level tab-strip chrome: a horizontal strip along the
-//! *bottom* of the screen, one tab per child, shown only when the
-//! focused top-level Village is a Tab-Village with 2+ children — distinct
-//! from `chrome.rs`'s own per-Hut Main-Window tab strip (always at the
-//! *top*), which this can be shown alongside without colliding (matches
-//! the established "chrome overlays whatever's underneath, doesn't
-//! reflow it" pattern already used everywhere else — see `chrome.rs`'s
-//! module doc).
+//! Phase 6's Village-level tab-strip chrome: one horizontal strip per
+//! Tab-Village along the *active path* from the top-level Village down to
+//! the focused Hut, stacked from the top of the screen — outermost
+//! (toplevel) first — with `chrome.rs`'s own per-Hut Main-Window tab
+//! strip pushed below the last of them (see `render.rs`'s
+//! `build_frame_elements`, which threads the total stack height through).
 //!
-//! Only a Tab-Village gets a strip — a Tile-Village's panes are all
-//! visible simultaneously (see `render.rs`'s Tile-Village compositing),
-//! so there's nothing to switch *to* the way a tab implies.
+//! A Tile-Village (or a bare Hut) ends the walk — there's nothing further
+//! to stack below it; a Tile's panes are all visible simultaneously (see
+//! `render.rs`'s Tile-Village compositing), so there's no "active tab" to
+//! show a strip for in the first place. A Tab-Village with only 1 child
+//! doesn't get a strip either (nothing to switch between) — though in
+//! practice this never happens, since [`Village::collapse_if_singleton`]
+//! unwraps it immediately.
 
 use smithay::backend::renderer::Renderer;
 use smithay::backend::renderer::element::Id;
@@ -24,7 +26,6 @@ use mudhuts_term::palette::Rgb;
 
 use crate::chrome::{to_color32f, window_title};
 use crate::render::{ChangeTracker, LabelCache, OutputRenderElements};
-use crate::stack::HutStack;
 use crate::village::Village;
 
 const TAB_PADDING: i32 = 12;
@@ -39,10 +40,17 @@ const BG_INACTIVE: Rgb = [40, 30, 50];
 
 type Element = OutputRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>;
 
+/// One tab's clickable/drawable rectangle within a single Tab-Village
+/// level, plus which child it is (an index into that level's `children`).
+pub struct TabRect {
+    pub index: usize,
+    pub rect: Rectangle<i32, Physical>,
+}
+
 /// What to show on a child's tab — its currently-effective Hut's active
 /// view: the active Main Window's title if it's showing one, else
 /// "Terminal". Same fallback chain `chrome::window_title` already uses
-/// for a single Hut's own Main-Window tabs, one level up.
+/// for a single Hut's own Main-Window tabs, one level down.
 fn child_label(village: &Village) -> String {
     let hut = village.focused_hut();
     if !hut.showing_terminal
@@ -60,18 +68,80 @@ fn child_label(village: &Village) -> String {
     "Terminal".to_string()
 }
 
-/// Build the Village-level tab strip's render elements, or an empty list
-/// if the focused top-level Village isn't a Tab-Village with 2+ children.
-pub fn build(stack: &mut HutStack, renderer: &mut GlesRenderer, output_size: (i32, i32)) -> Vec<Element> {
-    let cell_w = stack.focused().glyphs.cell_width().max(1);
-    let cell_h = stack.focused().glyphs.cell_height().max(1) as i32;
+fn tab_h(cell_h: i32) -> i32 {
+    cell_h + TAB_PADDING * 2
+}
 
-    let Village::Tab(tab) = stack.focused_village_mut() else {
-        return Vec::new();
+/// One Tab-Village level's tab rects, at physical-pixel row `y` — shared
+/// between rendering and click hit-testing (see this module's doc), so
+/// the two can never disagree about where a tab actually is.
+fn level_layout(children: &[Village], y: i32, cell_w: usize, cell_h: i32) -> Vec<TabRect> {
+    let h = tab_h(cell_h);
+    let mut rects = Vec::new();
+    let mut x = LEFT_MARGIN;
+    for (i, child) in children.iter().enumerate() {
+        let label = child_label(child);
+        let label_w = (label.chars().count().max(1) * cell_w) as i32;
+        let tab_w = label_w + TAB_PADDING * 2;
+        rects.push(TabRect {
+            index: i,
+            rect: Rectangle::new(Point::from((x, y)), Size::from((tab_w, h))),
+        });
+        x += tab_w + TAB_GAP;
+    }
+    rects
+}
+
+/// Total height of the Village-level tab-strip stack along the active
+/// path from `village` down — `0` if `village` isn't a Tab-Village with
+/// 2+ children (nothing to stack). Used by `render.rs` to know where
+/// `chrome.rs`'s own strip (and, when not tiled/tabbed at all, the
+/// terminal/window content itself) should start.
+pub fn stack_height(village: &Village, cell_h: i32) -> i32 {
+    match village {
+        Village::Tab(tab) if tab.children.len() >= 2 => {
+            tab_h(cell_h) + stack_height(&tab.children[tab.active], cell_h)
+        }
+        _ => 0,
+    }
+}
+
+/// Hit-test a click position (physical pixels) against the Village-level
+/// tab-strip hierarchy, recursing down the active path the same way
+/// [`build`] does. On a hit, switches that level's `active` index and
+/// returns `true` (the caller should re-sync visible content/focus and
+/// redraw); `false` if the click didn't land on any Village-level tab —
+/// the tile-pane/Hut-level click handling should take over instead.
+pub fn handle_click(village: &mut Village, pos: (i32, i32), y: i32, cell_w: usize, cell_h: i32) -> bool {
+    let Village::Tab(tab) = village else {
+        return false;
     };
     if tab.children.len() < 2 {
-        return Vec::new();
+        return false;
     }
+    let point = Point::from(pos);
+    for TabRect { index: i, rect } in level_layout(&tab.children, y, cell_w, cell_h) {
+        if rect.contains(point) {
+            tab.active = i;
+            return true;
+        }
+    }
+    handle_click(&mut tab.children[tab.active], pos, y + tab_h(cell_h), cell_w, cell_h)
+}
+
+/// Build the Village-level tab-strip stack's render elements, recursing
+/// down the active path (see this module's doc) — empty if `village`
+/// isn't a Tab-Village with 2+ children. Returns the elements plus the Y
+/// where whatever's next (a deeper level, or `chrome.rs`'s own strip)
+/// should start.
+pub fn build(village: &mut Village, renderer: &mut GlesRenderer, y: i32, cell_w: usize, cell_h: i32) -> (Vec<Element>, i32) {
+    let Village::Tab(tab) = village else {
+        return (Vec::new(), y);
+    };
+    if tab.children.len() < 2 {
+        return (Vec::new(), y);
+    }
+
     // Grow the per-child label cache/ids/bg-tracker lazily to match
     // `children` — see `TabVillage::label_cache`'s doc comment; only
     // ever grows here (shrinking happens in `Village::remove_child_hut`,
@@ -82,12 +152,9 @@ pub fn build(stack: &mut HutStack, renderer: &mut GlesRenderer, output_size: (i3
         tab.bg_tracker.push(ChangeTracker::new());
     }
 
-    let tab_h = cell_h + TAB_PADDING * 2;
-    let y = output_size.1 - tab_h;
-
+    let rects = level_layout(&tab.children, y, cell_w, cell_h);
     let mut elements = Vec::new();
-    let mut x = LEFT_MARGIN;
-    for i in 0..tab.children.len() {
+    for TabRect { index: i, rect } in rects {
         let active = i == tab.active;
         let (fg, bg) = if active {
             (FG_ACTIVE, BG_ACTIVE)
@@ -95,8 +162,6 @@ pub fn build(stack: &mut HutStack, renderer: &mut GlesRenderer, output_size: (i3
             (FG_INACTIVE, BG_INACTIVE)
         };
         let label = child_label(&tab.children[i]);
-        let label_w = (label.chars().count().max(1) * cell_w) as i32;
-        let tab_w = label_w + TAB_PADDING * 2;
 
         let key = (label.clone(), active);
         let texture = if tab.label_cache[i].is_stale(&key) {
@@ -120,7 +185,10 @@ pub fn build(stack: &mut HutStack, renderer: &mut GlesRenderer, output_size: (i3
                 let text = TextureRenderElement::from_texture_with_damage(
                     text_id,
                     renderer.context_id(),
-                    ((x + TAB_PADDING) as f64, (y + TAB_PADDING) as f64),
+                    (
+                        (rect.loc.x + TAB_PADDING) as f64,
+                        (rect.loc.y + TAB_PADDING) as f64,
+                    ),
                     texture,
                     1,
                     Transform::Normal,
@@ -137,17 +205,11 @@ pub fn build(stack: &mut HutStack, renderer: &mut GlesRenderer, output_size: (i3
         }
 
         let bg_commit = tab.bg_tracker[i].commit(active);
-        let background = SolidColorRenderElement::new(
-            bg_id,
-            Rectangle::<i32, Physical>::new(Point::from((x, y)), Size::from((tab_w, tab_h))),
-            bg_commit,
-            to_color32f(bg),
-            Kind::Unspecified,
-        );
+        let background = SolidColorRenderElement::new(bg_id, rect, bg_commit, to_color32f(bg), Kind::Unspecified);
         elements.push(Element::from(background));
-
-        x += tab_w + TAB_GAP;
     }
 
-    elements
+    let (deeper_elements, next_y) = build(&mut tab.children[tab.active], renderer, y + tab_h(cell_h), cell_w, cell_h);
+    elements.extend(deeper_elements);
+    (elements, next_y)
 }

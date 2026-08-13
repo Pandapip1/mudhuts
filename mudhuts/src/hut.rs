@@ -200,6 +200,13 @@ impl Hut {
         &self.main_windows
     }
 
+    /// Directly select a Main Window tab (clamped to bounds) — for
+    /// clicking a specific tab in `chrome.rs`'s strip, unlike
+    /// [`Self::cycle_tab`]'s relative forward/backward step.
+    pub fn set_active_main_window(&mut self, index: usize) {
+        self.active_main_window = index.min(self.main_windows.len().saturating_sub(1));
+    }
+
     pub fn main_windows_mut(&mut self) -> &mut [MainWindowEntry] {
         &mut self.main_windows
     }

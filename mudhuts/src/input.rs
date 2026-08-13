@@ -6,11 +6,12 @@ use smithay::backend::input::{
 use smithay::input::keyboard::{FilterResult, KeysymHandle, ModifiersState, keysyms};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::SERIAL_COUNTER;
+use smithay::utils::{Logical, Point, SERIAL_COUNTER};
 
 use crate::State;
-use crate::docks;
 use crate::keybindings::Action;
+use crate::village::{Village, pane_rects};
+use crate::{chrome, docks, village_chrome};
 
 /// Translate a raw xkb keysym into mudhuts-term's neutral [`Key`], or
 /// `None` for keys that don't map to a PTY-input action on their own
@@ -180,6 +181,103 @@ impl State {
         pointer.frame(self);
     }
 
+    /// Keyboard focus has to follow the visible view: clients only get
+    /// key events via `set_focus`, and the terminal only gets them via
+    /// `showing_terminal_effective()` itself (see `process_input_event`),
+    /// so the window needs *no* stale focus lingering while it's hidden,
+    /// and *does* need focus the moment it's shown. Shared by
+    /// `Action::ToggleTerminal` and every chrome click that can change
+    /// which Hut/tab/pane is now showing (`try_click_chrome`).
+    fn sync_keyboard_focus_to_view(&mut self) {
+        let target = if self.showing_terminal_effective() {
+            None
+        } else {
+            self.stack
+                .focused()
+                .active_window()
+                .and_then(|w| w.toplevel())
+                .map(|t| t.wl_surface().clone())
+        };
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            keyboard.set_focus(self, target, SERIAL_COUNTER.next_serial());
+        }
+    }
+
+    /// Try to handle a left-click as a chrome interaction — a
+    /// Village-level tab (any nesting level), a Hut-level Main-Window tab,
+    /// or clicking into a Tile-Village pane — rather than a normal
+    /// terminal/window click. On a hit, switches focus accordingly and
+    /// returns `true`, so the caller can skip its normal click handling
+    /// for this press.
+    ///
+    /// A genuinely tiled Tile-Village (2+ panes) is checked *exclusively*
+    /// — mirroring `render.rs`'s `build_frame_elements`, which bypasses
+    /// the Village-tab/Hut-tab chrome pipeline entirely while tiled (see
+    /// its own early return): neither strip is ever actually drawn there,
+    /// so hit-testing against them too would risk a click inside a tile
+    /// pane spuriously landing on some *other* Hut's tab layout that
+    /// happens to overlap the same screen position but was never
+    /// visible. Otherwise, checked in front-to-back z-order matching that
+    /// same function's element push order: Village-level tabs first
+    /// (topmost), then the Hut-level strip below them.
+    fn try_click_chrome(&mut self, pos: Point<f64, Logical>) -> bool {
+        let pixel = Point::<i32, Logical>::from((pos.x.round() as i32, pos.y.round() as i32));
+
+        if let Village::Tile(tile) = self.stack.focused_village_mut()
+            && tile.children.len() >= 2
+        {
+            let rects = pane_rects(tile.axis, tile.children.iter().map(|(_, frac)| *frac), self.output_size);
+            let Some(i) = rects
+                .into_iter()
+                .position(|(x, y, w, h)| pixel.x >= x && pixel.x < x + w && pixel.y >= y && pixel.y < y + h)
+            else {
+                return false;
+            };
+            tile.active = i;
+            self.sync_visible_main_window();
+            self.sync_keyboard_focus_to_view();
+            self.request_redraw();
+            return true;
+        }
+
+        let cell_w = self.stack.focused().glyphs.cell_width().max(1);
+        let cell_h = self.stack.focused().glyphs.cell_height().max(1) as i32;
+
+        if village_chrome::handle_click(
+            self.stack.focused_village_mut(),
+            (pixel.x, pixel.y),
+            0,
+            cell_w,
+            cell_h,
+        ) {
+            self.sync_visible_main_window();
+            self.sync_keyboard_focus_to_view();
+            self.request_redraw();
+            return true;
+        }
+
+        let strip_y = village_chrome::stack_height(self.stack.focused_village(), cell_h);
+        let physical_pixel = smithay::utils::Point::<i32, smithay::utils::Physical>::from((pixel.x, pixel.y));
+        let hit = chrome::tab_layout(self.stack.focused(), strip_y)
+            .into_iter()
+            .find(|t| t.rect.contains(physical_pixel));
+        if let Some(hit) = hit {
+            let hut = self.stack.focused_mut();
+            if hit.index == 0 {
+                hut.showing_terminal = true;
+            } else {
+                hut.showing_terminal = false;
+                hut.set_active_main_window(hit.index - 1);
+            }
+            self.sync_visible_main_window();
+            self.sync_keyboard_focus_to_view();
+            self.request_redraw();
+            return true;
+        }
+
+        false
+    }
+
     fn handle_action(&mut self, action: Action) {
         match action {
             Action::CloseFocused => {
@@ -210,35 +308,14 @@ impl State {
                 if hut.main_window_count() > 0 {
                     hut.showing_terminal = !hut.showing_terminal;
                     self.sync_visible_main_window();
-                    // Keyboard focus has to follow the visible view:
-                    // clients only get key events via `set_focus`, and the
-                    // terminal only gets them via `showing_terminal`
-                    // itself (see `process_input_event`), so the window
-                    // needs *no* stale focus lingering while it's hidden,
-                    // and *does* need focus the moment it's shown.
-                    let target = if self.stack.focused().showing_terminal {
-                        None
-                    } else {
-                        self.stack
-                            .focused()
-                            .active_window()
-                            .and_then(|w| w.toplevel())
-                            .map(|t| t.wl_surface().clone())
-                    };
-                    if let Some(keyboard) = self.seat.get_keyboard() {
-                        keyboard.set_focus(
-                            self,
-                            target,
-                            smithay::utils::SERIAL_COUNTER.next_serial(),
-                        );
-                    }
-                    // Missing until now — under winit this was masked by
-                    // that backend's own "redraw on every input event
-                    // regardless" behavior (see `handle_pointer_motion`'s
-                    // doc comment), but the udev backend is purely
-                    // demand-driven: without this, toggling never
-                    // actually repaints until some unrelated redraw comes
-                    // along.
+                    self.sync_keyboard_focus_to_view();
+                    // Missing until a previous fix — under winit this was
+                    // masked by that backend's own "redraw on every input
+                    // event regardless" behavior (see
+                    // `handle_pointer_motion`'s doc comment), but the udev
+                    // backend is purely demand-driven: without this,
+                    // toggling never actually repaints until some
+                    // unrelated redraw comes along.
                     self.request_redraw();
                 }
             }
@@ -306,11 +383,22 @@ impl State {
                 self.request_redraw();
             }
             Action::WrapTab => {
+                // Commit any open preview session first — `wrap_tab`
+                // combines whatever `current` is, but `current` doesn't
+                // follow a preview session until it's committed (see the
+                // Phase 3.5 "background stays frozen until commit" design).
+                // Without this, pressing wrap-tab while still holding the
+                // `stack-hold` modifier down (having only *peeked* at the
+                // next Hut in the popup, not released yet) would silently
+                // wrap the *old* frozen Hut instead of the one actually
+                // highlighted on screen.
+                self.stack.commit_preview();
                 self.stack.wrap_tab();
                 self.sync_visible_main_window();
                 self.request_redraw();
             }
             Action::WrapTile => {
+                self.stack.commit_preview();
                 self.stack.wrap_tile();
                 self.sync_visible_main_window();
                 self.request_redraw();
@@ -422,7 +510,12 @@ impl State {
                     docks::finish_drag(self);
                 }
 
-                if self.showing_terminal_effective() {
+                if pressed && button == BTN_LEFT && self.try_click_chrome(pointer.current_location()) {
+                    // Handled as a chrome click (a Village-level tab, a
+                    // Hut-level Main-Window tab, or a Tile-Village pane) —
+                    // skip the normal terminal/window click handling
+                    // below for this press.
+                } else if self.showing_terminal_effective() {
                     let pos = pointer.current_location();
                     let (ox, oy) = self.active_pane_offset();
                     let (col, row, left_half) = self.stack.focused().pixel_to_cell(pos.x - ox, pos.y - oy);

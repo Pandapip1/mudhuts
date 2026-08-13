@@ -73,10 +73,61 @@ pub(crate) fn to_color32f(rgb: Rgb) -> [f32; 4] {
     ]
 }
 
-/// Build the tab strip's render elements in front-to-back order, or an
-/// empty list if the focused Hut has no Main Windows.
-pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer) -> Vec<Element> {
+/// This tab strip's height in physical pixels — `0` if there's nothing
+/// to show (no Main Windows), so callers (`render.rs`'s Village-level
+/// stacking, `input.rs`'s click hit-testing) don't need their own
+/// separate "is there a strip at all" check.
+pub fn strip_height(hut: &Hut) -> i32 {
     if hut.main_window_count() == 0 {
+        return 0;
+    }
+    hut.glyphs.cell_height().max(1) as i32 + TAB_PADDING * 2
+}
+
+/// One tab's clickable/drawable rectangle, plus which tab it is — `0` is
+/// always the "Terminal" tab, `1..` follow `hut.main_windows()`'s order
+/// (matching `build`'s own indexing). Shared between `build` (rendering)
+/// and `input.rs` (click hit-testing), so the two can never disagree
+/// about where a tab actually is — the same reasoning as `docks::Handle`.
+pub struct TabRect {
+    pub index: usize,
+    pub rect: Rectangle<i32, Physical>,
+}
+
+/// Compute this Hut's tab strip layout, starting at physical-pixel row
+/// `y` (pushed down by however many Village-level tab strips are stacked
+/// above it — see `village_chrome.rs`'s module doc) — empty if there's
+/// nothing to show.
+pub fn tab_layout(hut: &Hut, y: i32) -> Vec<TabRect> {
+    if hut.main_window_count() == 0 {
+        return Vec::new();
+    }
+    let cell_w = hut.glyphs.cell_width().max(1);
+    let tab_h = strip_height(hut);
+
+    let mut labels = vec!["Terminal".to_string()];
+    labels.extend(hut.main_windows().iter().map(|entry| window_title(&entry.window)));
+
+    let mut rects = Vec::new();
+    let mut x = LEFT_MARGIN;
+    for (i, label) in labels.iter().enumerate() {
+        let label_w = (label.chars().count().max(1) * cell_w) as i32;
+        let tab_w = label_w + TAB_PADDING * 2;
+        rects.push(TabRect {
+            index: i,
+            rect: Rectangle::new(Point::from((x, y)), Size::from((tab_w, tab_h))),
+        });
+        x += tab_w + TAB_GAP;
+    }
+    rects
+}
+
+/// Build the tab strip's render elements in front-to-back order, starting
+/// at physical-pixel row `y`, or an empty list if the focused Hut has no
+/// Main Windows.
+pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer, y: i32) -> Vec<Element> {
+    let rects = tab_layout(hut, y);
+    if rects.is_empty() {
         return Vec::new();
     }
 
@@ -85,9 +136,6 @@ pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer) -> Vec<Element> {
     } else {
         1 + hut.active_main_window_index()
     };
-
-    let mut labels = vec!["Terminal".to_string()];
-    labels.extend(hut.main_windows().iter().map(|entry| window_title(&entry.window)));
 
     // Stable per-tab element ids, matching each label 1:1 — index 0 is
     // always the "Terminal" tab (`Hut`'s own cached ids), the rest follow
@@ -99,21 +147,19 @@ pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer) -> Vec<Element> {
     text_ids.extend(hut.main_windows().iter().map(|entry| entry.tab_text_id.clone()));
     bg_ids.extend(hut.main_windows().iter().map(|entry| entry.tab_bg_id.clone()));
 
-    let cell_w = hut.glyphs.cell_width().max(1);
-    let cell_h = hut.glyphs.cell_height().max(1) as i32;
-    let tab_h = cell_h + TAB_PADDING * 2;
-
     let mut elements = Vec::new();
-    let mut x = LEFT_MARGIN;
-    for (i, label) in labels.iter().enumerate() {
+    for TabRect { index: i, rect } in rects {
+        let label = if i == 0 {
+            "Terminal".to_string()
+        } else {
+            window_title(&hut.main_windows()[i - 1].window)
+        };
         let active = i == active_index;
         let (fg, bg) = if active {
             (FG_ACTIVE, BG_ACTIVE)
         } else {
             (FG_INACTIVE, BG_INACTIVE)
         };
-        let label_w = (label.chars().count().max(1) * cell_w) as i32;
-        let tab_w = label_w + TAB_PADDING * 2;
 
         // Only actually re-renders (real GPU work: glyph-atlas lookups
         // plus instanced draw calls into an FBO) when this tab's
@@ -127,13 +173,13 @@ pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer) -> Vec<Element> {
             let idx = i - 1;
             let key = (label.clone(), active);
             if hut.main_windows()[idx].tab_text_cache.is_stale(&key) {
-                hut.render_label(renderer, label, fg, bg)
+                hut.render_label(renderer, &label, fg, bg)
                     .map(|texture| hut.main_windows_mut()[idx].tab_text_cache.store(key, texture))
             } else {
                 match hut.main_windows()[idx].tab_text_cache.cached() {
                     Some(cached) => Ok(cached),
                     None => hut
-                        .render_label(renderer, label, fg, bg)
+                        .render_label(renderer, &label, fg, bg)
                         .map(|texture| hut.main_windows_mut()[idx].tab_text_cache.store(key, texture)),
                 }
             }
@@ -144,7 +190,10 @@ pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer) -> Vec<Element> {
                 let text = TextureRenderElement::from_texture_with_damage(
                     text_ids[i].clone(),
                     renderer.context_id(),
-                    ((x + TAB_PADDING) as f64, TAB_PADDING as f64),
+                    (
+                        (rect.loc.x + TAB_PADDING) as f64,
+                        (rect.loc.y + TAB_PADDING) as f64,
+                    ),
                     texture,
                     1,
                     Transform::Normal,
@@ -170,14 +219,12 @@ pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer) -> Vec<Element> {
         };
         let background = SolidColorRenderElement::new(
             bg_ids[i].clone(),
-            Rectangle::<i32, Physical>::new(Point::from((x, 0)), Size::from((tab_w, tab_h))),
+            rect,
             bg_commit,
             to_color32f(bg),
             Kind::Unspecified,
         );
         elements.push(Element::from(background));
-
-        x += tab_w + TAB_GAP;
     }
 
     elements

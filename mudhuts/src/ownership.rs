@@ -124,9 +124,20 @@ mod tests {
     #[test]
     fn unrelated_pid_finds_no_owning_hut() {
         let stack = new_stack();
-        // This test process is the *parent* of the spawned shell, not a
-        // descendant of it — walking upward from its own pid climbs
-        // toward init/the test harness, never toward the shell.
-        assert_eq!(find_owning_hut(std::process::id(), &stack), None);
+        // Deliberately not `std::process::id()`: this test binary's own
+        // environment isn't guaranteed clean of `MUDHUTS_HUT_ID` — if the
+        // whole test suite happens to be run from inside a live mudhuts
+        // session (its own daily-driver use), the test process inherits
+        // that Hut's real id, which `env_hut_id` would then find first,
+        // making this assertion depend on ambient state outside the
+        // test's control. A short-lived child with that variable
+        // explicitly cleared sidesteps it entirely.
+        let mut child = std::process::Command::new("true")
+            .env_remove("MUDHUTS_HUT_ID")
+            .spawn()
+            .expect("failed to spawn `true`");
+        let pid = child.id();
+        assert_eq!(find_owning_hut(pid, &stack), None);
+        let _ = child.wait();
     }
 }
