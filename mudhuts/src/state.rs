@@ -114,6 +114,18 @@ pub struct State {
     /// its own; that's normally backend-private state.
     pub dmabuf_renderer: Option<Rc<RefCell<GlesRenderer>>>,
 
+    /// `wlr-gamma-control-unstable-v1` (`zwlr_gamma_control_manager_v1`):
+    /// lets night-light tools like gammastep/wlsunset adjust the display's
+    /// hardware gamma ramp. Same shape as `dmabuf_renderer` right above —
+    /// `State` has no DRM device handle of its own (that's normally
+    /// backend-private, owned by `udev_backend.rs`'s own `Inner`), so the
+    /// actual `set_gamma`/`get_gamma` ioctl calls happen through this
+    /// borrowed handle instead. Only ever `Some` once
+    /// `udev_backend.rs::init_udev` has run — the global itself is only
+    /// ever registered there too, so no client ever sees it (and this
+    /// handler is therefore never invoked) under `winit_backend.rs`.
+    pub(crate) gamma_control_backend: Option<Rc<RefCell<crate::udev_backend::Inner>>>,
+
     /// `ext_foreign_toplevel_list_v1` — advertises every Main Window to
     /// any client that binds it (panels, taskbars, ...), and gives each
     /// one a stable identifier string. Phase 5b's `mudhuts_shell_authority_v1`
@@ -207,6 +219,7 @@ impl State {
             dmabuf_state: DmabufState::new(),
             dmabuf_global: None,
             dmabuf_renderer: None,
+            gamma_control_backend: None,
             foreign_toplevel_list_state,
             authority_token,
             redraw_ping,

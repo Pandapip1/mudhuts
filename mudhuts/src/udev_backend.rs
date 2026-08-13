@@ -39,6 +39,9 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::Read;
+use std::os::unix::io::OwnedFd;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -62,12 +65,22 @@ use smithay::input::pointer::{CursorImageAttributes, CursorImageStatus};
 use smithay::output::{Mode as WlMode, Output, PhysicalProperties};
 use smithay::reexports::calloop::ping::PingSource;
 use smithay::reexports::calloop::{EventLoop, LoopHandle};
-use smithay::reexports::drm::control::{ModeTypeFlags, connector, crtc};
+use smithay::reexports::drm::control::{Device as DrmControlDevice, ModeTypeFlags, connector, crtc};
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
+use smithay::reexports::wayland_protocols_wlr::gamma_control::v1::server::zwlr_gamma_control_manager_v1::{
+    self, ZwlrGammaControlManagerV1,
+};
+use smithay::reexports::wayland_protocols_wlr::gamma_control::v1::server::zwlr_gamma_control_v1::{
+    self, ZwlrGammaControlV1,
+};
+use smithay::reexports::wayland_server::backend::ClientId;
+use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
+use smithay::reexports::wayland_server::{Client, DataInit, DisplayHandle, New};
 use smithay::utils::{DeviceFd, IsAlive, Point, Scale, Transform};
 use smithay::wayland::compositor::with_states;
 use smithay::wayland::dmabuf::DmabufFeedbackBuilder;
+use smithay::wayland::{Dispatch2, GlobalData, GlobalDispatch2};
 use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 
 use crate::State;
@@ -91,9 +104,26 @@ struct SurfaceData {
     /// attempted — `frame_finish` re-renders once the pending commit
     /// actually completes, picking up anything that changed meanwhile.
     frame_pending: bool,
+    /// Whether some client currently holds an active
+    /// `zwlr_gamma_control_v1` for this crtc's output — the protocol
+    /// grants at most one client exclusive gamma access per output, so a
+    /// second `get_gamma_control` while this is set gets an immediate
+    /// `.failed()` rather than displacing the first (see
+    /// `get_gamma_control`).
+    gamma_control_bound: bool,
 }
 
-struct Inner {
+/// Exposed (opaquely — fields stay private to this module) as
+/// `State::gamma_control_backend` so `wlr-gamma-control-unstable-v1`'s
+/// `Dispatch2` impls below can reach `drm_output_manager`/`surfaces`
+/// through `state: &mut State` instead of stashing their own clone of
+/// this handle in Wayland resource user-data: `wayland-server` requires
+/// resource user-data to be `Send + Sync` (see `ObjectData`'s
+/// `DowncastSync` supertrait), which `Rc<RefCell<_>>` deliberately never
+/// is — this compositor has no multi-threaded dispatch to justify making
+/// it so. Nothing else about `Inner` changes: still constructed only in
+/// `init_udev`, still never touched under `winit_backend.rs`.
+pub(crate) struct Inner {
     /// `Rc<RefCell<_>>`, not owned outright — `State::dmabuf_renderer`
     /// holds a clone of the same renderer so `DmabufHandler::dmabuf_imported`
     /// (`handlers/mod.rs`) can attempt a client buffer import, since
@@ -272,6 +302,15 @@ pub fn init_udev(
         pointer_element: PointerElement::default(),
         pointer_image_cache: Vec::new(),
     }));
+
+    // `wlr-gamma-control-unstable-v1`: only ever registered here, mirroring
+    // `dmabuf_global` right above — see `Inner`'s own doc comment for why
+    // `State::gamma_control_backend` (not the resource user-data) is what
+    // holds this clone.
+    state.gamma_control_backend = Some(inner.clone());
+    state
+        .display_handle
+        .create_global::<State, ZwlrGammaControlManagerV1, _>(1, GlobalData);
 
     let loop_handle = event_loop.handle();
 
@@ -487,6 +526,7 @@ fn connector_connected(
             output,
             drm_output,
             frame_pending: false,
+            gamma_control_bound: false,
         },
     );
 
@@ -708,4 +748,230 @@ fn frame_finish(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Handl
     }
 
     render_surface(state, inner, crtc);
+}
+
+// `wlr-gamma-control-unstable-v1`: lets a privileged client (night-light
+// tools like gammastep/wlsunset) adjust a CRTC's hardware gamma ramp.
+// There's no Smithay-provided handler for this (unlike `DmabufHandler`
+// above) — no `wayland::gamma_control` module exists — so this is a
+// hand-rolled `Dispatch2`/`GlobalDispatch2` pair against the raw generated
+// protocol bindings, the same pattern `handlers/shell.rs` already
+// establishes for `mudhuts_shell_v1`. It lives here rather than in
+// `handlers/` because the actual gamma-ramp ioctls
+// (`drm::control::Device::get_gamma`/`set_gamma` — a standalone legacy
+// ioctl, entirely separate from the atomic-commit/property-blob machinery
+// `DrmOutputManager` otherwise uses for page-flips) can only be reached
+// through `Inner::drm_output_manager`, which stays private to this
+// module; see `Inner`'s own doc comment for why that's threaded through
+// `State::gamma_control_backend` rather than stashed directly in Wayland
+// resource user-data.
+//
+// Deliberately never touched from `winit_backend.rs`: there's no real
+// display hardware there to apply a gamma ramp to, and
+// `state.gamma_control_backend` is simply never set to `Some` under that
+// backend, so the global is never registered and no client ever sees the
+// interface in the registry — matching the `dmabuf_global` precedent
+// exactly (see `state.rs`'s doc comment on both fields).
+
+impl GlobalDispatch2<ZwlrGammaControlManagerV1, State> for GlobalData {
+    fn bind(
+        &self,
+        _state: &mut State,
+        _dh: &DisplayHandle,
+        _client: &Client,
+        resource: New<ZwlrGammaControlManagerV1>,
+        data_init: &mut DataInit<'_, State>,
+    ) {
+        data_init.init(resource, GlobalData);
+    }
+}
+
+impl Dispatch2<ZwlrGammaControlManagerV1, State> for GlobalData {
+    fn request(
+        &self,
+        state: &mut State,
+        _client: &Client,
+        _resource: &ZwlrGammaControlManagerV1,
+        request: zwlr_gamma_control_manager_v1::Request,
+        _dh: &DisplayHandle,
+        data_init: &mut DataInit<'_, State>,
+    ) {
+        match request {
+            zwlr_gamma_control_manager_v1::Request::GetGammaControl { id, output } => {
+                get_gamma_control(state, id, output, data_init);
+            }
+            // "All objects created by the manager will still remain
+            // valid, until their appropriate destroy request has been
+            // called" — nothing to do here for the manager itself.
+            zwlr_gamma_control_manager_v1::Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+/// Per-`zwlr_gamma_control_v1` state. `None` when this object was created
+/// only to be told `.failed()` immediately (see `get_gamma_control`) — no
+/// exclusive CRTC access was ever granted, so `SetGamma`/`destroyed`
+/// below become no-ops rather than acting on a CRTC this object was never
+/// given.
+struct GammaControlUserData {
+    active: Option<ActiveGammaControl>,
+}
+
+struct ActiveGammaControl {
+    crtc: crtc::Handle,
+    gamma_size: u32,
+    /// The CRTC's gamma ramp exactly as found the moment this object was
+    /// created — restored via `set_gamma` once this object is destroyed
+    /// (explicit `destroy` request or the client disconnecting; both
+    /// funnel through `Dispatch2::destroyed`, see its default-no-op doc
+    /// comment), matching the protocol's own requirement ("When the gamma
+    /// control object is destroyed, the gamma table is restored to its
+    /// original value").
+    original: (Vec<u16>, Vec<u16>, Vec<u16>),
+}
+
+/// Handle `zwlr_gamma_control_manager_v1.get_gamma_control`: resolve
+/// `output` to the `SurfaceData`/`crtc::Handle` that's actually driving
+/// it, then either grant exclusive access — capturing the CRTC's current
+/// ramp so `GammaControlUserData`'s `destroyed` hook can restore it later
+/// — or send an immediate `.failed()` per the protocol (unknown output,
+/// already bound by another client, or a CRTC reporting a zero-length
+/// ramp, i.e. no gamma hardware support). A resource is always created
+/// either way — the client needs a live object to receive `.failed()` on
+/// in the first place.
+fn get_gamma_control(
+    state: &mut State,
+    id: New<ZwlrGammaControlV1>,
+    output: WlOutput,
+    data_init: &mut DataInit<'_, State>,
+) {
+    let active = (|| -> Option<ActiveGammaControl> {
+        let target = Output::from_resource(&output)?;
+        let inner = state.gamma_control_backend.clone()?;
+        let mut inner_mut = inner.borrow_mut();
+        let Inner {
+            drm_output_manager,
+            surfaces,
+            ..
+        } = &mut *inner_mut;
+        let (&crtc, surface) = surfaces.iter_mut().find(|(_, s)| s.output == target)?;
+        if surface.gamma_control_bound {
+            return None;
+        }
+        let gamma_size = drm_output_manager.device().get_crtc(crtc).ok()?.gamma_length();
+        if gamma_size == 0 {
+            return None;
+        }
+        let gamma_size = gamma_size as usize;
+        let mut red = vec![0u16; gamma_size];
+        let mut green = vec![0u16; gamma_size];
+        let mut blue = vec![0u16; gamma_size];
+        drm_output_manager
+            .device()
+            .get_gamma(crtc, &mut red, &mut green, &mut blue)
+            .ok()?;
+        surface.gamma_control_bound = true;
+        Some(ActiveGammaControl {
+            crtc,
+            gamma_size: gamma_size as u32,
+            original: (red, green, blue),
+        })
+    })();
+
+    match active {
+        Some(active) => {
+            let gamma_size = active.gamma_size;
+            let resource = data_init.init(id, GammaControlUserData { active: Some(active) });
+            // "Sent immediately when the gamma control object is created."
+            resource.gamma_size(gamma_size);
+        }
+        None => {
+            let resource = data_init.init(id, GammaControlUserData { active: None });
+            resource.failed();
+        }
+    }
+}
+
+impl Dispatch2<ZwlrGammaControlV1, State> for GammaControlUserData {
+    fn request(
+        &self,
+        state: &mut State,
+        _client: &Client,
+        resource: &ZwlrGammaControlV1,
+        request: zwlr_gamma_control_v1::Request,
+        _dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, State>,
+    ) {
+        let Some(active) = &self.active else {
+            // Already `.failed()` at creation — nothing was ever granted
+            // for this object to act on.
+            return;
+        };
+        match request {
+            zwlr_gamma_control_v1::Request::SetGamma { fd } => {
+                if let Err(err) = apply_gamma(state, active, fd) {
+                    tracing::warn!("wlr-gamma-control: set_gamma failed: {err}");
+                    resource.failed();
+                }
+            }
+            zwlr_gamma_control_v1::Request::Destroy => {}
+            _ => {}
+        }
+    }
+
+    fn destroyed(&self, state: &mut State, _client: ClientId, _resource: &ZwlrGammaControlV1) {
+        let Some(active) = &self.active else {
+            return;
+        };
+        let Some(inner) = state.gamma_control_backend.as_ref() else {
+            return;
+        };
+        let mut inner_mut = inner.borrow_mut();
+        let (red, green, blue) = &active.original;
+        if let Err(err) = inner_mut
+            .drm_output_manager
+            .device()
+            .set_gamma(active.crtc, red, green, blue)
+        {
+            tracing::warn!("wlr-gamma-control: failed to restore the original gamma ramp: {err}");
+        }
+        if let Some(surface) = inner_mut.surfaces.get_mut(&active.crtc) {
+            surface.gamma_control_bound = false;
+        }
+    }
+}
+
+/// Read the client's raw gamma table off `fd` — per the protocol, three
+/// concatenated `u16` ramps (red, green, blue), each `gamma_size` long,
+/// which is exactly what the legacy `set_gamma` ioctl itself expects.
+/// Native-endian: like an mmap'd C `uint16_t[]`, this is raw memory the
+/// client wrote directly, not a serialized wire format with its own
+/// defined byte order. A short read or the ioctl call itself failing both
+/// surface as a plain `Err` — the caller sends `.failed()` rather than
+/// trusting a client-supplied fd to always behave.
+fn apply_gamma(state: &mut State, active: &ActiveGammaControl, fd: OwnedFd) -> Result<(), String> {
+    let mut file = File::from(fd);
+    let mut buf = vec![0u8; active.gamma_size as usize * 3 * 2];
+    file.read_exact(&mut buf)
+        .map_err(|err| format!("short read of the gamma table: {err}"))?;
+
+    let words: Vec<u16> = buf
+        .chunks_exact(2)
+        .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
+        .collect();
+    let gamma_size = active.gamma_size as usize;
+    let (red, rest) = words.split_at(gamma_size);
+    let (green, blue) = rest.split_at(gamma_size);
+
+    let inner = state
+        .gamma_control_backend
+        .as_ref()
+        .ok_or_else(|| "gamma control backend is gone".to_string())?;
+    inner
+        .borrow()
+        .drm_output_manager
+        .device()
+        .set_gamma(active.crtc, red, green, blue)
+        .map_err(|err| format!("set_gamma ioctl failed: {err}"))
 }
