@@ -429,6 +429,7 @@ fn render_surface(
         renderer, surfaces, ..
     } = &mut *inner_mut;
     let Some(surface) = surfaces.get_mut(&crtc) else {
+        tracing::debug!("render_surface: no surface for {crtc:?}, dropping the render chain here");
         return;
     };
 
@@ -457,10 +458,12 @@ fn render_surface(
     {
         Ok(result) => {
             if !result.is_empty {
+                tracing::debug!("render_surface: damage found for {crtc:?}, queuing frame");
                 if let Err(err) = surface.drm_output.queue_frame(()) {
                     tracing::warn!("failed to queue DRM frame: {err}");
                 }
             } else {
+                tracing::debug!("render_surface: no damage for {crtc:?}, rescheduling in 16ms");
                 // No damage — re-check for it in about a frame rather
                 // than busy-looping (trimmed of anvil's metadata-driven
                 // latency tuning; see the module doc).
@@ -472,9 +475,11 @@ fn render_surface(
 }
 
 fn frame_finish(state: &mut State, inner: &Rc<RefCell<Inner>>, handle: &LoopHandle<'static, State>, crtc: crtc::Handle) {
+    tracing::debug!("frame_finish: vblank for {crtc:?}");
     let submitted = {
         let mut inner_mut = inner.borrow_mut();
         let Some(surface) = inner_mut.surfaces.get_mut(&crtc) else {
+            tracing::debug!("frame_finish: no surface for {crtc:?}, dropping the render chain here");
             return;
         };
         surface.drm_output.frame_submitted()
@@ -490,6 +495,7 @@ fn reschedule(inner: &Rc<RefCell<Inner>>, handle: &LoopHandle<'static, State>, c
     let inner = inner.clone();
     let handle_clone = handle.clone();
     let result = handle.insert_source(Timer::from_duration(delay), move |_, _, state| {
+        tracing::debug!("reschedule: retry timer fired for {crtc:?}");
         render_surface(state, &inner, &handle_clone, crtc);
         TimeoutAction::Drop
     });
