@@ -1,0 +1,17 @@
+# D-Bus session-bus service activation file for mudhuts-portal.
+#
+# Install to: $DATADIR/dbus-1/services/org.freedesktop.impl.portal.desktop.mudhuts.service
+# (typically /usr/share/dbus-1/services/..., or
+# ~/.local/share/dbus-1/services/... for a user-only install).
+#
+# This is what lets `dbus-daemon`/`dbus-broker` launch mudhuts-portal on
+# demand the first time something calls a method on
+# org.freedesktop.impl.portal.desktop.mudhuts, rather than requiring it to
+# already be running. `Exec` must be an absolute path to the installed
+# binary — adjust to wherever this package actually installs it (e.g.
+# /usr/bin/mudhuts-portal, or /run/current-system/sw/bin/mudhuts-portal on
+# NixOS).
+
+[D-BUS Service]
+Name=org.freedesktop.impl.portal.desktop.mudhuts
+Exec=/usr/bin/mudhuts-portal
