@@ -934,6 +934,14 @@ fn build_cursor_elements(
         state.cursor_status = CursorImageStatus::default_named();
     }
 
+    let scale = state.output_scale();
+    // The buffer-scale integer every xcursor-theme frame is picked/
+    // uploaded at below — same rounding as `render::texture_buffer_scale`
+    // (a real fractional host scale loses sub-pixel precision here, same
+    // caveat as that helper's own doc comment), so a HiDPI theme's sharper
+    // 2x/3x frames actually get used instead of always the base-size one.
+    let scale_int = render::texture_buffer_scale(scale);
+
     let hotspot = match &state.cursor_status {
         CursorImageStatus::Surface(surface) => with_states(surface, |states| {
             states
@@ -953,7 +961,7 @@ fn build_cursor_elements(
         // actually look different from the plain arrow.
         CursorImageStatus::Named(icon) => {
             let pointer_image = pointer_images.entry(*icon).or_insert_with(|| Cursor::load(*icon));
-            match pointer_image.frame(1, state.start_time.elapsed()) {
+            match pointer_image.frame(scale_int as u32, state.start_time.elapsed()) {
                 Some(image) => {
                     let buffer = pointer_image_cache
                         .iter()
@@ -964,7 +972,7 @@ fn build_cursor_elements(
                                 &image.pixels_rgba,
                                 Fourcc::Argb8888,
                                 (image.width as i32, image.height as i32),
-                                1,
+                                scale_int,
                                 Transform::Normal,
                                 None,
                             );
@@ -972,7 +980,19 @@ fn build_cursor_elements(
                             buffer
                         });
                     pointer_element.set_buffer(buffer);
-                    Point::from((image.xhot as i32, image.yhot as i32))
+                    // `image.xhot`/`yhot` are in *this* image's own pixel
+                    // space — which, now that a HiDPI theme's scaled-up
+                    // variant may have been picked above, is `scale_int`×
+                    // the logical hotspot `state.pointer_location` (below)
+                    // needs. Divided back down here so the two stay in
+                    // the same (Logical) space before being combined —
+                    // same buffer-scale-vs-logical-size trap as
+                    // `render::texture_buffer_scale`'s doc comment, just
+                    // for a hotspot offset instead of an element size.
+                    Point::from((
+                        (image.xhot as f64 / scale_int as f64).round() as i32,
+                        (image.yhot as f64 / scale_int as f64).round() as i32,
+                    ))
                 }
                 None => Point::from((0, 0)),
             }
@@ -982,20 +1002,9 @@ fn build_cursor_elements(
     pointer_element.set_status(state.cursor_status.clone());
 
     // `state.pointer_location`/`hotspot` are both genuinely Logical (see
-    // `state.rs`'s `pointer_location` doc comment; `hotspot` in the
-    // `Named` case above comes from the xcursor theme's base-size image,
-    // whose nominal size — like `XCURSOR_SIZE` itself — is a logical, not
-    // physical, unit) — converted to physical here, at the render
-    // boundary, same as everywhere else in this compositor.
-    //
-    // Still picks the theme's base-size image regardless of output scale
-    // (`.frame(1, ...)` above, not `.frame(scale as u32, ...)`) — a real
-    // but cosmetic-only gap (the cursor renders correctly positioned, just
-    // not at full HiDPI crispness), matching anvil's own reference
-    // (`anvil/src/udev.rs`'s `// TODO get scale from the rendersurface
-    // when supporting HiDPI`) rather than a click-accuracy concern this
-    // pass is scoped to fix.
-    let scale = state.output_scale();
+    // `state.rs`'s `pointer_location` doc comment) — converted to physical
+    // here, at the render boundary, same as everywhere else in this
+    // compositor.
     let cursor_pos = (state.pointer_location - hotspot.to_f64())
         .to_physical(Scale::from(scale))
         .to_i32_round();
