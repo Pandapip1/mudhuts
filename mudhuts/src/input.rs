@@ -122,6 +122,17 @@ impl State {
     /// either way.
     fn handle_pointer_motion(&mut self, pos: smithay::utils::Point<f64, smithay::utils::Logical>, time: u32) {
         self.pointer_location = pos;
+        // Under winit this is a no-op ping (the host draws the cursor,
+        // and `winit_backend.rs`'s own input handler already force-
+        // redraws on every input event regardless) — but the udev
+        // backend draws its own compositor-side cursor (`cursor.rs`) at
+        // `pointer_location`, and its render loop is otherwise purely
+        // demand-driven (see `udev_backend.rs`'s module doc): without
+        // this, plain pointer motion with no other side effect (no
+        // button/text-selection/PTY activity) never triggers a redraw at
+        // all, so the drawn cursor only catches up to its real position
+        // whenever something unrelated happens to force one.
+        self.request_redraw();
         let serial = SERIAL_COUNTER.next_serial();
 
         if self.dock_drag.is_some() {
