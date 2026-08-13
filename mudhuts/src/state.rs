@@ -4,7 +4,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use smithay::backend::renderer::gles::GlesRenderer;
-use smithay::desktop::{PopupManager, Space, Window};
+use smithay::desktop::{PopupManager, Space, Window, WindowSurfaceType, layer_map_for_output};
 use smithay::input::pointer::CursorImageStatus;
 use smithay::input::{Seat, SeatState};
 use smithay::reexports::calloop::generic::Generic;
@@ -19,6 +19,7 @@ use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
 use smithay::wayland::foreign_toplevel_list::ForeignToplevelListState;
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
+use smithay::wayland::shell::wlr_layer::{Layer as WlrLayer, WlrLayerShellState};
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::socket::ListeningSocketSource;
@@ -121,6 +122,12 @@ pub struct State {
     /// tag *other* clients' toplevels without needing a direct object
     /// reference to them (see `handlers/shell.rs`).
     pub foreign_toplevel_list_state: ForeignToplevelListState,
+    /// `wlr-layer-shell` (`zwlr_layer_shell_v1`) — lets clients like status
+    /// bars/launchers/notification daemons anchor a surface to a screen
+    /// edge/region outside the normal fullscreen-toplevel model, stacked
+    /// in one of 4 layers (background/bottom/top/overlay) relative to
+    /// normal content. See `handlers/layer_shell.rs`'s module doc.
+    pub layer_shell_state: WlrLayerShellState,
     /// A one-time secret, generated fresh each run, that a helper program
     /// mudhuts itself spawns (see `main.rs`'s `--authority-helper`) must
     /// present via `mudhuts_shell_authority_v1.authenticate` before any of
@@ -166,6 +173,7 @@ impl State {
             smithay::wayland::GlobalData,
         );
         let foreign_toplevel_list_state = ForeignToplevelListState::new::<Self>(&dh);
+        let layer_shell_state = WlrLayerShellState::new::<Self>(&dh);
         let authority_token = {
             use rand::distr::{Alphanumeric, SampleString};
             Alphanumeric.sample_string(&mut rand::rng(), 32)
@@ -208,6 +216,7 @@ impl State {
             dmabuf_global: None,
             dmabuf_renderer: None,
             foreign_toplevel_list_state,
+            layer_shell_state,
             authority_token,
             redraw_ping,
         })
@@ -316,6 +325,27 @@ impl State {
         Ok(())
     }
 
+    /// The rectangle (physical pixels, output-relative) that Hut/Main-
+    /// Window *content* should actually be sized/positioned against —
+    /// the full output, minus whatever every mapped layer-shell surface's
+    /// exclusive zone currently reserves (see `handlers/layer_shell.rs`'s
+    /// module doc). Falls back to the full output size at `(0, 0)` if
+    /// there's no output yet.
+    ///
+    /// Deliberately narrower than "everything mudhuts draws": its own
+    /// chrome (`chrome.rs`/`village_chrome.rs`'s tab strips, `docks.rs`'s
+    /// edge handles, the Alt-Tab popup) still anchors to the raw output
+    /// rect unconditionally — a real, accepted v1 gap (a top-anchored
+    /// panel and mudhuts' own tab strip can visually collide) rather than
+    /// threading this through every chrome element too.
+    pub fn usable_area(&self) -> (i32, i32, i32, i32) {
+        let Some(output) = self.space.outputs().next() else {
+            return (0, 0, self.output_size.0, self.output_size.1);
+        };
+        let zone = layer_map_for_output(output).non_exclusive_zone();
+        (zone.loc.x, zone.loc.y, zone.size.w, zone.size.h)
+    }
+
     /// Whether the focused Hut's terminal (vs. its active Main Window)
     /// should currently be the visible view — `Hut::showing_terminal`,
     /// but forced true when that Hut has no Main Windows to toggle to.
@@ -338,27 +368,30 @@ impl State {
     }
 
     /// Screen-space offset of whichever pane currently has effective
-    /// focus — `(0.0, 0.0)` unless the focused top-level Village is a
-    /// Tile-Village (see `render.rs`'s Tile-Village compositing, which
-    /// places each pane at exactly this same offset) — so mouse
-    /// interaction (selection, click, scroll) lines up with the pane
-    /// that's actually on screen there, rather than being computed
-    /// against the whole output as if the focused Hut's terminal still
-    /// filled it.
+    /// focus — always at least [`Self::usable_area`]'s own origin (`(0.0,
+    /// 0.0)` unless a layer-shell surface reserves part of the output),
+    /// plus the Tile-Village pane offset on top of that if the focused
+    /// top-level Village is one (see `render.rs`'s Tile-Village
+    /// compositing, which places each pane at exactly this same offset)
+    /// — so mouse interaction (selection, click, scroll) lines up with
+    /// the pane that's actually on screen there, rather than being
+    /// computed against the raw output as if the focused Hut's terminal
+    /// still filled it edge to edge.
     pub fn active_pane_offset(&self) -> (f64, f64) {
+        let (area_x, area_y, area_w, area_h) = self.usable_area();
         let Village::Tile(tile) = self.stack.focused_village() else {
-            return (0.0, 0.0);
+            return (area_x as f64, area_y as f64);
         };
         if tile.children.len() < 2 {
-            return (0.0, 0.0);
+            return (area_x as f64, area_y as f64);
         }
         let rects = pane_rects(
             tile.axis,
             tile.children.iter().map(|(_, frac)| *frac),
-            self.output_size,
+            (area_w, area_h),
         );
         let (x, y, _, _) = rects[tile.active];
-        (x as f64, y as f64)
+        ((area_x + x) as f64, (area_y + y) as f64)
     }
 
     /// Make `self.space` match what the focused Hut should currently be
@@ -383,7 +416,13 @@ impl State {
         let Some(entry) = hut.active_main_window_entry() else {
             return;
         };
-        self.space.map_element(entry.window.clone(), (0, 0), false);
+        // Positioned at the usable area's own origin, not literally
+        // (0, 0) — matters once a layer-shell surface reserves part of
+        // the output (e.g. a left-anchored panel) — see
+        // `Self::usable_area`'s doc comment.
+        let (area_x, area_y, _, _) = self.usable_area();
+        self.space
+            .map_element(entry.window.clone(), (area_x, area_y), false);
         for sub in &entry.sub_windows {
             if let crate::main_window::Dock::Floating(pos) = sub.dock {
                 self.space.map_element(sub.window.clone(), pos, false);
@@ -418,6 +457,18 @@ impl State {
         })
     }
 
+    /// Topmost surface under `pos`, for pointer motion/click routing —
+    /// checked in the same front-to-back z-order `render.rs`'s
+    /// `build_frame_elements` actually draws: a `wlr-layer-shell` Top or
+    /// Overlay surface first (drawn above normal content — see
+    /// `layer_elements`'s doc comment), then whatever's mapped in
+    /// `self.space` (the focused Hut's visible Main Window/Sub-Windows/
+    /// Alerts), then a Bottom or Background layer surface last. Doesn't
+    /// need to special-case the terminal-visible branch: while the
+    /// terminal itself is showing, it occupies the whole usable area and
+    /// nothing in `self.space` is mapped there for it to compete with,
+    /// so a layer surface only ever gets picked up here when there's
+    /// genuinely nothing else on top of it at that point.
     pub fn surface_under(
         &self,
         pos: Point<f64, Logical>,
@@ -425,16 +476,51 @@ impl State {
         smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
         Point<f64, Logical>,
     )> {
-        self.space
-            .element_under(pos)
-            .and_then(|(window, location)| {
-                window
-                    .surface_under(
-                        pos - location.to_f64(),
-                        smithay::desktop::WindowSurfaceType::ALL,
-                    )
-                    .map(|(s, p)| (s, (p + location).to_f64()))
-            })
+        let output = self.space.outputs().next();
+
+        if let Some(output) = output {
+            let layers = layer_map_for_output(output);
+            if let Some(hit) = layers
+                .layer_under(WlrLayer::Overlay, pos)
+                .or_else(|| layers.layer_under(WlrLayer::Top, pos))
+                .and_then(|layer| Self::under_layer(&layers, layer, pos))
+            {
+                return Some(hit);
+            }
+        }
+
+        if let Some(hit) = self.space.element_under(pos).and_then(|(window, location)| {
+            window
+                .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
+                .map(|(s, p)| (s, (p + location).to_f64()))
+        }) {
+            return Some(hit);
+        }
+
+        let output = output?;
+        let layers = layer_map_for_output(output);
+        layers
+            .layer_under(WlrLayer::Bottom, pos)
+            .or_else(|| layers.layer_under(WlrLayer::Background, pos))
+            .and_then(|layer| Self::under_layer(&layers, layer, pos))
+    }
+
+    /// Shared tail of a layer-surface hit test: resolve `layer`'s own
+    /// surface (or a subsurface/popup of it) under `pos`, given `pos` is
+    /// still in output-relative coordinates (not yet offset by the
+    /// layer's own on-screen location).
+    fn under_layer(
+        layers: &smithay::desktop::LayerMap,
+        layer: &smithay::desktop::LayerSurface,
+        pos: Point<f64, Logical>,
+    ) -> Option<(
+        smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+        Point<f64, Logical>,
+    )> {
+        let layer_loc = layers.layer_geometry(layer)?.loc;
+        layer
+            .surface_under(pos - layer_loc.to_f64(), WindowSurfaceType::ALL)
+            .map(|(s, p)| (s, (p + layer_loc).to_f64()))
     }
 }
 

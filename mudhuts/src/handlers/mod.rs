@@ -1,4 +1,5 @@
 mod compositor;
+pub(crate) mod layer_shell;
 pub(crate) mod shell;
 pub(crate) mod xdg_shell;
 

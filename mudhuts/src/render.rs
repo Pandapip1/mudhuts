@@ -1,4 +1,5 @@
 use smithay::backend::renderer::{Renderer, Texture};
+use smithay::backend::renderer::element::AsRenderElements;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
@@ -6,10 +7,11 @@ use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::utils::{CommitCounter, DamageBag, DamageSnapshot};
 use smithay::backend::renderer::{ImportAll, ImportMem, RendererSuper};
-use smithay::desktop::Window;
 use smithay::desktop::space::{SpaceRenderElements, space_render_elements};
+use smithay::desktop::{Window, layer_map_for_output};
 use smithay::output::Output;
-use smithay::utils::{Buffer, Rectangle, Transform};
+use smithay::utils::{Buffer, Rectangle, Scale, Transform};
+use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
 
 use crate::State;
 use crate::village::{Village, pane_rects};
@@ -137,6 +139,56 @@ smithay::backend::renderer::element::render_elements! {
     Pointer = crate::cursor::PointerRenderElement<R>,
 }
 
+type Element = OutputRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>;
+
+/// This output's layer-shell surfaces (`handlers/layer_shell.rs`), split
+/// into the same two halves Smithay's own `space_render_elements` splits
+/// them into internally: `upper` (Top + Overlay, meant to render *above*
+/// normal content) and `lower` (Background + Bottom, *below* it).
+/// `space_render_elements` already handles this automatically for the
+/// Main-Window-visible branch below (its own doc comment confirms it:
+/// "this will include layer-shell surfaces added to this output's
+/// LayerMap") — this helper is only for the *other* two branches
+/// (showing the terminal directly, or a Tile-Village), which don't go
+/// through a `Space` at all, so nothing else would ever composite layer
+/// surfaces for them. Kept split (not flattened into one Vec) so the
+/// caller can insert its own content — a terminal texture, or a whole
+/// tile's worth of panes — into exactly the z-order slot a normal
+/// toplevel would otherwise occupy, between the two.
+fn layer_elements(
+    state: &State,
+    renderer: &mut GlesRenderer,
+) -> (Vec<Element>, Vec<Element>) {
+    let Some(output) = state.space.outputs().next() else {
+        return (Vec::new(), Vec::new());
+    };
+    let map = layer_map_for_output(output);
+    let (lower, upper): (Vec<_>, Vec<_>) = map
+        .layers()
+        .rev()
+        .partition(|s| matches!(s.layer(), WlrLayer::Background | WlrLayer::Bottom));
+
+    let mut render = |surfaces: Vec<&smithay::desktop::LayerSurface>| -> Vec<Element> {
+        surfaces
+            .into_iter()
+            .filter_map(|s| map.layer_geometry(s).map(|geo| (geo.loc, s)))
+            .flat_map(|(loc, s)| {
+                let elems: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = s.render_elements(
+                    renderer,
+                    loc.to_physical_precise_round(1.0),
+                    Scale::from(1.0),
+                    1.0,
+                );
+                elems
+                    .into_iter()
+                    .map(|e| Element::from(SpaceRenderElements::Surface(e)))
+            })
+            .collect()
+    };
+
+    (render(upper), render(lower))
+}
+
 /// Build one frame's worth of render elements (Alt-Tab popup, tab-strip
 /// chrome, docked-handle chrome, then either the focused Hut's terminal
 /// texture or its visible Main Window/Sub-Windows/Alerts via `state.space`)
@@ -181,7 +233,10 @@ pub fn build_frame_elements(
     // unwraps it immediately), but the length check stays as a defensive
     // fallback to the normal pipeline rather than assumed.
     if matches!(state.stack.focused_village(), Village::Tile(tile) if tile.children.len() >= 2) {
-        elements.extend(build_tile_elements(state, renderer, size));
+        let (layer_upper, layer_lower) = layer_elements(state, renderer);
+        elements.extend(layer_upper);
+        elements.extend(build_tile_elements(state, renderer));
+        elements.extend(layer_lower);
         return elements;
     }
 
@@ -210,6 +265,13 @@ pub fn build_frame_elements(
     }
 
     if show_terminal {
+        // Layer-shell surfaces around the terminal texture — the
+        // Main-Window-visible branch below gets this automatically from
+        // `space_render_elements`; this branch doesn't go through a
+        // `Space` at all, so it needs the hand-rolled equivalent (see
+        // `layer_elements`'s doc comment).
+        let (layer_upper, layer_lower) = layer_elements(state, renderer);
+        elements.extend(layer_upper);
         let hut = state.stack.focused_mut();
         if let Some(texture) = hut.redraw(renderer) {
             // `from_texture_with_damage`, not `from_static_texture` — the
@@ -233,6 +295,7 @@ pub fn build_frame_elements(
             );
             elements.push(OutputRenderElements::from(element));
         }
+        elements.extend(layer_lower);
     } else {
         match space_render_elements::<_, Window, _>(renderer, [&state.space], output, 1.0) {
             Ok(space_elements) => {
@@ -251,15 +314,25 @@ pub fn build_frame_elements(
 /// position, plus a highlight border around whichever pane currently has
 /// keyboard focus. Only called once the caller's confirmed the focused
 /// top-level Village really is a `Village::Tile` with 2+ children.
+///
+/// Panes are normal content — like the terminal-visible branch above,
+/// sized and positioned against [`State::usable_area`], not the raw
+/// output rect (matches `Village::resize_to_pixels`'s own sizing via
+/// `HutStack::resize_all`, and `State::active_pane_offset`'s identical
+/// rect computation for mouse-interaction routing — both must agree with
+/// what's actually drawn here).
 fn build_tile_elements(
     state: &mut State,
     renderer: &mut GlesRenderer,
-    size: (i32, i32),
 ) -> Vec<OutputRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> {
+    let (area_x, area_y, area_w, area_h) = state.usable_area();
     let Village::Tile(tile) = state.stack.focused_village_mut() else {
         return Vec::new();
     };
-    let rects = pane_rects(tile.axis, tile.children.iter().map(|(_, frac)| *frac), size);
+    let rects: Vec<_> = pane_rects(tile.axis, tile.children.iter().map(|(_, frac)| *frac), (area_w, area_h))
+        .into_iter()
+        .map(|(x, y, w, h)| (x + area_x, y + area_y, w, h))
+        .collect();
     let active = tile.active;
     let highlight_ids = tile.highlight_ids.clone();
 

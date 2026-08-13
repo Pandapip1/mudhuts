@@ -3,10 +3,12 @@ use smithay::backend::input::{
     AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
     KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
 };
+use smithay::desktop::{WindowSurfaceType, layer_map_for_output};
 use smithay::input::keyboard::{FilterResult, KeysymHandle, ModifiersState, keysyms};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Logical, Point, SERIAL_COUNTER};
+use smithay::utils::{Logical, Point, SERIAL_COUNTER, Serial};
+use smithay::wayland::shell::wlr_layer::{KeyboardInteractivity, Layer as WlrLayer};
 
 use crate::State;
 use crate::keybindings::Action;
@@ -223,14 +225,21 @@ impl State {
     fn try_click_chrome(&mut self, pos: Point<f64, Logical>) -> bool {
         let pixel = Point::<i32, Logical>::from((pos.x.round() as i32, pos.y.round() as i32));
 
+        // Rects computed against `usable_area`, not the raw output —
+        // must agree with what `render.rs`'s `build_tile_elements`
+        // actually draws (and with `State::active_pane_offset`'s own
+        // identical computation), or a click could land on the wrong
+        // pane whenever a layer-shell surface reserves part of the
+        // output.
+        let (area_x, area_y, area_w, area_h) = self.usable_area();
         if let Village::Tile(tile) = self.stack.focused_village_mut()
             && tile.children.len() >= 2
         {
-            let rects = pane_rects(tile.axis, tile.children.iter().map(|(_, frac)| *frac), self.output_size);
-            let Some(i) = rects
-                .into_iter()
-                .position(|(x, y, w, h)| pixel.x >= x && pixel.x < x + w && pixel.y >= y && pixel.y < y + h)
-            else {
+            let rects = pane_rects(tile.axis, tile.children.iter().map(|(_, frac)| *frac), (area_w, area_h));
+            let Some(i) = rects.into_iter().position(|(x, y, w, h)| {
+                let (x, y) = (x + area_x, y + area_y);
+                pixel.x >= x && pixel.x < x + w && pixel.y >= y && pixel.y < y + h
+            }) else {
                 return false;
             };
             tile.active = i;
@@ -276,6 +285,74 @@ impl State {
         }
 
         false
+    }
+
+    /// Try to claim a click for a `wlr-layer-shell` surface — a status
+    /// bar, launcher, notification popup, etc. — giving it real keyboard
+    /// focus if it asked for any (`set_keyboard_interactivity`'s
+    /// `on_demand`/`exclusive`; a plain `none` surface, e.g. a
+    /// wallpaper-style Background layer, still claims the click for
+    /// z-order purposes but never takes focus).
+    ///
+    /// `above` picks which half of the layer stack to check: `true` for
+    /// Top/Overlay (checked *before* normal terminal/window content, since
+    /// those render above it — see `render.rs`'s `layer_elements`), `false`
+    /// for Bottom/Background (checked only once nothing else — chrome,
+    /// Top/Overlay, normal content — already claimed the click).
+    fn try_click_layer_surface(&mut self, pos: Point<f64, Logical>, serial: Serial, above: bool) -> bool {
+        let Some(output) = self.space.outputs().next().cloned() else {
+            return false;
+        };
+        let focus_target = {
+            let layers = layer_map_for_output(&output);
+            let hit = if above {
+                layers
+                    .layer_under(WlrLayer::Overlay, pos)
+                    .or_else(|| layers.layer_under(WlrLayer::Top, pos))
+            } else {
+                layers
+                    .layer_under(WlrLayer::Bottom, pos)
+                    .or_else(|| layers.layer_under(WlrLayer::Background, pos))
+            };
+            let Some(layer) = hit else {
+                return false;
+            };
+            let Some(layer_loc) = layers.layer_geometry(layer).map(|geo| geo.loc) else {
+                return false;
+            };
+            if layer
+                .surface_under(pos - layer_loc.to_f64(), WindowSurfaceType::ALL)
+                .is_none()
+            {
+                return false;
+            }
+            layer.can_receive_keyboard_focus().then(|| layer.wl_surface().clone())
+        };
+        if let Some(wl_surface) = focus_target
+            && let Some(keyboard) = self.seat.get_keyboard()
+        {
+            keyboard.set_focus(self, Some(wl_surface), serial);
+        }
+        true
+    }
+
+    /// Any currently mapped `wlr-layer-shell` surface on the Top or
+    /// Overlay layer that's requested `exclusive` keyboard access
+    /// (typically a lock screen or similarly modal surface) — if one
+    /// exists, it should receive every key event unconditionally, ahead
+    /// of even mudhuts' own global keybindings (mirrors
+    /// `.smithay-ref/anvil`'s own `keyboard_key_to_action` reference
+    /// behavior).
+    fn exclusive_layer_surface(&self) -> Option<WlSurface> {
+        let output = self.space.outputs().next()?;
+        let layers = layer_map_for_output(output);
+        layers
+            .layers()
+            .find(|l| {
+                matches!(l.layer(), WlrLayer::Top | WlrLayer::Overlay)
+                    && l.cached_state().keyboard_interactivity == KeyboardInteractivity::Exclusive
+            })
+            .map(|l| l.wl_surface().clone())
     }
 
     fn handle_action(&mut self, action: Action) {
@@ -410,6 +487,21 @@ impl State {
                 let Some(keyboard) = self.seat.get_keyboard() else {
                     return;
                 };
+
+                if let Some(surface) = self.exclusive_layer_surface() {
+                    // An `exclusive` layer-shell surface (e.g. a lock
+                    // screen) wins even over mudhuts' own global
+                    // keybindings — every key goes straight to it,
+                    // skipping the keymap lookup and terminal-input path
+                    // below entirely.
+                    keyboard.set_focus(self, Some(surface), serial);
+                    keyboard.input::<(), _>(self, keycode, key_state, serial, time, |_, _, _| {
+                        FilterResult::Forward
+                    });
+                    let _ = self.display_handle.flush_clients();
+                    return;
+                }
+
                 keyboard.input::<(), _>(
                     self,
                     keycode,
@@ -508,6 +600,14 @@ impl State {
                     // Hut-level Main-Window tab, or a Tile-Village pane) —
                     // skip the normal terminal/window click handling
                     // below for this press.
+                } else if pressed
+                    && self.try_click_layer_surface(pointer.current_location(), serial, true)
+                {
+                    // Handled by a Top/Overlay layer-shell surface (a
+                    // status bar, launcher, etc.) — those render above
+                    // normal content (see `render.rs`'s `layer_elements`),
+                    // so they're checked before the terminal/window
+                    // branches below for this press.
                 } else if self.showing_terminal_effective() {
                     let pos = pointer.current_location();
                     let (ox, oy) = self.active_pane_offset();
@@ -564,6 +664,10 @@ impl State {
                         // changes a window's pending state — resending
                         // configures on every click would just be
                         // unnecessary client-side redraws.
+                    } else if self.try_click_layer_surface(pos, serial, false) {
+                        // Nothing else claimed it — falls through to a
+                        // Bottom/Background layer-shell surface (e.g. a
+                        // wallpaper-style widget), if one's actually there.
                     } else if let Some(keyboard) = self.seat.get_keyboard() {
                         keyboard.set_focus(self, Option::<WlSurface>::None, serial);
                     }

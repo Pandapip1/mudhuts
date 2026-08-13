@@ -9,7 +9,7 @@ use smithay::wayland::compositor::{
 };
 use smithay::wayland::shm::{ShmHandler, ShmState};
 
-use super::xdg_shell;
+use super::{layer_shell, xdg_shell};
 use crate::State;
 use crate::state::ClientState;
 
@@ -48,6 +48,7 @@ impl CompositorHandler for State {
 
         let window = self.find_window_by_surface(surface);
         xdg_shell::handle_commit(&mut self.popups, window, surface);
+        layer_shell::handle_commit(self, surface);
     }
 }
 

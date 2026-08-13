@@ -479,7 +479,8 @@ fn connector_connected(
 
     state.space.map_output(&output, (0, 0));
     state.output_size = (wl_mode.size.w, wl_mode.size.h);
-    state.stack.resize_all(wl_mode.size.w, wl_mode.size.h);
+    let (_, _, usable_w, usable_h) = state.usable_area();
+    state.stack.resize_all(usable_w, usable_h);
 
     inner.borrow_mut().surfaces.insert(
         crtc,
@@ -552,8 +553,12 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
     // own early-return when size is already correct). Without this, a
     // Hut spawned *after* the initial connector scan (e.g. Alt-Tabbing
     // past the stack's end to open a new one) never gets resized past
-    // `Hut::spawn`'s tiny 80x24-cell placeholder grid.
-    state.stack.resize_all(size.0, size.1);
+    // `Hut::spawn`'s tiny 80x24-cell placeholder grid. Sized to the
+    // *usable* area, not the raw output — shrinks automatically whenever
+    // a layer-shell surface's exclusive zone changes (see
+    // `State::usable_area`'s doc comment).
+    let (_, _, usable_w, usable_h) = state.usable_area();
+    state.stack.resize_all(usable_w, usable_h);
 
     tracing::debug!(
         "render_surface: focused hut={} showing_terminal_effective={} output_size={size:?}",

@@ -88,9 +88,9 @@ pub fn init_winit(
                     // sent once, at creation — already-mapped Main
                     // Windows (visible or not) need a fresh configure to
                     // actually resize when the output does.
-                    let scale = output.current_scale().fractional_scale();
-                    let logical_size = size.to_f64().to_logical(scale).to_i32_round();
-                    xdg_shell::resize_all_main_windows(&state.stack, logical_size);
+                    let (_, _, usable_w, usable_h) = state.usable_area();
+                    let usable_logical = smithay::utils::Size::<i32, smithay::utils::Logical>::from((usable_w, usable_h));
+                    xdg_shell::resize_all_main_windows(&state.stack, usable_logical);
                     backend.borrow().window().request_redraw();
                 }
                 WinitEvent::Input(event) => {
@@ -101,7 +101,8 @@ pub fn init_winit(
                     let mut backend = backend.borrow_mut();
                     let size = backend.window_size();
                     state.output_size = (size.w, size.h);
-                    state.stack.resize_all(size.w, size.h);
+                    let (_, _, usable_w, usable_h) = state.usable_area();
+                    state.stack.resize_all(usable_w, usable_h);
 
                     // Scoped so the mutable borrow of `backend` from `bind()`
                     // ends before we need `backend` again below (`submit`,
