@@ -10,13 +10,14 @@ use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::utils::{CommitCounter, DamageBag, DamageSnapshot};
 use smithay::desktop::Window;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Buffer, Rectangle, Size};
+use smithay::utils::{Buffer, Rectangle};
 
 use mudhuts_term::{GlyphCache, TermEvent, Terminal};
+use mudhuts_term::palette::Rgb;
 
 use crate::gpu_term::{GpuTermRenderer, LabelRenderer};
 use crate::main_window::MainWindowEntry;
-use crate::render::{ChangeTracker, TextureChangeTracker};
+use crate::render::{ChangeTracker, LabelCache};
 
 /// Initial grid size used before the real output size is known.
 const INITIAL_COLS: usize = 80;
@@ -68,10 +69,12 @@ pub struct Hut {
     /// there).
     pub terminal_tab_text_id: Id,
     pub terminal_tab_bg_id: Id,
-    /// Real damage tracking for the "Terminal" tab's text/background,
-    /// bumped only when its active/inactive state actually flips — see
-    /// `render::ChangeTracker`'s doc comment.
-    terminal_tab_text_tracker: TextureChangeTracker<bool>,
+    /// Caches the "Terminal" tab's rendered text label, only actually
+    /// re-rendering it (real GPU work) when its active/inactive state
+    /// flips — see `render::LabelCache`'s doc comment. Also backs real
+    /// damage tracking for its background, bumped on the same flip —
+    /// see `render::ChangeTracker`'s doc comment.
+    terminal_tab_text_cache: LabelCache<bool>,
     terminal_tab_bg_tracker: ChangeTracker<bool>,
     /// Stable identities for this Hut's own thumbnail/highlight in the
     /// Alt-Tab preview popup (`switcher.rs`) — same reasoning as above.
@@ -159,7 +162,7 @@ impl Hut {
                 element_id: Id::new(),
                 terminal_tab_text_id: Id::new(),
                 terminal_tab_bg_id: Id::new(),
-                terminal_tab_text_tracker: TextureChangeTracker::new(),
+                terminal_tab_text_cache: LabelCache::new(),
                 terminal_tab_bg_tracker: ChangeTracker::new(),
                 thumbnail_id: Id::new(),
                 thumbnail_highlight_id: Id::new(),
@@ -201,14 +204,29 @@ impl Hut {
         &mut self.main_windows
     }
 
-    /// A snapshot for the "Terminal" tab's text-label element, marking it
-    /// damaged only if `active` differs from last frame's.
-    pub fn terminal_tab_text_snapshot(
+    /// The "Terminal" tab's text-label texture and a damage snapshot for
+    /// it — reused from the cache (no GPU work) unless `active` differs
+    /// from last frame's, matching `render::LabelCache`'s whole point.
+    pub fn terminal_tab_label(
         &mut self,
+        renderer: &mut GlesRenderer,
         active: bool,
-        texture_size: Size<i32, Buffer>,
-    ) -> DamageSnapshot<i32, Buffer> {
-        self.terminal_tab_text_tracker.snapshot(active, texture_size)
+        fg: Rgb,
+        bg: Rgb,
+    ) -> Result<(GlesTexture, DamageSnapshot<i32, Buffer>), String> {
+        if self.terminal_tab_text_cache.is_stale(&active) {
+            let texture = self.render_label(renderer, "Terminal", fg, bg)?;
+            return Ok(self.terminal_tab_text_cache.store(active, texture));
+        }
+        match self.terminal_tab_text_cache.cached() {
+            Some(result) => Ok(result),
+            None => {
+                // Shouldn't happen (`is_stale` would've been true), but
+                // stays panic-free rather than assumed.
+                let texture = self.render_label(renderer, "Terminal", fg, bg)?;
+                Ok(self.terminal_tab_text_cache.store(active, texture))
+            }
+        }
     }
 
     /// A commit counter for the "Terminal" tab's background element,

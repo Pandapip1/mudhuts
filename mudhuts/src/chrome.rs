@@ -5,7 +5,7 @@
 //! between, so no chrome to draw (matches `Ctrl+`` being a no-op there
 //! too).
 
-use smithay::backend::renderer::{Renderer, Texture};
+use smithay::backend::renderer::Renderer;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
@@ -115,20 +115,32 @@ pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer) -> Vec<Element> {
         let label_w = (label.chars().count().max(1) * cell_w) as i32;
         let tab_w = label_w + TAB_PADDING * 2;
 
-        match hut.render_label(renderer, label, fg, bg) {
-            Ok(texture) => {
-                // Real damage tracking, not a fixed default snapshot —
-                // this texture is rebuilt fresh every call regardless of
-                // whether `label`/`active` actually changed since last
-                // frame; without this, the outer tracker would never see
-                // this tab's text change again after its first frame (see
-                // `render::TextureChangeTracker`'s doc comment).
-                let texture_size = texture.size();
-                let snapshot = if i == 0 {
-                    hut.terminal_tab_text_snapshot(active, texture_size)
-                } else {
-                    hut.main_windows_mut()[i - 1].tab_text_snapshot(label, active, texture_size)
-                };
+        // Only actually re-renders (real GPU work: glyph-atlas lookups
+        // plus instanced draw calls into an FBO) when this tab's
+        // label/active-state changed since last frame — every other
+        // frame reuses the cached texture instead of paying that cost
+        // again for a label that hasn't visibly changed (see
+        // `render::LabelCache`'s doc comment).
+        let label_texture = if i == 0 {
+            hut.terminal_tab_label(renderer, active, fg, bg)
+        } else {
+            let idx = i - 1;
+            let key = (label.clone(), active);
+            if hut.main_windows()[idx].tab_text_cache.is_stale(&key) {
+                hut.render_label(renderer, label, fg, bg)
+                    .map(|texture| hut.main_windows_mut()[idx].tab_text_cache.store(key, texture))
+            } else {
+                match hut.main_windows()[idx].tab_text_cache.cached() {
+                    Some(cached) => Ok(cached),
+                    None => hut
+                        .render_label(renderer, label, fg, bg)
+                        .map(|texture| hut.main_windows_mut()[idx].tab_text_cache.store(key, texture)),
+                }
+            }
+        };
+
+        match label_texture {
+            Ok((texture, snapshot)) => {
                 let text = TextureRenderElement::from_texture_with_damage(
                     text_ids[i].clone(),
                     renderer.context_id(),

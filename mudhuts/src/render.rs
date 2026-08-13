@@ -1,15 +1,15 @@
-use smithay::backend::renderer::Renderer;
+use smithay::backend::renderer::{Renderer, Texture};
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::texture::TextureRenderElement;
-use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::utils::{CommitCounter, DamageBag, DamageSnapshot};
 use smithay::backend::renderer::{ImportAll, ImportMem, RendererSuper};
 use smithay::desktop::Window;
 use smithay::desktop::space::{SpaceRenderElements, space_render_elements};
 use smithay::output::Output;
-use smithay::utils::{Buffer, Rectangle, Size, Transform};
+use smithay::utils::{Buffer, Rectangle, Transform};
 
 use crate::State;
 use crate::{chrome, docks, switcher};
@@ -51,37 +51,64 @@ impl<T: PartialEq> ChangeTracker<T> {
     }
 }
 
-/// [`ChangeTracker`]'s counterpart for `TextureRenderElement`s, which need
-/// a full [`DamageSnapshot`] (via `from_texture_with_damage`) rather than a
-/// bare [`CommitCounter`] — e.g. a tab label's rendered-text texture,
-/// which is rebuilt fresh every call to `Hut::render_label` regardless of
-/// whether the title/color actually changed.
-pub(crate) struct TextureChangeTracker<T> {
+/// Caches a rendered label texture (from `Hut::render_label`), only
+/// actually re-rendering it when the value identifying its content
+/// (title text, active/inactive state, ...) changes since last time.
+/// `Hut::render_label` does real GPU work every call — glyph-atlas
+/// lookups plus instanced draw calls into an FBO — and without this
+/// cache, `chrome.rs`'s tab strip and `docks.rs`'s dock handles would
+/// pay that cost on *every single frame* they're visible, even though a
+/// label's text/color essentially never changes between frames. Also
+/// backs real damage tracking for the resulting `TextureRenderElement`
+/// (via `from_texture_with_damage`), for the same reason
+/// [`ChangeTracker`] exists: a snapshot that never advances means "never
+/// damaged again after the first frame".
+pub(crate) struct LabelCache<T> {
     last: Option<T>,
+    texture: Option<GlesTexture>,
     damage: DamageBag<i32, Buffer>,
 }
 
-impl<T: PartialEq> TextureChangeTracker<T> {
+impl<T: PartialEq> LabelCache<T> {
     pub(crate) fn new() -> Self {
         Self {
             last: None,
+            texture: None,
             damage: DamageBag::default(),
         }
     }
 
-    /// Compare `value` against what was seen last time, marking the whole
-    /// `texture_size` as damaged if it differs, and return a snapshot to
-    /// attach to this frame's render element.
-    pub(crate) fn snapshot(
+    /// Whether `key` differs from what's cached (or nothing's been
+    /// rendered yet) — split from [`Self::store`] (rather than a single
+    /// render-and-cache call taking a closure) specifically so the
+    /// caller can render a fresh texture via a `&mut self` method of its
+    /// *own* (e.g. `Hut::render_label`) in between the two, without that
+    /// call fighting a simultaneous mutable borrow of this cache.
+    pub(crate) fn is_stale(&self, key: &T) -> bool {
+        self.texture.is_none() || self.last.as_ref() != Some(key)
+    }
+
+    /// Store a freshly-rendered texture for `key` (call after
+    /// [`Self::is_stale`] returned `true`), marking it fully damaged, and
+    /// return it alongside the fresh snapshot.
+    pub(crate) fn store(
         &mut self,
-        value: T,
-        texture_size: Size<i32, Buffer>,
-    ) -> DamageSnapshot<i32, Buffer> {
-        if self.last.as_ref() != Some(&value) {
-            self.damage.add([Rectangle::from_size(texture_size)]);
-            self.last = Some(value);
-        }
-        self.damage.snapshot()
+        key: T,
+        texture: GlesTexture,
+    ) -> (GlesTexture, DamageSnapshot<i32, Buffer>) {
+        self.damage.add([Rectangle::from_size(texture.size())]);
+        self.texture = Some(texture.clone());
+        self.last = Some(key);
+        (texture, self.damage.snapshot())
+    }
+
+    /// The already-cached texture and a damage snapshot for it, for when
+    /// [`Self::is_stale`] returned `false`. `None` if nothing's been
+    /// rendered yet — shouldn't happen if the caller checked
+    /// `is_stale` first, but stays panic-free rather than assumed.
+    pub(crate) fn cached(&self) -> Option<(GlesTexture, DamageSnapshot<i32, Buffer>)> {
+        let texture = self.texture.clone()?;
+        Some((texture, self.damage.snapshot()))
     }
 }
 

@@ -2,12 +2,12 @@
 //! see the plan's Phase 5 notes and the Nomenclature table.
 
 use smithay::backend::renderer::element::Id;
-use smithay::backend::renderer::utils::{CommitCounter, DamageSnapshot};
+use smithay::backend::renderer::utils::CommitCounter;
 use smithay::desktop::Window;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Buffer, Logical, Point, Size};
+use smithay::utils::{Logical, Point};
 
-use crate::render::{ChangeTracker, TextureChangeTracker};
+use crate::render::{ChangeTracker, LabelCache};
 
 /// Which screen edge a docked Sub-Window is minimized to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,12 +36,12 @@ pub struct SubWindow {
     /// as `MainWindowEntry::tab_text_id`/`tab_bg_id`.
     pub handle_text_id: Id,
     pub handle_bg_id: Id,
-    /// Real damage tracking for the handle's title text, bumped only
-    /// when the title actually changes — see `render::ChangeTracker`'s
-    /// doc comment. The handle's background color never changes (no
-    /// active/inactive state, unlike a tab), so it stays genuinely static
-    /// and needs no equivalent tracker.
-    handle_text_tracker: TextureChangeTracker<String>,
+    /// Caches the handle's rendered title-label texture, only actually
+    /// re-rendering it (real GPU work) when the title changes — see
+    /// `render::LabelCache`'s doc comment. The handle's background color
+    /// never changes (no active/inactive state, unlike a tab), so it
+    /// stays genuinely static and needs no equivalent cache.
+    pub(crate) handle_text_cache: LabelCache<String>,
 }
 
 impl SubWindow {
@@ -55,7 +55,7 @@ impl SubWindow {
             dock: Dock::Docked(Edge::Right),
             handle_text_id: Id::new(),
             handle_bg_id: Id::new(),
-            handle_text_tracker: TextureChangeTracker::new(),
+            handle_text_cache: LabelCache::new(),
         }
     }
 
@@ -63,16 +63,6 @@ impl SubWindow {
         self.window
             .toplevel()
             .is_some_and(|t| t.wl_surface() == surface)
-    }
-
-    /// A snapshot for this handle's text-label element, marking it
-    /// damaged only if `title` differs from last frame's.
-    pub fn handle_text_snapshot(
-        &mut self,
-        title: &str,
-        texture_size: Size<i32, Buffer>,
-    ) -> DamageSnapshot<i32, Buffer> {
-        self.handle_text_tracker.snapshot(title.to_string(), texture_size)
     }
 }
 
@@ -119,13 +109,15 @@ pub struct MainWindowEntry {
     /// fresh `Id::new()` per frame is a real correctness bug, not cosmetic.
     pub tab_text_id: Id,
     pub tab_bg_id: Id,
-    /// Real damage tracking for the tab's text/background, bumped only
-    /// when the title or active/inactive state actually changes — see
-    /// `render::ChangeTracker`'s doc comment for why a fixed
-    /// `CommitCounter`/`DamageSnapshot` (reused every frame regardless of
-    /// content) would mean the outer tracker never sees this tab's color
-    /// or label change again after the first frame it's drawn.
-    tab_text_tracker: TextureChangeTracker<(String, bool)>,
+    /// Caches this tab's rendered text label, only actually re-rendering
+    /// it (real GPU work) when the title or active/inactive state
+    /// changes — see `render::LabelCache`'s doc comment. Its background
+    /// gets real damage tracking the same way, bumped on the same
+    /// change — see `render::ChangeTracker`'s doc comment for why a
+    /// fixed `CommitCounter` (reused every frame regardless of content)
+    /// would mean the outer tracker never sees this tab's color change
+    /// again after the first frame it's drawn.
+    pub(crate) tab_text_cache: LabelCache<(String, bool)>,
     tab_bg_tracker: ChangeTracker<bool>,
 }
 
@@ -137,7 +129,7 @@ impl MainWindowEntry {
             alerts: Vec::new(),
             tab_text_id: Id::new(),
             tab_bg_id: Id::new(),
-            tab_text_tracker: TextureChangeTracker::new(),
+            tab_text_cache: LabelCache::new(),
             tab_bg_tracker: ChangeTracker::new(),
         }
     }
@@ -146,18 +138,6 @@ impl MainWindowEntry {
         self.window
             .toplevel()
             .is_some_and(|t| t.wl_surface() == surface)
-    }
-
-    /// A snapshot for this tab's text-label element, marking it damaged
-    /// only if `title`/`active` differ from last frame's.
-    pub fn tab_text_snapshot(
-        &mut self,
-        title: &str,
-        active: bool,
-        texture_size: Size<i32, Buffer>,
-    ) -> DamageSnapshot<i32, Buffer> {
-        self.tab_text_tracker
-            .snapshot((title.to_string(), active), texture_size)
     }
 
     /// A commit counter for this tab's background element, bumped only if

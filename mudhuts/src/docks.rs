@@ -13,16 +13,16 @@
 //! not a full `PointerGrab`, since there's no client surface/serial to
 //! grab in the first place until the window is actually mapped.
 
-use smithay::backend::renderer::{Renderer, Texture};
+use smithay::backend::renderer::Renderer;
 use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::texture::TextureRenderElement;
-use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::utils::{CommitCounter, DamageSnapshot};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Logical, Point, Rectangle, Size, Transform};
+use smithay::utils::{Buffer, Logical, Point, Rectangle, Size, Transform};
 
 use crate::State;
 use crate::chrome::{to_color32f, window_title};
@@ -126,42 +126,56 @@ pub fn build(hut: &mut Hut, renderer: &mut GlesRenderer, output_size: (i32, i32)
 
     for handle in &handles {
         let title = truncate(&handle.title);
-        match hut.render_label(renderer, &title, FG, BG) {
-            Ok(texture) => {
-                // Stable id + real damage tracking, not a fresh `Id::new()`
-                // wrapped in a never-tracked `from_static_texture` — the
-                // handle's title text can change (the Sub-Window's own
-                // title updates), so it needs the same treatment as
-                // `chrome.rs`'s tab labels (see
-                // `render::TextureChangeTracker`'s doc comment).
-                let texture_size = texture.size();
-                let (text_id, snapshot) = match hut.sub_window_mut(&handle.surface) {
-                    Some(sub) => (
-                        sub.handle_text_id.clone(),
-                        sub.handle_text_snapshot(&title, texture_size),
-                    ),
-                    None => (Id::new(), DamageSnapshot::empty()),
-                };
-                let text = TextureRenderElement::from_texture_with_damage(
-                    text_id,
-                    renderer.context_id(),
-                    (
-                        (handle.rect.loc.x + 6) as f64,
-                        (handle.rect.loc.y + 6) as f64,
-                    ),
-                    texture,
-                    1,
-                    Transform::Normal,
-                    None,
-                    None,
-                    None,
-                    None,
-                    snapshot,
-                    Kind::Unspecified,
-                );
-                elements.push(Element::from(text));
+
+        // Stable id + real damage tracking, not a fresh `Id::new()`
+        // wrapped in a never-tracked `from_static_texture` — the
+        // handle's title text can change (the Sub-Window's own title
+        // updates). Also only actually re-renders (real GPU work) when
+        // the title changed since last frame — see
+        // `render::LabelCache`'s doc comment.
+        let stale = hut
+            .sub_window_mut(&handle.surface)
+            .map(|sub| sub.handle_text_cache.is_stale(&title))
+            .unwrap_or(true);
+
+        let rendered: Option<(Id, GlesTexture, DamageSnapshot<i32, Buffer>)> = if stale {
+            match hut.render_label(renderer, &title, FG, BG) {
+                Ok(texture) => hut.sub_window_mut(&handle.surface).map(|sub| {
+                    let (texture, snapshot) = sub.handle_text_cache.store(title.clone(), texture);
+                    (sub.handle_text_id.clone(), texture, snapshot)
+                }),
+                Err(err) => {
+                    tracing::warn!("failed to render dock handle label: {err}");
+                    None
+                }
             }
-            Err(err) => tracing::warn!("failed to render dock handle label: {err}"),
+        } else {
+            hut.sub_window_mut(&handle.surface).and_then(|sub| {
+                sub.handle_text_cache
+                    .cached()
+                    .map(|(texture, snapshot)| (sub.handle_text_id.clone(), texture, snapshot))
+            })
+        };
+
+        if let Some((text_id, texture, snapshot)) = rendered {
+            let text = TextureRenderElement::from_texture_with_damage(
+                text_id,
+                renderer.context_id(),
+                (
+                    (handle.rect.loc.x + 6) as f64,
+                    (handle.rect.loc.y + 6) as f64,
+                ),
+                texture,
+                1,
+                Transform::Normal,
+                None,
+                None,
+                None,
+                None,
+                snapshot,
+                Kind::Unspecified,
+            );
+            elements.push(Element::from(text));
         }
 
         // The handle's background color never changes (no active/
