@@ -152,6 +152,24 @@ pub struct State {
     /// its own; that's normally backend-private state.
     pub dmabuf_renderer: Option<Rc<RefCell<GlesRenderer>>>,
 
+    /// DRM leasing (`wp_drm_lease_v1`) global state — see
+    /// `udev_backend.rs`'s module doc and `DrmLeaseHandler` impl. Lives
+    /// directly on `State` (unlike `udev_inner` below) because
+    /// `DrmLeaseHandler::drm_lease_state` has to hand back a `&mut
+    /// DrmLeaseState` tied to `&mut self`, which nothing reached through
+    /// `Rc<RefCell<_>>` can do. `None` under `winit_backend.rs` (no
+    /// global ever created there) or if `init_udev`'s
+    /// `DrmLeaseState::new` failed at startup (logged, non-fatal — DRM
+    /// leasing is optional, the desktop output must come up regardless).
+    pub drm_leasing_global: Option<smithay::wayland::drm_lease::DrmLeaseState>,
+    /// Shared with `udev_backend.rs`'s own `Inner` (a clone of the same
+    /// `Rc`) — needed so `DrmLeaseHandler`'s other trait methods (also
+    /// `&mut self` on `State`) can reach the backend's DRM device handle,
+    /// non-desktop connector list, and active-lease list, none of which
+    /// `State` otherwise has access to (same reasoning as
+    /// `dmabuf_renderer` above). `None` under `winit_backend.rs`.
+    pub(crate) udev_inner: Option<Rc<RefCell<crate::udev_backend::Inner>>>,
+
     /// `ext_foreign_toplevel_list_v1` — advertises every Main Window to
     /// any client that binds it (panels, taskbars, ...), and gives each
     /// one a stable identifier string. Phase 5b's `mudhuts_shell_authority_v1`
@@ -272,6 +290,8 @@ impl State {
             dmabuf_state: DmabufState::new(),
             dmabuf_global: None,
             dmabuf_renderer: None,
+            drm_leasing_global: None,
+            udev_inner: None,
             foreign_toplevel_list_state,
             layer_shell_state,
             keyboard_shortcuts_inhibit_state,
