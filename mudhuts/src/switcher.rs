@@ -58,7 +58,11 @@ pub fn build(stack: &HutStack, output_size: (i32, i32), renderer: &GlesRenderer)
                 texture.width() as f64,
                 texture.height() as f64,
             )));
-            let element = TextureRenderElement::from_static_texture(
+            // `from_texture_with_damage`, not `from_static_texture` — this
+            // wraps the same ever-changing terminal content as the main
+            // render element (see `Hut::damage_tracker`'s doc comment),
+            // just scaled down.
+            let element = TextureRenderElement::from_texture_with_damage(
                 hut.thumbnail_id.clone(),
                 renderer.context_id(),
                 (x as f64, y as f64),
@@ -69,6 +73,7 @@ pub fn build(stack: &HutStack, output_size: (i32, i32), renderer: &GlesRenderer)
                 Some(src),
                 Some(Size::from(THUMB_SIZE)),
                 None,
+                hut.element_damage_snapshot(),
                 Kind::Unspecified,
             );
             elements.push(Element::from(element));

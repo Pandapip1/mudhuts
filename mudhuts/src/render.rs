@@ -83,7 +83,12 @@ pub fn build_frame_elements(
     if show_terminal {
         let hut = state.stack.focused_mut();
         if let Some(texture) = hut.redraw(renderer) {
-            let element = TextureRenderElement::from_static_texture(
+            // `from_texture_with_damage`, not `from_static_texture` — the
+            // terminal's content genuinely changes every keystroke, and
+            // `from_static_texture` is documented by Smithay as creating
+            // an element with no damage tracking at all (see
+            // `Hut::damage_tracker`'s doc comment).
+            let element = TextureRenderElement::from_texture_with_damage(
                 hut.element_id.clone(),
                 renderer.context_id(),
                 (0.0, 0.0),
@@ -94,6 +99,7 @@ pub fn build_frame_elements(
                 None,
                 None,
                 None,
+                hut.element_damage_snapshot(),
                 Kind::Unspecified,
             );
             elements.push(OutputRenderElements::from(element));

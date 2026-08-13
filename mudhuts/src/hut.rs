@@ -4,10 +4,13 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use smithay::backend::renderer::Texture;
 use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
+use smithay::backend::renderer::utils::{DamageBag, DamageSnapshot};
 use smithay::desktop::Window;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::utils::{Buffer, Rectangle};
 
 use mudhuts_term::{GlyphCache, TermEvent, Terminal};
 
@@ -68,6 +71,20 @@ pub struct Hut {
     /// Alt-Tab preview popup (`switcher.rs`) — same reasoning as above.
     pub thumbnail_id: Id,
     pub thumbnail_highlight_id: Id,
+    /// Real damage tracking for this Hut's terminal texture, bumped in
+    /// [`Self::redraw`] whenever the terminal grid actually had dirty
+    /// cells. `TextureRenderElement::from_static_texture` (used for
+    /// `element_id`/`thumbnail_id` above) is documented by Smithay as
+    /// creating an element *without* damage tracking — its wrapped
+    /// snapshot never advances, so the outer per-element damage tracker
+    /// (`DrmCompositor`'s, in particular) sees zero damage forever after
+    /// the first frame a given Id is rendered, no matter how many times
+    /// the underlying texture's pixel content actually changes. That's
+    /// fine for genuinely static content but wrong for a terminal, whose
+    /// content changes on every keystroke — this tracker backs a real
+    /// `from_texture_with_damage` snapshot instead (see `render.rs`/
+    /// `switcher.rs`).
+    damage_tracker: DamageBag<i32, Buffer>,
 
     /// Client toplevels belonging to this Hut (see the plan's Phase 4
     /// notes on PID-ancestry assignment), tab-ordered, plus whatever's
@@ -130,6 +147,7 @@ impl Hut {
                 terminal_tab_bg_id: Id::new(),
                 thumbnail_id: Id::new(),
                 thumbnail_highlight_id: Id::new(),
+                damage_tracker: DamageBag::default(),
                 label_renderer: None,
                 main_windows: Vec::new(),
                 active_main_window: 0,
@@ -384,6 +402,8 @@ impl Hut {
             height,
         ) {
             Ok(texture) => {
+                self.damage_tracker
+                    .add([Rectangle::from_size(texture.size())]);
                 self.last_texture = Some(texture.clone());
                 Some(texture)
             }
@@ -392,6 +412,14 @@ impl Hut {
                 self.last_texture.clone()
             }
         }
+    }
+
+    /// A snapshot of [`Self::damage_tracker`] to hand to
+    /// `TextureRenderElement::from_texture_with_damage` — see that field's
+    /// doc comment for why `from_static_texture` isn't correct for the
+    /// terminal's own (or its thumbnail's) render element.
+    pub fn element_damage_snapshot(&self) -> DamageSnapshot<i32, Buffer> {
+        self.damage_tracker.snapshot()
     }
 
     /// Render `text` as a small standalone label texture (Phase 4's
