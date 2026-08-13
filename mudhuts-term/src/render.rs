@@ -280,13 +280,17 @@ pub fn collect_cells(content: RenderableContent<'_>) -> Vec<CellInfo> {
     let cursor_visible = !matches!(cursor_shape, CursorShape::Hidden);
     let selection = content.selection;
 
+    let display_offset = content.display_offset as i32;
     let mut cells = Vec::new();
     for indexed in content.display_iter {
-        let line = indexed.point.line.0;
-        if line < 0 {
-            continue;
-        }
-        let row = line as usize;
+        // A display-iterator point's `line` is in *grid* space, not
+        // viewport space — line 0 there is the top of the non-scrolled
+        // active region, not necessarily the top of what's currently
+        // visible. The actual on-screen row is `line + display_offset`
+        // (see `alacritty_terminal::term::point_to_viewport`); using
+        // `line` directly meant most/every row went negative and got
+        // dropped as soon as the view was scrolled at all.
+        let row = (indexed.point.line.0 + display_offset) as usize;
         let col = indexed.point.column.0;
         let cell = indexed.cell;
 
@@ -347,13 +351,13 @@ pub fn render(
     let cursor_shape = content.cursor.shape;
     let cursor_visible = !matches!(cursor_shape, CursorShape::Hidden);
     let selection = content.selection;
+    let display_offset = content.display_offset as i32;
 
     for indexed in content.display_iter {
-        let line = indexed.point.line.0;
-        if line < 0 {
-            continue;
-        }
-        let line = line as usize;
+        // See `collect_cells`'s identical fix: a display-iterator point's
+        // `line` is grid space, not viewport space — the on-screen row
+        // needs `line + display_offset`.
+        let line = (indexed.point.line.0 + display_offset) as usize;
         let col = indexed.point.column.0;
 
         if !is_full {
