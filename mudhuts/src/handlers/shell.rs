@@ -113,7 +113,7 @@ impl Dispatch2<MudhutsShellAuthorityV1, State> for AuthorityUserData {
                 };
                 retag(state, &surface, None);
             }
-            mudhuts_shell_authority_v1::Request::SetSub { identifier, main_identifier } => {
+            mudhuts_shell_authority_v1::Request::SetFloating { identifier, main_identifier } => {
                 let (Some(surface), Some(main_surface)) = (
                     resolve_by_identifier(state, &identifier),
                     resolve_by_identifier(state, &main_identifier),
@@ -121,7 +121,7 @@ impl Dispatch2<MudhutsShellAuthorityV1, State> for AuthorityUserData {
                     resource.post_error(AuthorityError::UnknownToplevel, "identifier or main_identifier not found".to_string());
                     return;
                 };
-                retag(state, &surface, Some((Role::Sub, main_surface)));
+                retag(state, &surface, Some((Role::Floating, main_surface)));
             }
             mudhuts_shell_authority_v1::Request::SetAlert { identifier, main_identifier } => {
                 let (Some(surface), Some(main_surface)) = (
@@ -182,12 +182,12 @@ impl Dispatch2<MudhutsWindowRoleV1, State> for WindowRoleUserData {
             mudhuts_window_role_v1::Request::SetMain => {
                 retag(state, &tagged_surface, None);
             }
-            mudhuts_window_role_v1::Request::SetSub { main } => {
+            mudhuts_window_role_v1::Request::SetFloating { main } => {
                 let Some(main_surface) = resolve_surface(state, &main) else {
-                    tracing::warn!("set_sub referencing an already-dead main toplevel");
+                    tracing::warn!("set_floating referencing an already-dead main toplevel");
                     return;
                 };
-                retag(state, &tagged_surface, Some((Role::Sub, main_surface)));
+                retag(state, &tagged_surface, Some((Role::Floating, main_surface)));
             }
             mudhuts_window_role_v1::Request::SetAlert { main } => {
                 let Some(main_surface) = resolve_surface(state, &main) else {
@@ -210,7 +210,7 @@ fn resolve_surface(state: &State, toplevel: &xdg_toplevel::XdgToplevel) -> Optio
 }
 
 enum Role {
-    Sub,
+    Floating,
     Alert,
 }
 
@@ -246,13 +246,13 @@ fn retag(state: &mut State, tagged_surface: &WlSurface, target: Option<(Role, Wl
             Some((role, main_surface)) => match hut.find_main_window_mut(main_surface) {
                 Some(entry) => {
                     match role {
-                        Role::Sub => entry.floating_windows.push(FloatingWindow::new(window)),
+                        Role::Floating => entry.floating_windows.push(FloatingWindow::new(window)),
                         Role::Alert => entry.alerts.push(Alert::new(window)),
                     }
                     tracing::debug!(
                         "mudhuts_window_role_v1: retagged as {}",
                         match role {
-                            Role::Sub => "a Floating Window",
+                            Role::Floating => "a Floating Window",
                             Role::Alert => "an Alert",
                         }
                     );

@@ -1,5 +1,5 @@
 //! Phase 5b's standalone helper program: tags *other* clients' toplevels
-//! (ones that don't speak `mudhuts_shell_v1` natively) as Sub-Windows or
+//! (ones that don't speak `mudhuts_shell_v1` natively) as Floating Windows or
 //! Alerts of some other Main Window, by simple exact `app_id` rules given
 //! on the command line. Trusted by mudhuts because mudhuts itself is what
 //! spawns it (`mudhuts --authority-helper <path to this binary>`), handing
@@ -7,7 +7,7 @@
 //! environment variable — see `mudhuts/src/handlers/shell.rs`'s module doc
 //! for the full trust model.
 //!
-//! Usage: `mudhuts-authority-helper --sub TARGET_APP_ID:MAIN_APP_ID`
+//! Usage: `mudhuts-authority-helper --floating TARGET_APP_ID:MAIN_APP_ID`
 //! (repeatable, `--alert` for the other role). A toplevel matching
 //! TARGET_APP_ID is tagged the moment a *currently known* toplevel matches
 //! MAIN_APP_ID — if the main window hasn't appeared yet when the target
@@ -35,7 +35,7 @@ use mudhuts_protocols::client::mudhuts_shell_v1::MudhutsShellV1;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Role {
-    Sub,
+    Floating,
     Alert,
 }
 
@@ -60,7 +60,7 @@ fn parse_rule(role: Role, spec: &str) -> Option<Rule> {
 struct ToplevelInfo {
     identifier: Option<String>,
     app_id: String,
-    /// Already handed to `set_sub`/`set_alert` — a toplevel only ever
+    /// Already handed to `set_floating`/`set_alert` — a toplevel only ever
     /// gets tagged once, even if further `done` events arrive later
     /// (e.g. its title changing).
     tagged: bool,
@@ -171,14 +171,14 @@ impl AppState {
                 continue;
             };
             match rule.role {
-                Role::Sub => authority.set_sub(identifier.clone(), main_identifier.clone()),
+                Role::Floating => authority.set_floating(identifier.clone(), main_identifier.clone()),
                 Role::Alert => authority.set_alert(identifier.clone(), main_identifier.clone()),
             }
             println!(
                 "tagged {identifier} ({}) as a {} of {main_identifier} ({})",
                 info.app_id,
                 match rule.role {
-                    Role::Sub => "Sub-Window",
+                    Role::Floating => "Floating Window",
                     Role::Alert => "Alert",
                 },
                 rule.main_app_id
@@ -197,7 +197,7 @@ fn parse_args() -> Result<Vec<Rule>, String> {
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         let role = match arg.as_str() {
-            "--sub" => Role::Sub,
+            "--floating" => Role::Floating,
             "--alert" => Role::Alert,
             other => return Err(format!("unrecognized argument {other:?}")),
         };
@@ -215,12 +215,12 @@ fn main() -> ExitCode {
         Ok(rules) => rules,
         Err(err) => {
             eprintln!("{err}");
-            eprintln!("usage: mudhuts-authority-helper [--sub|--alert TARGET_APP_ID:MAIN_APP_ID]...");
+            eprintln!("usage: mudhuts-authority-helper [--floating|--alert TARGET_APP_ID:MAIN_APP_ID]...");
             return ExitCode::FAILURE;
         }
     };
     if rules.is_empty() {
-        eprintln!("no --sub/--alert rules given — nothing to do");
+        eprintln!("no --floating/--alert rules given — nothing to do");
         return ExitCode::FAILURE;
     }
 

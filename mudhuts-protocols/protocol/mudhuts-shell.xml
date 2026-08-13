@@ -9,8 +9,9 @@
     <description summary="assign a window's role within mudhuts' Hut model">
       Lets a client declare how one of its own xdg_toplevels should be
       organized within mudhuts: as an ordinary Main Window (the default,
-      needing no request at all), a Sub-Window docked to a screen edge until
-      dragged out, or an always-on-top Alert. See mudhuts_window_role_v1.
+      needing no request at all), a Floating Window docked to a screen edge
+      until dragged out, or an always-on-top Alert. See
+      mudhuts_window_role_v1.
     </description>
 
     <request name="get_window_role">
@@ -51,12 +52,12 @@
     <request name="set_main">
       <description summary="declare this toplevel an ordinary Main Window">
         The default; only useful to explicitly move a toplevel back out of
-        the Sub-Window/Alert role it was previously given.
+        the Floating Window/Alert role it was previously given.
       </description>
     </request>
 
-    <request name="set_sub">
-      <description summary="declare this toplevel a Sub-Window of main">
+    <request name="set_floating">
+      <description summary="declare this toplevel a Floating Window of main">
         main must be an existing Main Window in the same Hut as this
         toplevel. Starts docked to whichever screen edge it's nearest,
         minimized to a small handle until the user drags it out.
@@ -115,12 +116,12 @@
       <arg name="token" type="string"/>
     </request>
 
-    <request name="set_sub">
-      <description summary="tag another client's toplevel a Sub-Window of main">
+    <request name="set_floating">
+      <description summary="tag another client's toplevel a Floating Window of main">
         identifier and main_identifier are ext_foreign_toplevel_handle_v1
         identifier strings, each naming a current Main Window — an
         unknown_toplevel protocol error if either doesn't. Starts docked,
-        same as mudhuts_window_role_v1.set_sub.
+        same as mudhuts_window_role_v1.set_floating.
       </description>
       <arg name="identifier" type="string"/>
       <arg name="main_identifier" type="string"/>
@@ -128,7 +129,7 @@
 
     <request name="set_alert">
       <description summary="tag another client's toplevel an Alert of main">
-        Same identifier rules as set_sub.
+        Same identifier rules as set_floating.
       </description>
       <arg name="identifier" type="string"/>
       <arg name="main_identifier" type="string"/>
@@ -136,8 +137,8 @@
 
     <request name="set_main">
       <description summary="tag another client's toplevel an ordinary Main Window">
-        Only useful to move a toplevel back out of a Sub-Window/Alert role
-        this same authority previously gave it. unknown_toplevel if
+        Only useful to move a toplevel back out of a Floating Window/Alert
+        role this same authority previously gave it. unknown_toplevel if
         identifier doesn't name a current Main Window.
       </description>
       <arg name="identifier" type="string"/>

@@ -2,7 +2,7 @@
 //! notes) — no real GUI app speaks this protocol yet, so this is how
 //! role assignment actually gets exercised: connects, creates two bare
 //! `xdg_toplevel`s, binds `mudhuts_shell_v1`, and tags the second as a
-//! Floating Window or Alert of the first (selected via `--sub`/`--alert`).
+//! Floating Window or Alert of the first (selected via `--floating`/`--alert`).
 //! Run from mudhuts' own built-in shell so its PID-ancestry ConsoleHut
 //! assignment (see `mudhuts/src/ownership.rs`) puts both toplevels in the
 //! same ConsoleHut — check mudhuts' logs to confirm the role landed.
@@ -101,12 +101,12 @@ fn spawn_toplevel(
 }
 
 fn main() -> ExitCode {
-    let arg = env::args().nth(1).unwrap_or_else(|| "--sub".to_string());
+    let arg = env::args().nth(1).unwrap_or_else(|| "--floating".to_string());
     let as_alert = match arg.as_str() {
-        "--sub" => false,
+        "--floating" => false,
         "--alert" => true,
         other => {
-            eprintln!("usage: mudhuts-test-client [--sub | --alert] (got {other:?}, defaulting to --sub)");
+            eprintln!("usage: mudhuts-test-client [--floating | --alert] (got {other:?}, defaulting to --floating)");
             false
         }
     };
@@ -161,7 +161,7 @@ fn main() -> ExitCode {
         role.set_alert(&main_toplevel);
         println!("tagged the second toplevel as an Alert of the first");
     } else {
-        role.set_sub(&main_toplevel);
+        role.set_floating(&main_toplevel);
         println!("tagged the second toplevel as a Floating Window of the first");
     }
 

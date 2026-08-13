@@ -286,7 +286,7 @@ impl ConsoleHut {
     }
 
     /// Whether `surface` is currently a bare (untagged) Main Window in
-    /// this ConsoleHut — used to resolve `mudhuts_window_role_v1.set_sub`/
+    /// this ConsoleHut — used to resolve `mudhuts_window_role_v1.set_floating`/
     /// `set_alert`'s target toplevel (which must start out as a plain
     /// Main Window; `new_toplevel` always adds new clients as one before
     /// any role-assignment request can arrive on the same connection).
