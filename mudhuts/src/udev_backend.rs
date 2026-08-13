@@ -114,7 +114,21 @@ pub fn init_udev(
             .map_err(|err| format!("failed to open {path:?}: {err}"))
             .and_then(|fd| {
                 let fd = DrmDeviceFd::new(DeviceFd::from(fd));
-                DrmDevice::new(fd.clone(), true)
+                // `disable_connectors: false` — `true` would force an
+                // atomic commit disabling every connector immediately on
+                // open, before any connector scan. That collides badly
+                // with a live session handoff: the outgoing session
+                // (e.g. cosmic-greeter tearing down) may still be mid-
+                // teardown of its own claim on the same connector, and
+                // the display controller's power-state machine here is
+                // asynchronous (coprocessor round-trips taking seconds),
+                // so two overlapping "disable" commands to the same
+                // connector is a real way to wedge it. `false` matches
+                // what actually works on this hardware (see cosmic-comp's
+                // own `Device::new`, which uses `false` for exactly this
+                // reason — "prevent flickering of already turned on
+                // connectors").
+                DrmDevice::new(fd.clone(), false)
                     .map(|(drm_device, drm_notifier)| (fd, drm_device, drm_notifier))
                     .map_err(|err| format!("{path:?} can't do modesetting: {err}"))
             });
@@ -156,9 +170,20 @@ pub fn init_udev(
         GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
     );
     let exporter = GbmFramebufferExporter::new(gbm.clone(), NodeFilter::All);
-    // 8-bit only for v1 (see module doc) — 10-bit negotiation is a
-    // deferred refinement, not a correctness requirement.
-    let color_formats = [Fourcc::Argb8888, Fourcc::Xrgb8888];
+    // Matches anvil's/cosmic-comp's exact format list — channel order
+    // isn't an arbitrary preference here: `DrmOutputManager` picks the
+    // first entry both this list and the renderer's own reported
+    // `render_formats` support, so requesting a format the display
+    // controller's pixel-format converter doesn't actually accept (my
+    // earlier `Argb8888`/`Xrgb8888` guess used the wrong channel order —
+    // ABGR, not ARGB, is what both known-working references request)
+    // could pick a working-on-paper-but-not-really format.
+    let color_formats = [
+        Fourcc::Abgr2101010,
+        Fourcc::Argb2101010,
+        Fourcc::Abgr8888,
+        Fourcc::Argb8888,
+    ];
     let render_formats = renderer
         .egl_context()
         .dmabuf_render_formats()
@@ -368,7 +393,17 @@ fn connector_connected(
         .surfaces
         .insert(crtc, SurfaceData { output, drm_output });
 
-    render_surface(state, inner, handle, crtc);
+    // Deferred to the next event loop iteration (matches anvil's own
+    // reference pattern) rather than called synchronously here, still
+    // nested inside the same call stack as the modeset that
+    // `initialize_output` just performed — giving the display
+    // controller's own (asynchronous, coprocessor-driven) power-state
+    // machine a chance to settle before another commit lands on it.
+    let inner = inner.clone();
+    let handle_clone = handle.clone();
+    handle.insert_idle(move |state| {
+        render_surface(state, &inner, &handle_clone, crtc);
+    });
 }
 
 fn connector_disconnected(
@@ -406,9 +441,19 @@ fn render_surface(
 
     let elements = render::build_frame_elements(state, renderer, &output, size);
 
+    // `FrameFlags::empty()`, not `::DEFAULT` — `DEFAULT` allows the
+    // `DrmCompositor` to attempt direct scanout via overlay/cursor
+    // planes, not just plain GPU composition into the primary plane.
+    // Direct scanout is a known category of driver-specific bugs (see
+    // anvil's own NVIDIA overlay-plane workaround and its
+    // `ANVIL_DISABLE_DIRECT_SCANOUT` escape hatch, which sets exactly
+    // this) — on a display driver as young as Apple Silicon's, staying
+    // on the simpler, more universally-exercised pure-composition path
+    // is the safer default until there's a specific reason to want the
+    // performance/power benefit of scanout.
     match surface
         .drm_output
-        .render_frame(renderer, &elements, [0.0, 0.0, 0.0, 1.0], FrameFlags::DEFAULT)
+        .render_frame(renderer, &elements, [0.0, 0.0, 0.0, 1.0], FrameFlags::empty())
     {
         Ok(result) => {
             if !result.is_empty {
