@@ -194,16 +194,20 @@ type Element = OutputRenderElements<GlesRenderer, HutSpaceRenderElement>;
 /// into the same two halves Smithay's own `space_render_elements` splits
 /// them into internally: `upper` (Top + Overlay, meant to render *above*
 /// normal content) and `lower` (Background + Bottom, *below* it).
-/// `space_render_elements` already handles this automatically for the
-/// Main-Window-visible branch below (its own doc comment confirms it:
-/// "this will include layer-shell surfaces added to this output's
-/// LayerMap") — this helper is only for the *other* two branches
-/// (showing the terminal directly, or a Tile-Hut), which don't go
-/// through a `Space` at all, so nothing else would ever composite layer
-/// surfaces for them. Kept split (not flattened into one Vec) so the
-/// caller can insert its own content — a terminal texture, or a whole
-/// tile's worth of panes — into exactly the z-order slot a normal
-/// toplevel would otherwise occupy, between the two.
+/// `space_render_elements` only does this automatically for whichever real
+/// `Output` it's actually given — none of `build_frame_elements`'s three
+/// content branches render against the real output directly anymore since
+/// the composable Hut hierarchy RFC's migration step 5 (each renders
+/// against its own node's private, synthetic output instead — see
+/// `ConsoleHut::space_output`'s doc comment), so every one of them needs
+/// this hand-rolled equivalent now, not just the two that never went
+/// through a `Space` at all. Kept split (not flattened into one Vec) so
+/// the caller can insert its own content — a terminal texture, a whole
+/// tile's worth of panes, or a Console Hut's own composited `Space` output
+/// — into exactly the z-order slot a normal toplevel would otherwise
+/// occupy, between the two. Step 5 sub-step 4 (the Layer-Shell Root Hut)
+/// will delete this entirely once every content branch's output is
+/// consolidated through one real-output-bound `Space` instead.
 fn layer_elements(
     state: &State,
     renderer: &mut GlesRenderer,
@@ -433,6 +437,23 @@ pub fn build_frame_elements(
         // position, pushed straight into `elements` with no further
         // translation needed, exactly like the terminal-visible branch
         // above already does for its own texture.
+        //
+        // Regression fix, 2026-08-13: `space_render_elements` only
+        // automatically includes layer-shell surfaces for whichever real
+        // `Output` it's actually given — that stopped being true here the
+        // moment this branch started rendering against `hut.space_output`
+        // (a private, never-globalized synthetic output no layer-shell
+        // client is ever registered against) instead of the real one, so
+        // this now needs the same hand-rolled `layer_elements` split the
+        // terminal-visible branch above already uses, or a status bar
+        // etc. silently vanishes the instant a Main Window is shown.
+        // Interim fix — RFC migration step 5 sub-step 4 (the Layer-Shell
+        // Root Hut) properly subsumes this by consolidating every content
+        // branch's output through one real-output-bound `Space`, at which
+        // point this hand-rolled split goes away again along with
+        // `layer_elements` itself.
+        let (layer_upper, layer_lower) = layer_elements(state, renderer);
+        elements.extend(layer_upper);
         let hut = state.stack.focused_mut();
         match space_render_elements::<_, HutSpaceElement, _>(renderer, [&hut.space], &hut.space_output, 1.0) {
             Ok(space_elements) => {
@@ -440,6 +461,7 @@ pub fn build_frame_elements(
             }
             Err(err) => tracing::warn!("failed to collect space elements: {err}"),
         }
+        elements.extend(layer_lower);
     }
 
     elements
