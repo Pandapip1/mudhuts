@@ -99,7 +99,15 @@ mod tests {
 
     fn new_stack() -> Stack {
         let (hut, events) = ConsoleHut::spawn(std::iter::empty(), 1.0).unwrap();
-        Stack::new(hut, events, loop_handle(), Vec::new()).unwrap()
+        let (ping, _source) = smithay::reexports::calloop::ping::make_ping().unwrap();
+        Stack::new(
+            hut,
+            events,
+            loop_handle(),
+            Vec::new(),
+            crate::redraw::RedrawHandle::new(ping),
+        )
+        .unwrap()
     }
 
     #[test]

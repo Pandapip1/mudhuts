@@ -24,6 +24,7 @@ use mudhuts_term::TermEvent;
 use crate::State;
 use crate::console_hut::ConsoleHut;
 use crate::hut::{Axis, Direction, Hut};
+use crate::redraw::RedrawHandle;
 
 pub struct Stack {
     huts: Vec<Hut>,
@@ -52,6 +53,16 @@ pub struct Stack {
     /// once, by [`Self::rescale_all`], the moment the real value becomes
     /// known — see that method's doc comment.
     scale: f64,
+    /// Composable Hut hierarchy RFC migration step 2 (see
+    /// `docs/rfcs/composable-hut-hierarchy.md`): every method that changes
+    /// what the Alt-Tab popup (`switcher.rs`) or the visible top-level
+    /// entry should show calls `mark_dirty()` on this itself, rather than
+    /// leaving it to `input.rs`'s `Action::StackNext`/`StackPrev` handlers
+    /// to remember afterward. Unlike `docks.rs`'s `DockDrag`, `Stack` is
+    /// long-lived and constructed exactly once — in `main.rs`, where the
+    /// raw `Ping` is already available before `Stack::new` runs — so this
+    /// is supplied directly instead of via `Redrawable::attach_redraw_handle`.
+    redraw: RedrawHandle,
 }
 
 impl Stack {
@@ -62,6 +73,7 @@ impl Stack {
         first_events: Channel<TermEvent>,
         loop_handle: LoopHandle<'static, State>,
         extra_env: Vec<(String, String)>,
+        redraw: RedrawHandle,
     ) -> Result<Self, String> {
         let stack = Self {
             huts: vec![Hut::Console(Box::new(first))],
@@ -71,6 +83,7 @@ impl Stack {
             loop_handle,
             extra_env,
             scale: 1.0,
+            redraw,
         };
         let id = stack.huts[0].focused_hut().id;
         stack.insert_channel(id, first_events)?;
@@ -280,6 +293,7 @@ impl Stack {
         let mut pos = self.current;
         self.advance_forward(&mut pos, None)?;
         self.current = pos;
+        self.redraw.mark_dirty();
         Ok(())
     }
 
@@ -288,6 +302,7 @@ impl Stack {
         let mut pos = self.current;
         self.advance_backward(&mut pos, None);
         self.current = pos;
+        self.redraw.mark_dirty();
     }
 
     /// Whether a preview session is currently open.
@@ -315,6 +330,7 @@ impl Stack {
         let mut pos = self.preview.unwrap_or(self.current);
         self.advance_forward(&mut pos, Some(self.current))?;
         self.preview = Some(pos);
+        self.redraw.mark_dirty();
         Ok(())
     }
 
@@ -329,6 +345,7 @@ impl Stack {
             None => self.huts.len().saturating_sub(1),
         };
         self.preview = Some(pos);
+        self.redraw.mark_dirty();
     }
 
     /// Commit the open preview session: the highlighted entry becomes the
@@ -349,6 +366,7 @@ impl Stack {
             self.huts.insert(0, hut);
         }
         self.current = 0;
+        self.redraw.mark_dirty();
     }
 
     /// A ConsoleHut's shell exited. Per the last-ConsoleHut rule, if it was the only
@@ -413,7 +431,8 @@ mod tests {
 
     fn new_stack() -> Stack {
         let (hut, events) = ConsoleHut::spawn(std::iter::empty(), 1.0).unwrap();
-        Stack::new(hut, events, loop_handle(), Vec::new()).unwrap()
+        let (ping, _source) = smithay::reexports::calloop::ping::make_ping().unwrap();
+        Stack::new(hut, events, loop_handle(), Vec::new(), RedrawHandle::new(ping)).unwrap()
     }
 
     #[test]

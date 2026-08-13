@@ -521,8 +521,10 @@ impl State {
                 // triggers (see `winit_backend.rs`'s `resize_all` call,
                 // which runs before that frame's texture is generated) —
                 // a freshly-spawned one starts at the placeholder default
-                // grid size otherwise.
-                self.request_redraw();
+                // grid size otherwise. `Stack::next`/`preview_next` already
+                // called `mark_dirty()` on their own redraw handle above
+                // (composable Hut hierarchy RFC migration step 2) — no
+                // `request_redraw()` needed here.
             }
             Action::StackPrev => {
                 let instant = self.keymap.stack_hold().is_empty();
@@ -532,7 +534,8 @@ impl State {
                 } else {
                     self.stack.preview_prev();
                 }
-                self.request_redraw();
+                // See the `StackNext` arm above — `Stack::prev`/
+                // `preview_prev` already triggered the redraw.
             }
             // Innermost-first resolution (see the plan's Meta+Left/Right
             // notes): the focused ConsoleHut's own Main Window tabs win if it
@@ -660,9 +663,10 @@ impl State {
                         if data.stack.is_previewing()
                             && !data.keymap.stack_hold().satisfied_by(mods)
                         {
+                            // `commit_preview` already triggers its own
+                            // redraw (see `Action::StackNext`'s arm above).
                             data.stack.commit_preview();
                             data.sync_visible_main_window();
-                            data.request_redraw();
                         }
 
                         // Global keybindings always win, regardless of

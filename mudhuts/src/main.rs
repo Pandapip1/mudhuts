@@ -94,7 +94,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let (redraw_ping, redraw_ping_source) = smithay::reexports::calloop::ping::make_ping()?;
     let loop_handle = event_loop.handle();
-    let stack = stack::Stack::new(hut, term_events, loop_handle, extra_env)?;
+    let stack = stack::Stack::new(
+        hut,
+        term_events,
+        loop_handle,
+        extra_env,
+        redraw::RedrawHandle::new(redraw_ping.clone()),
+    )?;
     let mut state = State::new(&mut event_loop, display, stack, socket, redraw_ping)?;
 
     if let Some(helper) = &args.authority_helper {
