@@ -174,6 +174,22 @@ impl State {
             }
             mudhuts_term::TermEvent::Exited => {
                 tracing::info!("hut {id} shell exited");
+                // Closing the very last Hut (e.g. Ctrl+D-ing out of it)
+                // is the closest thing mudhuts has to a "log out"/"close
+                // the window" gesture — there's no other way to exit at
+                // all otherwise (no window-close button under winit, no
+                // way back to a login greeter under the real TTY
+                // backend without this). Skips the normal remove/
+                // respawn path entirely (nothing will touch the stack
+                // again before the process exits, so leaving the now-
+                // dead Hut entry in place is harmless) rather than
+                // trying to keep the "always ≥1 Hut" invariant intact
+                // through a stop-in-progress shutdown.
+                if self.stack.len() == 1 && self.stack.focused().id == id {
+                    tracing::info!("last Hut closed, exiting");
+                    self.loop_signal.stop();
+                    return;
+                }
                 if let Err(err) = self.stack.remove_exited(id) {
                     tracing::error!("failed to respawn after shell exit: {err}");
                 }
