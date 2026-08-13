@@ -12,21 +12,33 @@
 //! explicit GPU sync via drm-syncobj, 10-bit color, dmabuf client-buffer
 //! import, and real xcursor-theme cursor rendering).
 //!
-//! The page-flip loop is self-perpetuating and naturally vsync-throttled
-//! (each `DrmEvent::VBlank` completion schedules the next repaint) — a
-//! fundamentally different, correctly-paced mechanism from the
-//! `redraw_ping`/`Ping` demand-driven model Phase 2.6 built for the winit
-//! path (that fix targeted winit's `request_redraw()` having *no*
-//! natural rate limit). This backend does not use `State::
-//! request_redraw()`/`redraw_ping` at all — the passed-in
-//! `redraw_ping_source` is accepted only for signature symmetry with
-//! `init_winit` and is intentionally never inserted into the event loop.
+//! Rendering is demand-driven, same principle as `winit_backend.rs`'s use
+//! of `redraw_ping`/`request_redraw()`: nothing here polls on a timer.
+//! `redraw_ping_source` fires `render_surface` for every known crtc
+//! whenever shared code calls `State::request_redraw()` (PTY output, a
+//! keypress, a client commit, etc.) — but a render attempt only actually
+//! submits a new atomic commit if `render_frame` finds real damage *and*
+//! no previous commit for that crtc is still in flight
+//! (`SurfaceData::frame_pending`); a ping that arrives mid-flight is a
+//! no-op, since the already-queued commit's eventual `DrmEvent::VBlank`
+//! will call `frame_finish` -> `render_surface` again once it lands,
+//! picking up anything that changed in the meantime. This avoids two
+//! failure modes of a naive "just resubmit immediately" approach: tearing
+//! (a new buffer handed to the display mid-scanout, before the previous
+//! one finished presenting) and submitting a second atomic commit before
+//! the first one's page-flip event has been processed, which the kernel/
+//! `DrmCompositor` doesn't support. It also means this backend is VRR-
+//! transparent for free: a new frame goes out as soon as one is both
+//! ready and safe to submit, gated only by real vblank completion, not by
+//! a fixed wall-clock interval — if Asahi's DRM driver exposes adaptive
+//! sync on a given connector (untested; not verified either way), the
+//! kernel decides how soon that next vblank actually is, and nothing
+//! about this render-triggering logic needs to change either way.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Duration;
 
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
@@ -43,7 +55,6 @@ use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{self, UdevBackend, UdevEvent};
 use smithay::output::{Mode as WlMode, Output, PhysicalProperties};
 use smithay::reexports::calloop::ping::PingSource;
-use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{EventLoop, LoopHandle};
 use smithay::reexports::drm::control::{ModeTypeFlags, connector, crtc};
 use smithay::reexports::input::Libinput;
@@ -63,6 +74,14 @@ type Elements = OutputRenderElements<GlesRenderer, WaylandSurfaceRenderElement<G
 struct SurfaceData {
     output: Output,
     drm_output: CrtcOutput,
+    /// Whether a submitted atomic commit for this crtc is still waiting
+    /// on its `DrmEvent::VBlank` completion. Gates `render_surface`: a
+    /// second commit can't safely go out before the first one's
+    /// page-flip event has been processed (see the module doc), so a
+    /// `redraw_ping` that arrives mid-flight is dropped here rather than
+    /// attempted — `frame_finish` re-renders once the pending commit
+    /// actually completes, picking up anything that changed meanwhile.
+    frame_pending: bool,
 }
 
 struct Inner {
@@ -75,7 +94,7 @@ struct Inner {
 pub fn init_udev(
     event_loop: &mut EventLoop<'static, State>,
     state: &mut State,
-    _redraw_ping_source: PingSource,
+    redraw_ping_source: PingSource,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (mut session, notifier) =
         LibSeatSession::new().map_err(|err| format!("failed to initialize a session: {err}"))?;
@@ -205,20 +224,37 @@ pub fn init_udev(
     // page-flip loop (see the module doc).
     {
         let inner = inner.clone();
-        let loop_handle = loop_handle.clone();
         event_loop
             .handle()
             .insert_source(drm_notifier, move |event, _, state| match event {
-                DrmEvent::VBlank(crtc) => frame_finish(state, &inner, &loop_handle, crtc),
+                DrmEvent::VBlank(crtc) => frame_finish(state, &inner, crtc),
                 DrmEvent::Error(err) => tracing::warn!("DRM device error: {err}"),
             })
             .map_err(|err| format!("failed to register the DRM event source: {err}"))?;
     }
 
+    // Demand-driven rendering: fires on every `State::request_redraw()`
+    // call from shared code (PTY output, input, client commits, etc.) —
+    // see the module doc for why this is safe to call unconditionally
+    // for every known crtc even when nothing actually changed (a no-op
+    // `render_frame` finding no damage) or when a previous commit is
+    // still in flight (dropped, picked up by the next real vblank).
+    {
+        let inner = inner.clone();
+        event_loop
+            .handle()
+            .insert_source(redraw_ping_source, move |(), _, state| {
+                let crtcs: Vec<_> = inner.borrow().surfaces.keys().copied().collect();
+                for crtc in crtcs {
+                    render_surface(state, &inner, crtc);
+                }
+            })
+            .map_err(|err| format!("failed to register the redraw ping source: {err}"))?;
+    }
+
     // Session pause/resume (VT switch away/back).
     {
         let inner = inner.clone();
-        let loop_handle = loop_handle.clone();
         event_loop
             .handle()
             .insert_source(notifier, move |event, _, state| match event {
@@ -235,7 +271,7 @@ pub fn init_udev(
                     // explicitly force a fresh pass on every crtc.
                     let crtcs: Vec<_> = inner.borrow().surfaces.keys().copied().collect();
                     for crtc in crtcs {
-                        render_surface(state, &inner, &loop_handle, crtc);
+                        render_surface(state, &inner, crtc);
                     }
                 }
             })
@@ -388,10 +424,14 @@ fn connector_connected(
     state.output_size = (wl_mode.size.w, wl_mode.size.h);
     state.stack.resize_all(wl_mode.size.w, wl_mode.size.h);
 
-    inner
-        .borrow_mut()
-        .surfaces
-        .insert(crtc, SurfaceData { output, drm_output });
+    inner.borrow_mut().surfaces.insert(
+        crtc,
+        SurfaceData {
+            output,
+            drm_output,
+            frame_pending: false,
+        },
+    );
 
     // Deferred to the next event loop iteration (matches anvil's own
     // reference pattern) rather than called synchronously here, still
@@ -400,9 +440,8 @@ fn connector_connected(
     // controller's own (asynchronous, coprocessor-driven) power-state
     // machine a chance to settle before another commit lands on it.
     let inner = inner.clone();
-    let handle_clone = handle.clone();
     handle.insert_idle(move |state| {
-        render_surface(state, &inner, &handle_clone, crtc);
+        render_surface(state, &inner, crtc);
     });
 }
 
@@ -418,12 +457,7 @@ fn connector_disconnected(
     }
 }
 
-fn render_surface(
-    state: &mut State,
-    inner: &Rc<RefCell<Inner>>,
-    handle: &LoopHandle<'static, State>,
-    crtc: crtc::Handle,
-) {
+fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Handle) {
     let mut inner_mut = inner.borrow_mut();
     let Inner {
         renderer, surfaces, ..
@@ -432,6 +466,14 @@ fn render_surface(
         tracing::debug!("render_surface: no surface for {crtc:?}, dropping the render chain here");
         return;
     };
+
+    if surface.frame_pending {
+        // A previous commit for this crtc hasn't completed yet — see
+        // `SurfaceData::frame_pending`'s doc comment. `frame_finish` will
+        // call back in here once it does.
+        tracing::debug!("render_surface: frame already pending for {crtc:?}, skipping");
+        return;
+    }
 
     let size = surface
         .output
@@ -474,22 +516,19 @@ fn render_surface(
         Ok(result) => {
             if !result.is_empty {
                 tracing::debug!("render_surface: damage found for {crtc:?}, queuing frame");
-                if let Err(err) = surface.drm_output.queue_frame(()) {
-                    tracing::warn!("failed to queue DRM frame: {err}");
+                match surface.drm_output.queue_frame(()) {
+                    Ok(()) => surface.frame_pending = true,
+                    Err(err) => tracing::warn!("failed to queue DRM frame: {err}"),
                 }
             } else {
-                tracing::debug!("render_surface: no damage for {crtc:?}, rescheduling in 16ms");
-                // No damage — re-check for it in about a frame rather
-                // than busy-looping (trimmed of anvil's metadata-driven
-                // latency tuning; see the module doc).
-                reschedule(inner, handle, crtc, Duration::from_millis(16));
+                tracing::debug!("render_surface: no damage for {crtc:?}, waiting for the next redraw ping");
             }
         }
         Err(err) => tracing::warn!("render_frame failed: {err}"),
     }
 }
 
-fn frame_finish(state: &mut State, inner: &Rc<RefCell<Inner>>, handle: &LoopHandle<'static, State>, crtc: crtc::Handle) {
+fn frame_finish(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Handle) {
     tracing::debug!("frame_finish: vblank for {crtc:?}");
     let submitted = {
         let mut inner_mut = inner.borrow_mut();
@@ -497,24 +536,12 @@ fn frame_finish(state: &mut State, inner: &Rc<RefCell<Inner>>, handle: &LoopHand
             tracing::debug!("frame_finish: no surface for {crtc:?}, dropping the render chain here");
             return;
         };
+        surface.frame_pending = false;
         surface.drm_output.frame_submitted()
     };
     if let Err(err) = submitted {
         tracing::warn!("frame_submitted failed: {err}");
     }
 
-    render_surface(state, inner, handle, crtc);
-}
-
-fn reschedule(inner: &Rc<RefCell<Inner>>, handle: &LoopHandle<'static, State>, crtc: crtc::Handle, delay: Duration) {
-    let inner = inner.clone();
-    let handle_clone = handle.clone();
-    let result = handle.insert_source(Timer::from_duration(delay), move |_, _, state| {
-        tracing::debug!("reschedule: retry timer fired for {crtc:?}");
-        render_surface(state, &inner, &handle_clone, crtc);
-        TimeoutAction::Drop
-    });
-    if let Err(err) = result {
-        tracing::warn!("failed to schedule a repaint retry: {err}");
-    }
+    render_surface(state, inner, crtc);
 }
