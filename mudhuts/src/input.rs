@@ -8,6 +8,7 @@ use smithay::input::keyboard::{FilterResult, KeysymHandle, ModifiersState, keysy
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, SERIAL_COUNTER, Serial};
+use smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitorSeat;
 use smithay::wayland::shell::wlr_layer::{KeyboardInteractivity, Layer as WlrLayer};
 
 use crate::State;
@@ -502,6 +503,21 @@ impl State {
                     return;
                 }
 
+                // `keyboard-shortcuts-inhibit-unstable-v1`: a client (a VM
+                // viewer, remote-desktop app, ...) can ask not to have its
+                // surface's key events intercepted by mudhuts' own global
+                // keybindings, so it can forward them raw to whatever it's
+                // showing instead. mudhuts keeps keyboard focus in exact
+                // 1:1 sync with "the one visible view" (see
+                // `sync_keyboard_focus_to_view`'s doc comment), so
+                // `current_focus()` is exactly the right — and only —
+                // surface to check here; it's `None` while the terminal
+                // shows (which has no inhibitor to look up anyway).
+                let inhibited = keyboard
+                    .current_focus()
+                    .and_then(|s| self.seat.keyboard_shortcuts_inhibitor_for_surface(&s))
+                    .is_some_and(|i| i.is_active());
+
                 keyboard.input::<(), _>(
                     self,
                     keycode,
@@ -526,8 +542,13 @@ impl State {
                         // whether the terminal or a client window is the
                         // active view — otherwise there'd be no way to
                         // toggle back to the terminal once a client
-                        // window takes over the screen.
-                        if key_state == KeyState::Pressed {
+                        // window takes over the screen. Except when the
+                        // focused surface holds an active shortcuts
+                        // inhibitor (`inhibited`, computed above): then it
+                        // wants raw key events itself, so the lookup is
+                        // skipped entirely and this falls through to the
+                        // `Forward` branch just below.
+                        if key_state == KeyState::Pressed && !inhibited {
                             let base_keysym = keysym
                                 .raw_latin_sym_or_raw_current_sym()
                                 .unwrap_or(keysym.modified_sym());

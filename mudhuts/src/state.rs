@@ -17,6 +17,7 @@ use smithay::utils::{Logical, Point};
 use smithay::wayland::compositor::{CompositorClientState, CompositorState};
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
 use smithay::wayland::foreign_toplevel_list::ForeignToplevelListState;
+use smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitState;
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::shell::wlr_layer::{Layer as WlrLayer, WlrLayerShellState};
@@ -128,6 +129,13 @@ pub struct State {
     /// in one of 4 layers (background/bottom/top/overlay) relative to
     /// normal content. See `handlers/layer_shell.rs`'s module doc.
     pub layer_shell_state: WlrLayerShellState,
+    /// `keyboard-shortcuts-inhibit-unstable-v1` — lets a client (a VM
+    /// viewer, remote-desktop app, ...) ask mudhuts not to intercept its
+    /// own global keybindings for its surface, so it can forward raw key
+    /// events (e.g. the guest's own Ctrl+Alt+Fn) through instead. See
+    /// `input.rs`'s `process_input_event` for where this is actually
+    /// consulted.
+    pub keyboard_shortcuts_inhibit_state: KeyboardShortcutsInhibitState,
     /// A one-time secret, generated fresh each run, that a helper program
     /// mudhuts itself spawns (see `main.rs`'s `--authority-helper`) must
     /// present via `mudhuts_shell_authority_v1.authenticate` before any of
@@ -174,6 +182,7 @@ impl State {
         );
         let foreign_toplevel_list_state = ForeignToplevelListState::new::<Self>(&dh);
         let layer_shell_state = WlrLayerShellState::new::<Self>(&dh);
+        let keyboard_shortcuts_inhibit_state = KeyboardShortcutsInhibitState::new::<Self>(&dh);
         let authority_token = {
             use rand::distr::{Alphanumeric, SampleString};
             Alphanumeric.sample_string(&mut rand::rng(), 32)
@@ -217,6 +226,7 @@ impl State {
             dmabuf_renderer: None,
             foreign_toplevel_list_state,
             layer_shell_state,
+            keyboard_shortcuts_inhibit_state,
             authority_token,
             redraw_ping,
         })

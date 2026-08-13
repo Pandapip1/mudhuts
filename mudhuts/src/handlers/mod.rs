@@ -12,6 +12,9 @@ use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
 use smithay::wayland::foreign_toplevel_list::{ForeignToplevelListHandler, ForeignToplevelListState};
+use smithay::wayland::keyboard_shortcuts_inhibit::{
+    KeyboardShortcutsInhibitHandler, KeyboardShortcutsInhibitState, KeyboardShortcutsInhibitor,
+};
 use smithay::wayland::output::OutputHandler;
 use smithay::wayland::pointer_constraints::PointerConstraintsHandler;
 use smithay::wayland::selection::SelectionHandler;
@@ -99,6 +102,23 @@ impl DmabufHandler for State {
 impl ForeignToplevelListHandler for State {
     fn foreign_toplevel_list_state(&mut self) -> &mut ForeignToplevelListState {
         &mut self.foreign_toplevel_list_state
+    }
+}
+
+/// `keyboard-shortcuts-inhibit-unstable-v1` — see `state.rs`'s
+/// `keyboard_shortcuts_inhibit_state` doc comment. Auto-grants every
+/// request unconditionally (mirrors `.smithay-ref/anvil`'s own reference
+/// handler, whose comment reads "Just grant the wish for everyone") —
+/// simpler than building a confirmation UX, and there's no wire-level
+/// "deny" in the protocol anyway (a client that's never `activate()`'d
+/// just never sees an `active()` event).
+impl KeyboardShortcutsInhibitHandler for State {
+    fn keyboard_shortcuts_inhibit_state(&mut self) -> &mut KeyboardShortcutsInhibitState {
+        &mut self.keyboard_shortcuts_inhibit_state
+    }
+
+    fn new_inhibitor(&mut self, inhibitor: KeyboardShortcutsInhibitor) {
+        inhibitor.activate();
     }
 }
 
