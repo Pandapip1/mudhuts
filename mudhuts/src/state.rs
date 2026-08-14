@@ -334,6 +334,19 @@ pub struct State {
     /// `render_surface`/`winit_backend.rs`'s redraw handler for where it
     /// finally gets taken and confirmed.
     pub pending_lock: Option<SessionLocker>,
+    /// Every real `Output` that has successfully queued a locked frame
+    /// since `pending_lock` was last set — cleared in
+    /// `handlers/session_lock.rs`'s `lock`/`unlock`. `udev_backend.rs`'s
+    /// `render_surface` (called once per crtc, independently, possibly
+    /// several event-loop ticks apart on a multi-monitor session) only
+    /// takes and confirms `pending_lock` once every currently-connected
+    /// output has an entry here — without this, the very first crtc to
+    /// queue a frame after `lock()` confirmed the client's `locked()`
+    /// immediately, even though every other monitor was still showing
+    /// pre-lock desktop content until its own crtc got around to
+    /// rendering: a real content-disclosure gap for a security feature on
+    /// any 2+-monitor setup.
+    pub pending_lock_confirmed_outputs: Vec<Output>,
     /// Stable identity for the plain blank backdrop `render.rs`'s
     /// `build_frame_elements` draws while locked and no lock surface is
     /// mapped yet (or one just went stale) — kept here rather than
@@ -486,6 +499,7 @@ impl State {
             accepted_lock: None,
             lock_surfaces: Vec::new(),
             pending_lock: None,
+            pending_lock_confirmed_outputs: Vec::new(),
             lock_backdrop_id: Id::new(),
             authority_token,
             redraw_ping,
@@ -549,6 +563,10 @@ impl State {
                 if let Err(err) = self.stack.remove_exited(id) {
                     tracing::error!("failed to respawn after shell exit: {err}");
                 }
+                // This id can never exist again (`ConsoleHut::id` is a
+                // fresh counter per spawn) — see `render::purge_hut_content`'s
+                // doc comment on the leak this avoids.
+                crate::render::purge_hut_content(id);
                 self.request_redraw();
             }
             mudhuts_term::TermEvent::Wakeup => {

@@ -506,6 +506,24 @@ fn refresh_hut_content_thumbnail(
     });
 }
 
+/// Drop `id`'s entry from the Alt-Tab thumbnail cache, if it has one —
+/// called from `state.rs`'s shell-exit handling right alongside
+/// `GraphStack::remove_exited`, the one place a `ConsoleHut` id actually
+/// stops existing. Without this, every Hut that was ever thumbnailed
+/// (previewed at least once) leaked its full-output-sized `GlesTexture`/
+/// `OutputDamageTracker` for the rest of the process's life once it
+/// exited — unbounded GPU memory growth over a long-running session, the
+/// same "per-key state never purged when the key's owner goes away" class
+/// already fixed for `State::lock_surfaces`/the `wl_output` global leak.
+pub(crate) fn purge_hut_content(id: u64) {
+    HUT_CONTENT.with(|cell| {
+        cell.borrow_mut().remove(&id);
+    });
+    HUT_CONTENT_DAMAGE.with(|cell| {
+        cell.borrow_mut().remove(&id);
+    });
+}
+
 /// The texture+damage pair [`refresh_hut_content_thumbnail`] last cached
 /// for `id`, if any — `None` for a Hut that's never had its thumbnail
 /// refreshed yet (never previewed while showing a Main Window). Marks the
