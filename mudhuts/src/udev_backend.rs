@@ -1070,6 +1070,15 @@ fn connector_disconnected(
         for id in removed_hut_ids {
             crate::render::purge_hut_content(id);
         }
+        // After `remove_output`, not before — `state.stack.outputs()` has
+        // to reflect the disconnected output's own removal already, or
+        // `all_confirmed` would still see that (just-purged-from-
+        // `pending_lock_confirmed_outputs`) slot and never pass. Purging
+        // the disconnected output above can be exactly what makes every
+        // *remaining* output already confirmed — nothing else re-checks
+        // that on its own (see `State::confirm_pending_lock_if_ready`'s
+        // doc comment).
+        state.confirm_pending_lock_if_ready();
         // Every other surface pointing at a slot index *after* the
         // removed one shifts down by one along with it — mirrors
         // `GraphStack::remove_output`'s own index-shift internally.
@@ -1204,14 +1213,7 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
         if !state.pending_lock_confirmed_outputs.contains(&output) {
             state.pending_lock_confirmed_outputs.push(output.clone());
         }
-        let all_confirmed = state
-            .stack
-            .outputs()
-            .iter()
-            .all(|slot| state.pending_lock_confirmed_outputs.contains(&slot.output));
-        if all_confirmed && let Some(confirmation) = state.pending_lock.take() {
-            confirmation.lock();
-        }
+        state.confirm_pending_lock_if_ready();
     };
 
     match surface

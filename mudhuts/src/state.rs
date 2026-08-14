@@ -662,6 +662,31 @@ impl State {
             .unwrap_or((0, 0));
     }
 
+    /// If a lock is pending and every currently-connected output has
+    /// already queued a locked frame (`self.pending_lock_confirmed_outputs`
+    /// — see its own doc comment), take and confirm it. Called from
+    /// `udev_backend.rs`'s `render_surface` right after adding *this*
+    /// output to that list on every render pass, but also needs calling
+    /// from `connector_disconnected`: unplugging the one remaining
+    /// not-yet-confirmed output can make every *remaining* output already
+    /// confirmed, and nothing else would ever re-check that — without
+    /// this, the locking client's confirmation could stall forever
+    /// waiting on an output that no longer exists, even once the screen
+    /// is genuinely, fully blanked.
+    pub fn confirm_pending_lock_if_ready(&mut self) {
+        if !self.locked || self.pending_lock.is_none() {
+            return;
+        }
+        let all_confirmed = self
+            .stack
+            .outputs()
+            .iter()
+            .all(|slot| self.pending_lock_confirmed_outputs.contains(&slot.output));
+        if all_confirmed && let Some(confirmation) = self.pending_lock.take() {
+            confirmation.lock();
+        }
+    }
+
     /// [`Self::output_scale`], for a specific output — see
     /// [`Self::usable_area_for`]'s doc comment on why real multi-monitor
     /// needs this alongside the focused-output version.
