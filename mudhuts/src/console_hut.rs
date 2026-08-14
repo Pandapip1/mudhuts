@@ -22,6 +22,7 @@ use mudhuts_term::palette::Rgb;
 
 use crate::gpu_term::{GpuTermRenderer, LabelRenderer};
 use crate::main_window::MainWindowEntry;
+use crate::redraw::{Redrawable, RedrawHandle, Signal};
 use crate::render::{ChangeTracker, LabelCache};
 use crate::space_element::{HutSpaceElement, synthetic_output};
 
@@ -110,14 +111,22 @@ pub struct ConsoleHut {
     /// alongside it.
     main_windows: Vec<MainWindowEntry>,
     /// Index into `main_windows` of the tab that's active — meaningless
-    /// while `main_windows` is empty.
-    active_main_window: usize,
+    /// while `main_windows` is empty. A [`Signal`] (composable Hut
+    /// hierarchy RFC migration step 4's generic follow-up — see
+    /// `redraw::Signal`'s doc comment) so nothing that changes it can
+    /// forget to request a redraw, same reasoning as `TabbedHut::active`/
+    /// `TileHut::active`.
+    active_main_window: Signal<usize>,
     /// Whether *this ConsoleHut's* terminal (vs. its active Main Window) is the
     /// visible view when this ConsoleHut is focused. Per-ConsoleHut so switching Huts
     /// (or Main Window tabs) doesn't disturb what each one was last
     /// showing. Ignored (treated as `true`) while `main_windows` is
-    /// empty — see `State::showing_terminal_effective`.
-    pub showing_terminal: bool,
+    /// empty — see `State::showing_terminal_effective`. A [`Signal`] —
+    /// this used to need a manual `State::request_redraw()` right after
+    /// every write (and once shipped without one, `Action::ToggleTerminal`
+    /// — see `redraw::Signal`'s doc comment), which is no longer possible
+    /// to forget.
+    pub showing_terminal: Signal<bool>,
     /// Fractional scroll-wheel/trackpad distance (physical pixels,
     /// signed the same way `input.rs`'s `PointerAxis` handling reads
     /// `vertical_amount`) not yet converted into a whole line of
@@ -204,8 +213,8 @@ impl ConsoleHut {
                 damage_tracker: DamageBag::default(),
                 label_renderer: None,
                 main_windows: Vec::new(),
-                active_main_window: 0,
-                showing_terminal: true,
+                active_main_window: Signal::new(0),
+                showing_terminal: Signal::new(true),
                 scroll_accum: 0.0,
             },
             events,
@@ -218,18 +227,18 @@ impl ConsoleHut {
 
     /// The Main Window whose tab is currently active, if any.
     pub fn active_window(&self) -> Option<&Window> {
-        self.main_windows.get(self.active_main_window).map(|e| &e.window)
+        self.main_windows.get(*self.active_main_window).map(|e| &e.window)
     }
 
     /// The active tab's full entry (Floating Windows/Alerts included), if any.
     pub fn active_main_window_entry(&self) -> Option<&MainWindowEntry> {
-        self.main_windows.get(self.active_main_window)
+        self.main_windows.get(*self.active_main_window)
     }
 
     /// Index into `main_windows()` of the active tab — meaningless while
     /// `main_windows()` is empty.
     pub fn active_main_window_index(&self) -> usize {
-        self.active_main_window
+        *self.active_main_window
     }
 
     pub fn main_windows(&self) -> &[MainWindowEntry] {
@@ -240,7 +249,7 @@ impl ConsoleHut {
     /// clicking a specific tab in `chrome.rs`'s strip, unlike
     /// [`Self::cycle_tab`]'s relative forward/backward step.
     pub fn set_active_main_window(&mut self, index: usize) {
-        self.active_main_window = index.min(self.main_windows.len().saturating_sub(1));
+        *self.active_main_window = index.min(self.main_windows.len().saturating_sub(1));
     }
 
     pub fn main_windows_mut(&mut self) -> &mut [MainWindowEntry] {
@@ -304,7 +313,7 @@ impl ConsoleHut {
         self.main_windows
             .push(MainWindowEntry::new(window, foreign_handle));
         if make_active {
-            self.active_main_window = self.main_windows.len() - 1;
+            *self.active_main_window = self.main_windows.len() - 1;
         }
     }
 
@@ -325,10 +334,10 @@ impl ConsoleHut {
     pub fn take_bare_main_window(&mut self, surface: &WlSurface) -> Option<Window> {
         let idx = self.main_windows.iter().position(|e| e.matches(surface))?;
         let entry = self.main_windows.remove(idx);
-        if idx < self.active_main_window {
-            self.active_main_window -= 1;
+        if idx < *self.active_main_window {
+            *self.active_main_window -= 1;
         }
-        self.active_main_window = self
+        *self.active_main_window = self
             .active_main_window
             .min(self.main_windows.len().saturating_sub(1));
         Some(entry.window)
@@ -384,14 +393,14 @@ impl ConsoleHut {
     pub fn remove_window(&mut self, surface: &WlSurface) -> bool {
         if let Some(idx) = self.main_windows.iter().position(|e| e.matches(surface)) {
             self.main_windows.remove(idx);
-            if idx < self.active_main_window {
-                self.active_main_window -= 1;
+            if idx < *self.active_main_window {
+                *self.active_main_window -= 1;
             }
-            self.active_main_window = self
+            *self.active_main_window = self
                 .active_main_window
                 .min(self.main_windows.len().saturating_sub(1));
             if self.main_windows.is_empty() {
-                self.showing_terminal = true;
+                *self.showing_terminal = true;
             }
             return true;
         }
@@ -416,10 +425,10 @@ impl ConsoleHut {
         if len < 2 {
             return;
         }
-        self.active_main_window = if forward {
-            (self.active_main_window + 1) % len
+        *self.active_main_window = if forward {
+            (*self.active_main_window + 1) % len
         } else {
-            (self.active_main_window + len - 1) % len
+            (*self.active_main_window + len - 1) % len
         };
     }
 
@@ -629,5 +638,15 @@ impl ConsoleHut {
             fg,
             bg,
         )
+    }
+}
+
+impl Redrawable for ConsoleHut {
+    /// The leaf case `Hut::attach_redraw_handle` recurses into — see that
+    /// method's doc comment. Reaches every one of this ConsoleHut's own
+    /// `Signal` fields; a future one just needs adding here too.
+    fn attach_redraw_handle(&mut self, handle: RedrawHandle) {
+        self.showing_terminal.attach_redraw_handle(handle.clone());
+        self.active_main_window.attach_redraw_handle(handle);
     }
 }

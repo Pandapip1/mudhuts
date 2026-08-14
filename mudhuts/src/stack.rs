@@ -78,7 +78,7 @@ impl MruStackHut {
         extra_env: Vec<(String, String)>,
         redraw: RedrawHandle,
     ) -> Result<Self, String> {
-        let stack = Self {
+        let mut stack = Self {
             huts: vec![Hut::Console(Box::new(first))],
             current: 0,
             preview: None,
@@ -88,6 +88,15 @@ impl MruStackHut {
             scale: 1.0,
             redraw,
         };
+        // Every ConsoleHut needs this to make its own `Signal` fields
+        // (`showing_terminal`, `active_main_window`) actually mark
+        // redraws — see `Hut::attach_redraw_handle`'s doc comment. Every
+        // *other* construction path (`wrap_tab`/`wrap_tile`,
+        // `spawn_and_insert`) does this too; this is the one for the
+        // very first Hut, constructed before `self.redraw` exists to
+        // pass to a method on `self`.
+        let handle = stack.redraw.clone();
+        stack.huts[0].attach_redraw_handle(handle);
         let id = stack.huts[0].focused_hut().id;
         stack.insert_channel(id, first_events)?;
         Ok(stack)
@@ -253,7 +262,11 @@ impl MruStackHut {
         let (hut, events) = ConsoleHut::spawn(self.extra_env.clone(), self.scale)?;
         let id = hut.id;
         self.insert_channel(id, events)?;
-        self.huts.push(Hut::Console(Box::new(hut)));
+        // See `Self::new`'s matching comment — a bare ConsoleHut needs
+        // this too, same as every other construction path.
+        let mut hut = Hut::Console(Box::new(hut));
+        hut.attach_redraw_handle(self.redraw.clone());
+        self.huts.push(hut);
         Ok(())
     }
 

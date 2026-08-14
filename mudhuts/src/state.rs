@@ -688,7 +688,7 @@ impl State {
             return true;
         }
         let hut = self.stack.focused();
-        hut.showing_terminal || hut.main_window_count() == 0
+        *hut.showing_terminal || hut.main_window_count() == 0
     }
 
     /// Screen-space offset of whichever pane currently has effective
@@ -709,7 +709,7 @@ impl State {
         if tile.children.len() < 2 {
             return (area.0 as f64, area.1 as f64);
         }
-        let (x, y, _, _) = tile.absolute_pane_rects(area)[tile.active];
+        let (x, y, _, _) = tile.absolute_pane_rects(area)[*tile.active];
         (x as f64, y as f64)
     }
 
@@ -757,7 +757,7 @@ impl State {
         for window in mapped {
             hut.space.unmap_elem(&window);
         }
-        if hut.showing_terminal {
+        if *hut.showing_terminal {
             return;
         }
         let Some(entry) = hut.active_main_window_entry() else {

@@ -27,7 +27,7 @@
 use smithay::backend::renderer::element::Id;
 
 use crate::console_hut::ConsoleHut;
-use crate::redraw::{Redrawable, RedrawHandle};
+use crate::redraw::{Redrawable, RedrawHandle, Signal};
 use crate::render::{ChangeTracker, LabelCache};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,7 +55,12 @@ pub enum Hut {
 
 pub struct TabbedHut {
     pub children: Vec<Hut>,
-    pub active: usize,
+    /// Which child is shown — a [`Signal`], so nothing that changes it
+    /// can forget to request a redraw (composable Hut hierarchy RFC
+    /// migration step 4; this used to be a hand-written `set_active`
+    /// setter plus a separate `redraw: Option<RedrawHandle>` field,
+    /// subsumed by `Signal` itself now).
+    pub active: Signal<usize>,
     /// Each child's rendered tab-label texture, cached the same way
     /// `ConsoleHut`'s own tab caches are (see `render::LabelCache`'s doc
     /// comment) — one entry per child, kept in sync with `children`'s
@@ -75,29 +80,6 @@ pub struct TabbedHut {
     /// when its active/inactive state flips (see `render::ChangeTracker`'s
     /// doc comment).
     pub(crate) bg_tracker: Vec<ChangeTracker<bool>>,
-    /// Composable Hut hierarchy RFC migration step 4: set via
-    /// [`Hut::attach_redraw_handle`] (recursively, from
-    /// `stack::MruStackHut::wrap_tab`/`wrap_tile`) — [`Self::set_active`]
-    /// calls `mark_dirty()` on it itself, so nothing that changes which
-    /// child tab is active can forget to request a redraw. `None` only
-    /// momentarily, for a freshly-constructed node before that attach call
-    /// runs (see `Hut::wrap_focused`'s placeholder).
-    redraw: Option<RedrawHandle>,
-}
-
-impl TabbedHut {
-    /// Switch which child is active, requesting a redraw — the one place
-    /// this should ever be set from outside `hut.rs`, so the redraw can't
-    /// be forgotten (see [`Self::redraw`]'s doc comment). Internal
-    /// bookkeeping (`remove_child_hut`'s clamp on removal) still writes
-    /// `active` directly — nothing to redraw differently there, since the
-    /// element being removed is already forcing a redraw of its own.
-    pub fn set_active(&mut self, index: usize) {
-        self.active = index;
-        if let Some(redraw) = &self.redraw {
-            redraw.mark_dirty();
-        }
-    }
 }
 
 pub struct TileHut {
@@ -109,8 +91,9 @@ pub struct TileHut {
     pub children: Vec<(Hut, f64)>,
     /// Which pane currently has keyboard focus — distinct from a
     /// Tab-Hut's `active`, which *also* controls visibility; every
-    /// Tile-Hut pane is visible regardless of this index.
-    pub active: usize,
+    /// Tile-Hut pane is visible regardless of this index. A [`Signal`] —
+    /// see [`TabbedHut::active`]'s doc comment.
+    pub active: Signal<usize>,
     /// Stable identities for the 4 border strips (top/bottom/left/right)
     /// drawn around whichever pane is `active` — reused across frames
     /// regardless of *which* pane that is: each strip's *geometry*
@@ -124,21 +107,9 @@ pub struct TileHut {
     /// single frame needs its own identity, or the damage tracker can't
     /// tell the 4 strips apart.
     pub(crate) highlight_ids: [Id; 4],
-    /// See [`TabbedHut::redraw`]'s doc comment — same purpose, for
-    /// [`Self::set_active`] (which pane has keyboard focus).
-    redraw: Option<RedrawHandle>,
 }
 
 impl TileHut {
-    /// See [`TabbedHut::set_active`] — same purpose, for which pane has
-    /// keyboard focus.
-    pub fn set_active(&mut self, index: usize) {
-        self.active = index;
-        if let Some(redraw) = &self.redraw {
-            redraw.mark_dirty();
-        }
-    }
-
     /// Every pane's rectangle in absolute physical-pixel space — `area`
     /// is `State::usable_area()`'s `(x, y, w, h)`. The single computation
     /// shared by rendering (`render.rs::build_tile_elements`), pane-click
@@ -170,11 +141,10 @@ impl Hut {
     pub fn wrap_tab(other: Hut, current: Hut) -> Hut {
         Hut::Tab(TabbedHut {
             children: vec![other, current],
-            active: 1,
+            active: Signal::new(1),
             label_cache: vec![LabelCache::new(), LabelCache::new()],
             tab_ids: vec![(Id::new(), Id::new()), (Id::new(), Id::new())],
             bg_tracker: vec![ChangeTracker::new(), ChangeTracker::new()],
-            redraw: None,
         })
     }
 
@@ -185,9 +155,8 @@ impl Hut {
         Hut::Tile(TileHut {
             axis,
             children: vec![(other, 0.5), (current, 0.5)],
-            active: 1,
+            active: Signal::new(1),
             highlight_ids: [Id::new(), Id::new(), Id::new(), Id::new()],
-            redraw: None,
         })
     }
 
@@ -214,19 +183,18 @@ impl Hut {
         if matches!(self, Hut::Console(_)) {
             let placeholder = Hut::Tab(TabbedHut {
                 children: Vec::new(),
-                active: 0,
+                active: Signal::new(0),
                 label_cache: Vec::new(),
                 tab_ids: Vec::new(),
                 bg_tracker: Vec::new(),
-                redraw: None,
             });
             let old = std::mem::replace(self, placeholder);
             *self = make(old);
             return;
         }
         match self {
-            Hut::Tab(tab) => tab.children[tab.active].wrap_focused(make),
-            Hut::Tile(tile) => tile.children[tile.active].0.wrap_focused(make),
+            Hut::Tab(tab) => tab.children[*tab.active].wrap_focused(make),
+            Hut::Tile(tile) => tile.children[*tile.active].0.wrap_focused(make),
             Hut::Console(_) => unreachable!("checked above"),
         }
     }
@@ -283,16 +251,16 @@ impl Hut {
     pub fn focused_hut(&self) -> &ConsoleHut {
         match self {
             Hut::Console(hut) => hut,
-            Hut::Tab(tab) => tab.children[tab.active].focused_hut(),
-            Hut::Tile(tile) => tile.children[tile.active].0.focused_hut(),
+            Hut::Tab(tab) => tab.children[*tab.active].focused_hut(),
+            Hut::Tile(tile) => tile.children[*tile.active].0.focused_hut(),
         }
     }
 
     pub fn focused_hut_mut(&mut self) -> &mut ConsoleHut {
         match self {
             Hut::Console(hut) => hut,
-            Hut::Tab(tab) => tab.children[tab.active].focused_hut_mut(),
-            Hut::Tile(tile) => tile.children[tile.active].0.focused_hut_mut(),
+            Hut::Tab(tab) => tab.children[*tab.active].focused_hut_mut(),
+            Hut::Tile(tile) => tile.children[*tile.active].0.focused_hut_mut(),
         }
     }
 
@@ -325,7 +293,7 @@ impl Hut {
                 .iter()
                 .any(|entry| entry.matches(root))
                 .then_some(area),
-            Hut::Tab(tab) => tab.children.get(tab.active)?.leaf_absolute_rect(root, area),
+            Hut::Tab(tab) => tab.children.get(*tab.active)?.leaf_absolute_rect(root, area),
             Hut::Tile(tile) => {
                 let rects = tile.absolute_pane_rects(area);
                 tile.children.iter().zip(rects).find_map(|((child, _), rect)| {
@@ -410,7 +378,7 @@ impl Hut {
                     let mut kept = keep.iter();
                     tab.bg_tracker
                         .retain(|_| kept.next().copied().unwrap_or(true));
-                    tab.active = tab.active.min(tab.children.len().saturating_sub(1));
+                    *tab.active = tab.active.min(tab.children.len().saturating_sub(1));
                     true
                 } else {
                     tab.children.iter_mut().any(|c| c.remove_child_hut(id))
@@ -421,7 +389,7 @@ impl Hut {
                 tile.children
                     .retain(|(c, _)| !matches!(c, Hut::Console(hut) if hut.id == id));
                 if tile.children.len() != before {
-                    tile.active = tile.active.min(tile.children.len().saturating_sub(1));
+                    *tile.active = tile.active.min(tile.children.len().saturating_sub(1));
                     true
                 } else {
                     tile.children.iter_mut().any(|(c, _)| c.remove_child_hut(id))
@@ -461,23 +429,23 @@ impl Hut {
         match self {
             Hut::Console(_) => false,
             Hut::Tab(tab) => {
-                if tab.children[tab.active].cycle_innermost(dir) {
+                if tab.children[*tab.active].cycle_innermost(dir) {
                     return true;
                 }
                 if tab.children.len() < 2 {
                     return false;
                 }
-                tab.set_active(wrapping_step(tab.children.len(), tab.active, dir));
+                *tab.active = wrapping_step(tab.children.len(), *tab.active, dir);
                 true
             }
             Hut::Tile(tile) => {
-                if tile.children[tile.active].0.cycle_innermost(dir) {
+                if tile.children[*tile.active].0.cycle_innermost(dir) {
                     return true;
                 }
                 if tile.children.len() < 2 {
                     return false;
                 }
-                tile.set_active(wrapping_step(tile.children.len(), tile.active, dir));
+                *tile.active = wrapping_step(tile.children.len(), *tile.active, dir);
                 true
             }
         }
@@ -488,21 +456,22 @@ impl Redrawable for Hut {
     /// Recurses into every descendant, not just this node — a Tab/Tile-Hut
     /// might contain other Tab/Tile-Huts nested arbitrarily deep (see the
     /// module doc's v1 scope note), and every one of them needs the same
-    /// handle so [`TabbedHut::set_active`]/[`TileHut::set_active`] can mark
-    /// a redraw regardless of how deep the click/cycle that changed them
-    /// was. A no-op for a bare `Console` leaf — `ConsoleHut` isn't part of
-    /// this migration step (see the RFC's step 4 notes).
+    /// handle so a change to any level's `active` `Signal` can mark a
+    /// redraw regardless of how deep the click/cycle that changed it was.
+    /// Also reaches a bare `Console` leaf's own `Signal` fields now (see
+    /// `ConsoleHut`'s `Redrawable` impl) — no longer a no-op the way it
+    /// was before the generic `Signal` wrapper existed (RFC step 4).
     fn attach_redraw_handle(&mut self, handle: RedrawHandle) {
         match self {
-            Hut::Console(_) => {}
+            Hut::Console(console) => console.attach_redraw_handle(handle),
             Hut::Tab(tab) => {
-                tab.redraw = Some(handle.clone());
+                tab.active.attach_redraw_handle(handle.clone());
                 for child in &mut tab.children {
                     child.attach_redraw_handle(handle.clone());
                 }
             }
             Hut::Tile(tile) => {
-                tile.redraw = Some(handle.clone());
+                tile.active.attach_redraw_handle(handle.clone());
                 for (child, _) in &mut tile.children {
                     child.attach_redraw_handle(handle.clone());
                 }
@@ -563,11 +532,10 @@ mod tests {
     fn placeholder() -> Hut {
         Hut::Tab(TabbedHut {
             children: Vec::new(),
-            active: 0,
+            active: Signal::new(0),
             label_cache: Vec::new(),
             tab_ids: Vec::new(),
             bg_tracker: Vec::new(),
-            redraw: None,
         })
     }
 
@@ -575,9 +543,8 @@ mod tests {
         TileHut {
             axis,
             children: vec![(placeholder(), fracs[0]), (placeholder(), fracs[1])],
-            active: 0,
+            active: Signal::new(0),
             highlight_ids: [Id::new(), Id::new(), Id::new(), Id::new()],
-            redraw: None,
         }
     }
 
@@ -601,12 +568,12 @@ mod tests {
     }
 
     #[test]
-    fn set_active_marks_the_attached_redraw_handle_dirty() {
+    fn writing_active_marks_the_attached_redraw_handle_dirty() {
         let mut t = tile(Axis::Horizontal, [0.5, 0.5]);
         let (ping, source) = smithay::reexports::calloop::ping::make_ping().unwrap();
-        t.redraw = Some(RedrawHandle::new(ping));
+        t.active.attach_redraw_handle(RedrawHandle::new(ping));
 
-        t.set_active(1);
+        *t.active = 1;
         assert_eq!(t.active, 1);
 
         let mut event_loop: smithay::reexports::calloop::EventLoop<'static, ()> =
@@ -620,6 +587,6 @@ mod tests {
         event_loop
             .dispatch(std::time::Duration::from_millis(0), &mut ())
             .unwrap();
-        assert!(fired.get(), "set_active should have pinged the attached RedrawHandle");
+        assert!(fired.get(), "writing through the Signal should have pinged the attached RedrawHandle");
     }
 }

@@ -156,7 +156,7 @@ pub fn build(hut: &mut ConsoleHut, renderer: &mut GlesRenderer, y: i32, scale: f
     }
     let padding = crate::render::scaled(TAB_PADDING, scale);
 
-    let active_index = if hut.showing_terminal {
+    let active_index = if *hut.showing_terminal {
         0
     } else {
         1 + hut.active_main_window_index()

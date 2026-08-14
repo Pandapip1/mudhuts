@@ -93,7 +93,7 @@ impl XdgShellHandler for State {
         // "was empty" rule to be per-ConsoleHut).
         let should_show_now = is_focused_hut && was_empty;
         if should_show_now {
-            self.stack.focused_mut().showing_terminal = false;
+            *self.stack.focused_mut().showing_terminal = false;
         }
         self.sync_visible_main_window();
 

@@ -695,7 +695,7 @@ fn build_tile_elements(
         return Vec::new();
     };
     let rects = tile.absolute_pane_rects(area);
-    let active = tile.active;
+    let active = *tile.active;
     let highlight_ids = tile.highlight_ids.clone();
 
     let mut elements = Vec::new();

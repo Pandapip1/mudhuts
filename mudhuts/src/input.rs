@@ -302,10 +302,10 @@ impl State {
             }) else {
                 return false;
             };
-            // `set_active` requests its own redraw (composable Hut
-            // hierarchy RFC migration step 4) — no `request_redraw()`
+            // Writing through the `Signal` requests its own redraw (see
+            // `redraw::Signal`'s doc comment) — no `request_redraw()`
             // needed here.
-            tile.set_active(i);
+            *tile.active = i;
             self.sync_visible_main_window();
             self.sync_keyboard_focus_to_view();
             return true;
@@ -338,14 +338,13 @@ impl State {
         if let Some(hit) = hit {
             let hut = self.stack.focused_mut();
             if hit.index == 0 {
-                hut.showing_terminal = true;
+                *hut.showing_terminal = true;
             } else {
-                hut.showing_terminal = false;
+                *hut.showing_terminal = false;
                 hut.set_active_main_window(hit.index - 1);
             }
             self.sync_visible_main_window();
             self.sync_keyboard_focus_to_view();
-            self.request_redraw();
             return true;
         }
 
@@ -483,17 +482,17 @@ impl State {
                 // doesn't disturb what any other ConsoleHut was last showing.
                 let hut = self.stack.focused_mut();
                 if hut.main_window_count() > 0 {
-                    hut.showing_terminal = !hut.showing_terminal;
+                    // `showing_terminal` is a `Signal` (see
+                    // `redraw::Signal`'s doc comment) — this write alone
+                    // now guarantees the redraw a manual
+                    // `self.request_redraw()` used to have to remember
+                    // right here, and once genuinely shipped without
+                    // (masked under winit by that backend's own "redraw
+                    // on every input event regardless" behavior, but not
+                    // under the purely demand-driven udev backend).
+                    *hut.showing_terminal = !*hut.showing_terminal;
                     self.sync_visible_main_window();
                     self.sync_keyboard_focus_to_view();
-                    // Missing until a previous fix — under winit this was
-                    // masked by that backend's own "redraw on every input
-                    // event regardless" behavior (see
-                    // `handle_pointer_motion`'s doc comment), but the udev
-                    // backend is purely demand-driven: without this,
-                    // toggling never actually repaints until some
-                    // unrelated redraw comes along.
-                    self.request_redraw();
                 }
             }
             Action::StackNext => {

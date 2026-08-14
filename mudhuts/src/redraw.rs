@@ -60,3 +60,69 @@ pub enum Hit {
 pub trait HitTestable {
     fn hit_test(&self, point: Point<i32, Physical>) -> Option<Hit>;
 }
+
+/// The generic version of the pattern `TabbedHut`/`TileHut`'s `set_active`
+/// hand-wrote for exactly one field each: wrap any render-relevant field
+/// in this instead of writing a bespoke setter, and it's impossible for a
+/// future mutation site to forget to request a redraw — the wrapper
+/// itself calls [`RedrawHandle::mark_dirty`] on every `&mut` access (via
+/// `DerefMut`), unconditionally, the same "safe by default" choice
+/// `set_active` already made (no comparing old vs. new — see
+/// `RedrawHandle::mark_dirty`'s own doc comment on why over-marking
+/// within one frame is free).
+///
+/// `redraw` starts `None`, the same shape `TabbedHut::redraw`/
+/// `TileHut::redraw` already used — reads always work; a write before
+/// [`Redrawable::attach_redraw_handle`] runs is silently untracked, which
+/// only actually happens during construction, before anything could have
+/// rendered from the value anyway.
+pub struct Signal<T> {
+    value: T,
+    redraw: Option<RedrawHandle>,
+}
+
+impl<T> Signal<T> {
+    pub fn new(value: T) -> Self {
+        Self { value, redraw: None }
+    }
+}
+
+impl<T> Redrawable for Signal<T> {
+    fn attach_redraw_handle(&mut self, handle: RedrawHandle) {
+        self.redraw = Some(handle);
+    }
+}
+
+impl<T> std::ops::Deref for Signal<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+
+impl<T> std::ops::DerefMut for Signal<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        if let Some(redraw) = &self.redraw {
+            redraw.mark_dirty();
+        }
+        &mut self.value
+    }
+}
+
+/// So read-site comparisons (`tab.active == 0`) keep working without an
+/// explicit deref. Indexing (`tab.children[tab.active]`) still needs one
+/// (`tab.children[*tab.active]`) — that's a `Vec`-specific concern, not
+/// something `Signal` itself should carry.
+impl<T: PartialEq> PartialEq<T> for Signal<T> {
+    fn eq(&self, other: &T) -> bool {
+        &self.value == other
+    }
+}
+
+/// Forwards to `T`'s own `Debug` (e.g. for `assert_eq!` failure messages
+/// in tests) — the `redraw` handle itself carries nothing worth printing.
+impl<T: std::fmt::Debug> std::fmt::Debug for Signal<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.value, f)
+    }
+}

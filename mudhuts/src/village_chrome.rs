@@ -55,7 +55,7 @@ pub struct TabRect {
 /// for a single ConsoleHut's own Main-Window tabs, one level down.
 fn child_label(village: &Hut) -> String {
     let hut = village.focused_hut();
-    if !hut.showing_terminal
+    if !*hut.showing_terminal
         && hut.main_window_count() > 0
         && let Some(window) = hut.active_window()
     {
@@ -104,7 +104,7 @@ fn level_layout(children: &[Hut], y: i32, cell_w: usize, cell_h: i32, scale: f64
 pub fn stack_height(village: &Hut, cell_h: i32, scale: f64) -> i32 {
     match village {
         Hut::Tab(tab) if tab.children.len() >= 2 => {
-            tab_h(cell_h, scale) + stack_height(&tab.children[tab.active], cell_h, scale)
+            tab_h(cell_h, scale) + stack_height(&tab.children[*tab.active], cell_h, scale)
         }
         _ => 0,
     }
@@ -133,12 +133,12 @@ pub fn handle_click(
     let point = Point::from(pos);
     for TabRect { index: i, rect } in level_layout(&tab.children, y, cell_w, cell_h, scale) {
         if rect.contains(point) {
-            tab.set_active(i);
+            *tab.active = i;
             return true;
         }
     }
     handle_click(
-        &mut tab.children[tab.active],
+        &mut tab.children[*tab.active],
         pos,
         y + tab_h(cell_h, scale),
         cell_w,
@@ -181,7 +181,7 @@ pub fn build(
     let padding = crate::render::scaled(TAB_PADDING, scale);
     let mut elements = Vec::new();
     for TabRect { index: i, rect } in rects {
-        let active = i == tab.active;
+        let active = tab.active == i;
         let (fg, bg) = if active {
             (FG_ACTIVE, BG_ACTIVE)
         } else {
@@ -236,7 +236,7 @@ pub fn build(
     }
 
     let (deeper_elements, next_y) = build(
-        &mut tab.children[tab.active],
+        &mut tab.children[*tab.active],
         renderer,
         y + tab_h(cell_h, scale),
         cell_w,
