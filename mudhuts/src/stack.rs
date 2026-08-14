@@ -170,6 +170,19 @@ impl MruStackHut {
         self.huts.iter_mut().map(|v| v.focused_hut_mut())
     }
 
+    /// The raw top-level `Hut` per Stack entry, unresolved — unlike
+    /// [`Self::top_level_huts`], lets a caller (`Hut::shows_terminal_effective`,
+    /// via `switcher.rs`/`render.rs`) tell a genuinely-tiled entry apart
+    /// from a bare/tabbed one, which needs to see `Hut::Tile` itself, not
+    /// just whichever ConsoleHut it resolves to.
+    pub fn top_level_entries(&self) -> impl Iterator<Item = &Hut> {
+        self.huts.iter()
+    }
+
+    pub fn top_level_entries_mut(&mut self) -> impl Iterator<Item = &mut Hut> {
+        self.huts.iter_mut()
+    }
+
     /// Every Hut's ConsoleHut(s) need to track the real output size even
     /// while not focused/visible, so switching to one doesn't show a
     /// stale layout until the next actual resize.

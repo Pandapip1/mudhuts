@@ -256,6 +256,58 @@ impl ConsoleHut {
         &mut self.main_windows
     }
 
+    /// Make this ConsoleHut's own `space` match what it should currently
+    /// be showing: unmap whatever's mapped (harmless if nothing was),
+    /// then map the active Main Window (if this ConsoleHut isn't showing
+    /// its terminal) plus every currently-floating Floating Window and
+    /// every Alert belonging to it — docked Floating Windows stay
+    /// unmapped (`docks.rs` draws a handle instead), Alerts are mapped
+    /// last so they end up on top. `area_origin` is the real usable
+    /// area's own `(x, y)` — matters once a layer-shell surface reserves
+    /// part of the output (e.g. a left-anchored panel) — see
+    /// `State::usable_area`'s doc comment.
+    ///
+    /// Extracted from `State::sync_visible_main_window`'s old body
+    /// (composable Hut hierarchy RFC migration step 5 sub-step 2) so it
+    /// can run for *any* ConsoleHut, not just the focused one —
+    /// `render.rs`'s `refresh_hut_content_thumbnail` is the other caller,
+    /// syncing a backgrounded entry's `space` only while its Alt-Tab
+    /// thumbnail is actually about to be shown.
+    pub fn sync_main_window_space(&mut self, area_origin: (i32, i32)) {
+        let mapped: Vec<_> = self.space.elements().cloned().collect();
+        for window in mapped {
+            self.space.unmap_elem(&window);
+        }
+        if *self.showing_terminal {
+            return;
+        }
+        let Some(entry) = self.active_main_window_entry() else {
+            return;
+        };
+        // Cloned out into owned locals before touching `self.space` again
+        // — `entry` borrows `self` immutably, which can't coexist with
+        // the `self.space.map_element` calls below.
+        let main_window = entry.window.clone();
+        let floating: Vec<_> = entry
+            .floating_windows
+            .iter()
+            .filter_map(|sub| match sub.dock {
+                crate::main_window::Dock::Floating(pos) => Some((sub.window.clone(), pos)),
+                crate::main_window::Dock::Docked(_) => None,
+            })
+            .collect();
+        let alerts: Vec<_> = entry.alerts.iter().map(|a| (a.window.clone(), a.position)).collect();
+
+        self.space
+            .map_element(HutSpaceElement::Window(main_window), area_origin, false);
+        for (window, pos) in floating {
+            self.space.map_element(HutSpaceElement::Window(window), pos, false);
+        }
+        for (window, pos) in alerts {
+            self.space.map_element(HutSpaceElement::Window(window), pos, false);
+        }
+    }
+
     /// The "Terminal" tab's text-label texture and a damage snapshot for
     /// it — reused from the cache (no GPU work) unless `active` differs
     /// from last frame's, matching `render::LabelCache`'s whole point.

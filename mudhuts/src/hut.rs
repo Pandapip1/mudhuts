@@ -246,6 +246,25 @@ impl Hut {
         }
     }
 
+    /// Whether this top-level entry's terminal (vs. its focused ConsoleHut's
+    /// active Main Window) is what's currently effectively shown — the
+    /// same decision `State::showing_terminal_effective` makes for
+    /// whichever entry is focused, generalized so `switcher.rs`'s
+    /// thumbnails (and `render.rs`'s per-entry redraw gate) can make it
+    /// for *any* top-level entry, not just the focused one.
+    pub fn shows_terminal_effective(&self) -> bool {
+        // A genuinely tiled Tile-Hut (2+ panes) always shows every pane's
+        // terminal, regardless of any individual ConsoleHut's own
+        // `showing_terminal` flag — see `render.rs`'s Tile-Hut
+        // compositing and this module's doc on why Main Windows aren't
+        // shown in a tile pane in v1.
+        if matches!(self, Hut::Tile(tile) if tile.children.len() >= 2) {
+            return true;
+        }
+        let hut = self.focused_hut();
+        *hut.showing_terminal || hut.main_window_count() == 0
+    }
+
     /// The ConsoleHut that currently has effective focus, walking down through
     /// whichever child is `active` at each Tab/Tile-Hut level.
     pub fn focused_hut(&self) -> &ConsoleHut {

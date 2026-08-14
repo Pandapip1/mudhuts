@@ -674,21 +674,7 @@ impl State {
     /// should currently be the visible view — `ConsoleHut::showing_terminal`,
     /// but forced true when that ConsoleHut has no Main Windows to toggle to.
     pub fn showing_terminal_effective(&self) -> bool {
-        // A genuinely tiled Tile-Hut (2+ panes) always shows every
-        // pane's terminal, regardless of any individual ConsoleHut's own
-        // `showing_terminal` flag — see `render.rs`'s Tile-Hut
-        // compositing and `village.rs`'s module doc on why Main Windows
-        // aren't shown in a tile pane in v1. Without this, a ConsoleHut that had
-        // toggled to a Main Window before being tiled would report
-        // `false` here while still visually showing its terminal,
-        // desyncing mouse-interaction routing (selection/mouse-reports)
-        // from what's actually on screen.
-        if matches!(self.stack.focused_top_level(), Hut::Tile(tile) if tile.children.len() >= 2)
-        {
-            return true;
-        }
-        let hut = self.stack.focused();
-        *hut.showing_terminal || hut.main_window_count() == 0
+        self.stack.focused_top_level().shows_terminal_effective()
     }
 
     /// Screen-space offset of whichever pane currently has effective
@@ -742,55 +728,18 @@ impl State {
     ///
     /// Composable Hut hierarchy RFC migration step 5 sub-step 2: this used
     /// to rebuild the single global `state.space`; now rebuilds whichever
-    /// ConsoleHut is focused's own `space` instead — every other Hut's
-    /// `space` is simply left as it was (a background ConsoleHut never has
-    /// anything mapped in its own `space` in the first place, so there's
-    /// nothing to unmap there).
+    /// ConsoleHut is focused's own `space` instead. A backgrounded Hut's
+    /// `space` is otherwise left as it was here — `render.rs`'s Alt-Tab-
+    /// popup thumbnail refresh (`refresh_hut_content_thumbnail`) is the
+    /// *other* caller of the underlying `ConsoleHut::sync_main_window_space`,
+    /// syncing a background entry's own `space` only while its thumbnail
+    /// is actually about to be shown.
     pub fn sync_visible_main_window(&mut self) {
         // Computed before taking `hut`'s mutable borrow below — `usable_area`
         // needs `&self` as a whole, which the borrow checker won't allow
         // alongside an active `&mut self.stack` borrow.
         let (area_x, area_y, _, _) = self.usable_area();
-
-        let hut = self.stack.focused_mut();
-        let mapped: Vec<_> = hut.space.elements().cloned().collect();
-        for window in mapped {
-            hut.space.unmap_elem(&window);
-        }
-        if *hut.showing_terminal {
-            return;
-        }
-        let Some(entry) = hut.active_main_window_entry() else {
-            return;
-        };
-        // Cloned out into owned locals before touching `hut.space` again —
-        // `entry` borrows `hut` immutably, which can't coexist with the
-        // `hut.space.map_element` calls below (a mutable borrow of the same
-        // struct) the way it could when `space` was `state`'s own separate
-        // field rather than `ConsoleHut`'s.
-        let main_window = entry.window.clone();
-        let floating: Vec<_> = entry
-            .floating_windows
-            .iter()
-            .filter_map(|sub| match sub.dock {
-                crate::main_window::Dock::Floating(pos) => Some((sub.window.clone(), pos)),
-                crate::main_window::Dock::Docked(_) => None,
-            })
-            .collect();
-        let alerts: Vec<_> = entry.alerts.iter().map(|a| (a.window.clone(), a.position)).collect();
-
-        // Positioned at the usable area's own origin, not literally
-        // (0, 0) — matters once a layer-shell surface reserves part of
-        // the output (e.g. a left-anchored panel) — see
-        // `Self::usable_area`'s doc comment.
-        hut.space
-            .map_element(HutSpaceElement::Window(main_window), (area_x, area_y), false);
-        for (window, pos) in floating {
-            hut.space.map_element(HutSpaceElement::Window(window), pos, false);
-        }
-        for (window, pos) in alerts {
-            hut.space.map_element(HutSpaceElement::Window(window), pos, false);
-        }
+        self.stack.focused_mut().sync_main_window_space((area_x, area_y));
     }
 
     /// Find a window (Main Window, Floating Window, or Alert) by its surface

@@ -1,10 +1,16 @@
 //! The Alt-Tab preview popup: a horizontal strip of thumbnails, one per
-//! ConsoleHut in The Stack, with a highlight border around whichever one is
-//! currently previewed — see the plan's Phase 3.5 notes. Reuses each
-//! ConsoleHut's already-rendered cached texture ([`ConsoleHut::cached_texture`]) scaled
-//! down via an explicit `size` override, rather than a new rendering
-//! pipeline: `TextureRenderElement` composites a texture at whatever
-//! size/location it's given regardless of the texture's native size.
+//! top-level Stack entry, with a highlight border around whichever one is
+//! currently previewed — see the plan's Phase 3.5 notes. Each thumbnail
+//! reuses an already-rendered texture scaled down via an explicit `size`
+//! override, rather than a new rendering pipeline: `TextureRenderElement`
+//! composites a texture at whatever size/location it's given regardless
+//! of the texture's native size. Which texture depends on what that entry
+//! is actually showing (`Hut::shows_terminal_effective`): its terminal
+//! ([`ConsoleHut::cached_texture`]) or, for a Main Window instead,
+//! `render.rs`'s per-entry `hut_thumbnail_texture` cache (refreshed by
+//! `build_frame_elements`'s `is_previewing()` gate — see
+//! `refresh_hut_content_thumbnail`'s doc comment for why that needs to be
+//! its own step rather than reusing `ConsoleHut::cached_texture`).
 
 use smithay::backend::renderer::{Renderer, Texture};
 use smithay::backend::renderer::element::Kind;
@@ -56,26 +62,38 @@ pub fn build(stack: &MruStackHut, output_size: (i32, i32), renderer: &GlesRender
     let preview_index = stack.preview_index();
     let mut elements = Vec::new();
 
-    for (i, hut) in stack.top_level_huts().enumerate() {
+    for (i, entry) in stack.top_level_entries().enumerate() {
         let x = panel_x + padding + i as i32 * (thumb_w + gap);
         let y = panel_y + padding;
+        let console = entry.focused_hut();
 
-        if let Some(texture) = hut.cached_texture() {
+        // Whatever this entry is actually showing — its terminal, or (for
+        // a Main Window instead) `render.rs`'s per-entry cache, falling
+        // back to the terminal texture if that cache hasn't been
+        // refreshed yet (e.g. this exact frame's offscreen render
+        // failed) — see this module's doc comment.
+        let cached = if entry.shows_terminal_effective() {
+            console.cached_texture().map(|texture| (texture, console.element_damage_snapshot()))
+        } else {
+            crate::render::hut_thumbnail_texture(console.id)
+                .or_else(|| console.cached_texture().map(|texture| (texture, console.element_damage_snapshot())))
+        };
+
+        if let Some((texture, damage)) = cached {
             // `size` below is the *destination* size (the thumbnail) —
             // without an explicit `src`, `TextureRenderElement` defaults
             // the source rect to that same override size rather than the
             // texture's real dimensions, so it'd sample only the
             // thumbnail-sized top-left corner of the full-resolution
-            // terminal texture (cropped, not scaled). Pass the real size
+            // texture (cropped, not scaled). Pass the real size
             // explicitly so `size` is free to scale independently.
             let src = Rectangle::<f64, Logical>::from_size(Size::from((
                 texture.width() as f64,
                 texture.height() as f64,
             )));
             // `from_texture_with_damage`, not `from_static_texture` — this
-            // wraps the same ever-changing terminal content as the main
-            // render element (see `ConsoleHut::damage_tracker`'s doc comment),
-            // just scaled down.
+            // wraps ever-changing content (a terminal, or a live Main
+            // Window), just scaled down.
             //
             // The *base* (unscaled) `THUMB_SIZE`, not `thumb_w`/`thumb_h`
             // above — this `size` is a `Logical` destination override, and
@@ -89,7 +107,7 @@ pub fn build(stack: &MruStackHut, output_size: (i32, i32), renderer: &GlesRender
             // literally, unlike `size`.
             let thumb_size = Size::from(THUMB_SIZE);
             let element = TextureRenderElement::from_texture_with_damage(
-                hut.thumbnail_id.clone(),
+                console.thumbnail_id.clone(),
                 renderer.context_id(),
                 (x as f64, y as f64),
                 texture,
@@ -99,7 +117,7 @@ pub fn build(stack: &MruStackHut, output_size: (i32, i32), renderer: &GlesRender
                 Some(src),
                 Some(thumb_size),
                 None,
-                hut.element_damage_snapshot(),
+                damage,
                 Kind::Unspecified,
             );
             elements.push(Element::from(element));
@@ -111,7 +129,7 @@ pub fn build(stack: &MruStackHut, output_size: (i32, i32), renderer: &GlesRender
                 Size::from((thumb_w + 2 * highlight_margin, thumb_h + 2 * highlight_margin)),
             );
             let highlight = SolidColorRenderElement::new(
-                hut.thumbnail_highlight_id.clone(),
+                console.thumbnail_highlight_id.clone(),
                 geometry,
                 smithay::backend::renderer::utils::CommitCounter::default(),
                 [0.3, 0.6, 1.0, 1.0],

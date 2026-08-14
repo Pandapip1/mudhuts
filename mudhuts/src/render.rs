@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use smithay::backend::allocator::Fourcc;
@@ -17,6 +18,7 @@ use smithay::output::Output;
 use smithay::utils::{Buffer, Rectangle, Scale, Transform};
 
 use crate::State;
+use crate::console_hut::ConsoleHut;
 use crate::hut::Hut;
 use crate::space_element::{CompositedTexture, HutSpaceElement, HutSpaceRenderElement, synthetic_output};
 use crate::{chrome, docks, switcher, village_chrome};
@@ -289,6 +291,134 @@ struct NormalContentTarget {
     scale: f64,
 }
 
+/// One entry's own persistent copy of [`NormalContentTarget`]'s idea —
+/// same shape, same staleness-check pattern — but keyed by
+/// `ConsoleHut::id` instead of being a single unkeyed slot, so a
+/// *backgrounded* top-level Stack entry that's showing a Main Window can
+/// have its own last-known content cached too (`NormalContentTarget`
+/// itself only ever holds the *focused* entry's content — see
+/// `refresh_hut_content_thumbnail`'s doc comment for why this can't just
+/// clone that one instead). Real output resolution, not thumbnail-sized —
+/// same reason `composite_normal_content`'s own doc comment gives:
+/// `space_render_elements`' output uses real-output-absolute coordinates,
+/// so a smaller canvas would just show a cropped corner, not a scaled-
+/// down view. `switcher.rs` is the one that scales it down for display,
+/// the same way it already does for `ConsoleHut::cached_texture`'s
+/// terminal texture.
+struct HutContentTarget {
+    #[allow(dead_code)]
+    output: Output,
+    texture: GlesTexture,
+    tracker: OutputDamageTracker,
+    size: (i32, i32),
+    scale: f64,
+}
+
+thread_local! {
+    static HUT_CONTENT: RefCell<HashMap<u64, HutContentTarget>> = RefCell::new(HashMap::new());
+}
+
+thread_local! {
+    /// Real, persistent per-id damage tracking for [`HUT_CONTENT`]'s
+    /// entries — same reasoning as [`with_normal_content_damage`]: a fresh
+    /// `DamageBag` reports commit `0` every single call, and since each
+    /// entry's `Id` (`ConsoleHut::thumbnail_id`) is stable across frames, the
+    /// outer per-element damage tracker would see "commit 0 now, commit 0
+    /// last time" after the first frame and stop repainting it — must keep
+    /// advancing across calls, not be rebuilt alongside [`HutContentTarget`]
+    /// on a staleness reset.
+    static HUT_CONTENT_DAMAGE: RefCell<HashMap<u64, DamageBag<i32, Buffer>>> = RefCell::new(HashMap::new());
+}
+
+/// Refreshes `hut`'s entry in the per-id thumbnail cache with its current
+/// Main-Window-mode content — the *only* place that cache is written, and
+/// only ever called while the Alt-Tab popup is actually open
+/// (`build_frame_elements`'s `is_previewing()` gate), mirroring the
+/// existing per-entry terminal-redraw loop right next to it: nothing here
+/// runs on a frame nobody's previewing.
+///
+/// Syncs `hut`'s own `space` first (`ConsoleHut::sync_main_window_space`)
+/// — a backgrounded entry's `space` isn't otherwise kept in sync with its
+/// Main Window at all (see this function's call site's doc comment) — then
+/// renders it the same way `content_elements`'s own Main-Window branch
+/// does, into this entry's own persistent [`HutContentTarget`] rather than
+/// the single shared one `composite_normal_content` uses: that one gets
+/// re-rendered into on every frame regardless of which Hut is focused, so
+/// cloning its texture handle into a per-entry cache would alias — every
+/// "cached" entry would silently show whatever's currently focused, not a
+/// real snapshot of its own content.
+fn refresh_hut_content_thumbnail(
+    hut: &mut ConsoleHut,
+    renderer: &mut GlesRenderer,
+    area_origin: (i32, i32),
+    size: (i32, i32),
+    scale: f64,
+) {
+    if size.0 <= 0 || size.1 <= 0 {
+        return;
+    }
+    hut.sync_main_window_space(area_origin);
+    let elements = match space_render_elements::<_, HutSpaceElement, _>(renderer, [&hut.space], &hut.space_output, 1.0) {
+        Ok(elements) => elements,
+        Err(err) => {
+            tracing::warn!("failed to collect space elements for Alt-Tab thumbnail: {err}");
+            return;
+        }
+    };
+    let buffer_size: smithay::utils::Size<i32, Buffer> = size.into();
+    let id = hut.id;
+
+    HUT_CONTENT.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        let stale = !matches!(cache.get(&id), Some(t) if t.size == size && t.scale == scale);
+        if stale {
+            let output = synthetic_output("hut-content-thumbnail", size, scale);
+            let Ok(texture) = Offscreen::<GlesTexture>::create_buffer(renderer, Fourcc::Argb8888, buffer_size)
+                .inspect_err(|err| tracing::warn!("failed to create offscreen buffer for a Hut thumbnail: {err}"))
+            else {
+                return;
+            };
+            let tracker = OutputDamageTracker::from_output(&output);
+            cache.insert(id, HutContentTarget { output, texture, tracker, size, scale });
+        }
+        let Some(target) = cache.get_mut(&id) else { return };
+
+        let Ok(mut bound) = renderer
+            .bind(&mut target.texture)
+            .inspect_err(|err| tracing::warn!("failed to bind offscreen buffer for a Hut thumbnail: {err}"))
+        else {
+            return;
+        };
+        if let Err(err) = target
+            .tracker
+            .render_output(renderer, &mut bound, 0, &elements, [0.0, 0.0, 0.0, 0.0])
+        {
+            tracing::warn!("failed to render a Hut thumbnail offscreen: {err}");
+        }
+    });
+}
+
+/// The texture+damage pair [`refresh_hut_content_thumbnail`] last cached
+/// for `id`, if any — `None` for a Hut that's never had its thumbnail
+/// refreshed yet (never previewed while showing a Main Window). Marks the
+/// whole buffer damaged unconditionally on every call, same justification
+/// `composite_normal_content`'s own snapshot has: this only ever runs
+/// during an already-demand-driven redraw pass to begin with.
+pub(crate) fn hut_thumbnail_texture(id: u64) -> Option<(GlesTexture, DamageSnapshot<i32, Buffer>)> {
+    HUT_CONTENT.with(|cell| {
+        let cache = cell.borrow();
+        let target = cache.get(&id)?;
+        let buffer_size: smithay::utils::Size<i32, Buffer> = target.size.into();
+        let snapshot = HUT_CONTENT_DAMAGE.with(|damage| {
+            let mut damage = damage.borrow_mut();
+            let bag = damage.entry(id).or_default();
+            bag.add([Rectangle::from_size(buffer_size)]);
+            bag.snapshot()
+        });
+        Some((target.texture.clone(), snapshot))
+    })
+}
+
 /// Whichever content this tick's focused view actually shows — a
 /// Tile-Hut's panes, the terminal, or the focused Console Hut's own
 /// `space` — built the same way each of `build_frame_elements`'s three
@@ -558,6 +688,19 @@ pub fn build_frame_elements(
     if state.stack.is_previewing() {
         for hut in state.stack.top_level_huts_mut() {
             hut.redraw(renderer);
+        }
+        // Same "only while previewing" gate, for entries showing a Main
+        // Window instead of their terminal — see
+        // `refresh_hut_content_thumbnail`'s doc comment on why this needs
+        // its own step (a background entry's `space` isn't otherwise kept
+        // in sync at all, and its content isn't cheap to get from
+        // anywhere else the way `ConsoleHut::redraw`'s terminal texture
+        // already is).
+        let (area_x, area_y, _, _) = state.usable_area();
+        for entry in state.stack.top_level_entries_mut() {
+            if !entry.shows_terminal_effective() {
+                refresh_hut_content_thumbnail(entry.focused_hut_mut(), renderer, (area_x, area_y), size, scale);
+            }
         }
     }
 
