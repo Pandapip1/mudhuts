@@ -8,6 +8,7 @@ mod console_hut;
 mod input;
 mod keybindings;
 mod main_window;
+mod malloc;
 mod ownership;
 mod redraw;
 mod render;
@@ -26,6 +27,9 @@ use smithay::reexports::wayland_server::Display;
 pub use state::State;
 
 fn main() -> std::process::ExitCode {
+    // Must run before anything else has a chance to allocate — see
+    // `malloc`'s module doc.
+    malloc::limit_mmap_threshold(128 * 1024);
     init_logging();
 
     // Routed through `tracing::error!` (not the default `Termination`

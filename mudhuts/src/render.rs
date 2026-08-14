@@ -538,7 +538,10 @@ pub fn build_frame_elements(
     // requires this before it can even tell the client the lock
     // succeeded.
     if state.locked {
-        return lock_screen_elements(state, renderer, size);
+        let elements = lock_screen_elements(state, renderer, size);
+        // See the matching call at this function's other exit point below.
+        crate::malloc::trim(0);
+        return elements;
     }
 
     let show_terminal = state.showing_terminal_effective();
@@ -635,6 +638,12 @@ pub fn build_frame_elements(
             Err(err) => tracing::warn!("failed to collect root space elements: {err}"),
         }
     }
+
+    // Once per render pass, after the pass has actually done its
+    // allocating — see `malloc`'s module doc for why a fixed cadence tied
+    // to real work (mirroring COSMIC's own `App::view`/`App::update` call
+    // sites) matters here, not just calling this occasionally.
+    crate::malloc::trim(0);
 
     elements
 }
