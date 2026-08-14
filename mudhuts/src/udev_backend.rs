@@ -54,12 +54,12 @@
 //! renderer.
 //!
 //! Rendering is demand-driven, same principle as `winit_backend.rs`'s use
-//! of `redraw_ping`/`request_redraw()`: nothing here polls on a timer.
-//! `redraw_ping_source` fires `render_surface` for every known crtc
-//! whenever shared code calls `State::request_redraw()` (PTY output, a
-//! keypress, a client commit, etc.) — but a render attempt only actually
-//! submits a new atomic commit if `render_frame` finds real damage *and*
-//! no previous commit for that crtc is still in flight
+//! of `redraw_ping`/`request_redraw()`: nothing here polls on a timer to
+//! *drive rendering*. `redraw_ping_source` fires `render_surface` for
+//! every known crtc whenever shared code calls `State::request_redraw()`
+//! (PTY output, a keypress, a client commit, etc.) — but a render attempt
+//! only actually submits a new atomic commit if `render_frame` finds real
+//! damage *and* no previous commit for that crtc is still in flight
 //! (`SurfaceData::frame_pending`); a ping that arrives mid-flight is a
 //! no-op, since the already-queued commit's eventual `DrmEvent::VBlank`
 //! will call `frame_finish` -> `render_surface` again once it lands,
@@ -71,10 +71,34 @@
 //! `DrmCompositor` doesn't support. It also means this backend is VRR-
 //! transparent for free: a new frame goes out as soon as one is both
 //! ready and safe to submit, gated only by real vblank completion, not by
-//! a fixed wall-clock interval — if Asahi's DRM driver exposes adaptive
-//! sync on a given connector (untested; not verified either way), the
-//! kernel decides how soon that next vblank actually is, and nothing
-//! about this render-triggering logic needs to change either way.
+//! a fixed wall-clock interval — if a given connector is genuinely
+//! VRR-capable, the kernel decides how soon that next vblank actually is,
+//! and nothing about this render-triggering logic needs to change either
+//! way.
+//!
+//! ## Adaptive refresh rate for non-VRR connectors
+//!
+//! The one genuine timer in this module: every real `VRR_CAPABLE`-`false`
+//! connector's own available modes at its current resolution are sampled
+//! once a second (`ADAPTIVE_REFRESH_CHECK_INTERVAL`) against how many real
+//! frames it actually queued in that second, and switched — via the
+//! low-level `DrmOutput::use_mode` (a pending-mode write, only actually
+//! applied to hardware by the *next* real `render_frame`/`queue_frame`
+//! cycle, which `check_adaptive_refresh` pings for) — to whichever
+//! available mode most closely matches: the smallest mode whose refresh
+//! covers the observed rate while content is actually updating, or the
+//! connector's own minimum available refresh once it's been quiet for
+//! several checks in a row (hysteresis against flickering the mode
+//! between a fast rate and idle on every brief pause). A real DRM
+//! modeset is visibly disruptive (a defined KMS property, not something
+//! Smithay works around) even at the same resolution, which is why this
+//! polls on a coarse 1-second cadence with idle hysteresis rather than
+//! reacting to every single frame — nothing about *rendering itself* is
+//! timer-driven, only this one refresh-rate decision. Skipped entirely
+//! for a `VRR_CAPABLE` connector (real adaptive sync, once enabled, is
+//! strictly better than mode-hopping) or one whose EDID only exposes a
+//! single refresh rate at its resolution — see `connector_connected`'s
+//! `AdaptiveRefresh` setup.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -102,8 +126,9 @@ use smithay::backend::udev::{self, UdevBackend, UdevEvent};
 use smithay::input::pointer::{CursorIcon, CursorImageAttributes, CursorImageStatus};
 use smithay::output::{Mode as WlMode, Output, PhysicalProperties, Scale as OutputScale};
 use smithay::reexports::calloop::ping::PingSource;
+use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{EventLoop, LoopHandle};
-use smithay::reexports::drm::control::{Device as _, ModeTypeFlags, connector, crtc};
+use smithay::reexports::drm::control::{Device as _, Mode as DrmMode, ModeTypeFlags, connector, crtc};
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_protocols_wlr::gamma_control::v1::server::zwlr_gamma_control_manager_v1::{
@@ -159,6 +184,36 @@ struct SurfaceData {
     /// `.failed()` rather than displacing the first (see
     /// `get_gamma_control`).
     gamma_control_bound: bool,
+    /// `None` for a `VRR_CAPABLE` connector, or one whose EDID only
+    /// exposes a single refresh rate at its current resolution — see the
+    /// module doc's "Adaptive refresh rate" section and
+    /// `connector_connected`'s own setup of this field.
+    adaptive_refresh: Option<AdaptiveRefresh>,
+}
+
+/// Per-connector adaptive-refresh-rate state — see the module doc's
+/// "Adaptive refresh rate for non-VRR connectors" section.
+struct AdaptiveRefresh {
+    /// Every mode this connector offers at its current resolution,
+    /// ascending by refresh rate — what `check_adaptive_refresh` chooses
+    /// from. Always at least 2 entries (a single-mode connector gets
+    /// `SurfaceData::adaptive_refresh = None` instead, at construction).
+    modes: Vec<DrmMode>,
+    /// Index into `modes` of whichever one is currently actually in use
+    /// (kept in sync by `check_adaptive_refresh` after a successful
+    /// `use_mode`, not read back from the hardware every check).
+    current: usize,
+    /// Real frames this crtc has queued (`render_surface`'s own
+    /// `queue_frame` success, not every render attempt) since the last
+    /// `check_adaptive_refresh` tick — an approximate "content updates
+    /// per second" sample, reset every tick.
+    frames_since_check: u32,
+    /// Consecutive `check_adaptive_refresh` ticks with zero queued
+    /// frames — only actually steps down to the minimum available
+    /// refresh once this reaches `ADAPTIVE_REFRESH_IDLE_TICKS`, so a
+    /// brief pause mid-typing doesn't flicker the mode; reset to `0` the
+    /// moment any frame lands.
+    idle_ticks: u32,
 }
 
 /// `pub(crate)` (not module-private) solely so `state.rs` can name this
@@ -447,6 +502,20 @@ pub fn init_udev(
             .map_err(|err| format!("failed to register the redraw ping source: {err}"))?;
     }
 
+    // Adaptive refresh rate for non-VRR connectors — see the module doc's
+    // own section. The one genuine timer in this backend; everything else
+    // is purely event-driven (see the module doc's opening paragraphs).
+    {
+        let inner = inner.clone();
+        event_loop
+            .handle()
+            .insert_source(Timer::from_duration(ADAPTIVE_REFRESH_CHECK_INTERVAL), move |_, _, state| {
+                check_adaptive_refresh(state, &inner);
+                TimeoutAction::ToDuration(ADAPTIVE_REFRESH_CHECK_INTERVAL)
+            })
+            .map_err(|err| format!("failed to register the adaptive-refresh-rate timer: {err}"))?;
+    }
+
     // Session pause/resume (VT switch away/back).
     {
         let inner = inner.clone();
@@ -634,6 +703,30 @@ fn detect_output_scale(phys_size_mm: (i32, i32), pixels: (i32, i32)) -> f64 {
     if dpi >= 192.0 { 2.0 } else { 1.0 }
 }
 
+/// Look up `connector`'s own boolean-typed DRM property named `name` —
+/// `false` if the property doesn't exist, isn't boolean, or the query
+/// itself fails, matching every other "no this connector doesn't have
+/// this driver/EDID-derived signal" fallback in this module. Shared by
+/// the DRM-leasing `non-desktop` check and the adaptive-refresh-rate
+/// `VRR_CAPABLE` check (see the module doc's respective sections) — same
+/// property-enumeration shape, just a different property name.
+fn connector_bool_property(drm_device: &DrmDevice, connector: connector::Handle, name: &str) -> bool {
+    drm_device
+        .get_properties(connector)
+        .ok()
+        .and_then(|props| {
+            let (info, value) = props
+                .into_iter()
+                .filter_map(|(handle, value)| {
+                    let info = drm_device.get_property(handle).ok()?;
+                    Some((info, value))
+                })
+                .find(|(info, _)| info.name().to_str() == Ok(name))?;
+            info.value_type().convert_value(value).as_boolean()
+        })
+        .unwrap_or(false)
+}
+
 fn connector_connected(
     state: &mut State,
     inner: &Rc<RefCell<Inner>>,
@@ -650,20 +743,7 @@ fn connector_connected(
     let is_leasable = {
         let inner_ref = inner.borrow();
         let drm_device = inner_ref.drm_output_manager.device();
-        let non_desktop = drm_device
-            .get_properties(connector.handle())
-            .ok()
-            .and_then(|props| {
-                let (info, value) = props
-                    .into_iter()
-                    .filter_map(|(handle, value)| {
-                        let info = drm_device.get_property(handle).ok()?;
-                        Some((info, value))
-                    })
-                    .find(|(info, _)| info.name().to_str() == Ok("non-desktop"))?;
-                info.value_type().convert_value(value).as_boolean()
-            })
-            .unwrap_or(false);
+        let non_desktop = connector_bool_property(drm_device, connector.handle(), "non-desktop");
         // Defense-in-depth: `non-desktop` alone depends on driver/EDID
         // correctness, and the built-in panel must never be leasable
         // regardless — see the module doc.
@@ -699,6 +779,41 @@ fn connector_connected(
         return;
     };
     let wl_mode = WlMode::from(drm_mode);
+
+    // See the module doc's "Adaptive refresh rate" section. `None` for a
+    // real `VRR_CAPABLE` connector (real adaptive sync beats mode-hopping
+    // once enabled — not attempted here, this only chooses between fixed
+    // rates) or one whose EDID only actually offers a single refresh rate
+    // at this resolution (nothing to adapt between).
+    let adaptive_refresh = {
+        let inner_ref = inner.borrow();
+        let drm_device = inner_ref.drm_output_manager.device();
+        let vrr_capable = connector_bool_property(drm_device, connector.handle(), "vrr_capable");
+        drop(inner_ref);
+        if vrr_capable {
+            None
+        } else {
+            let mut modes: Vec<DrmMode> =
+                connector.modes().iter().copied().filter(|m| m.size() == drm_mode.size()).collect();
+            modes.sort_by_key(|m| WlMode::from(*m).refresh);
+            modes.dedup_by_key(|m| WlMode::from(*m).refresh);
+            if modes.len() < 2 {
+                None
+            } else {
+                // Wherever the preferred mode we just picked above landed
+                // in the sorted list — falls back to the highest available
+                // rate if that exact refresh somehow isn't in the
+                // deduped list (shouldn't happen: `drm_mode` is itself one
+                // of `connector.modes()`), matching a defensible default
+                // rather than panicking on a driver quirk.
+                let current = modes
+                    .iter()
+                    .position(|m| WlMode::from(*m).refresh == wl_mode.refresh)
+                    .unwrap_or(modes.len() - 1);
+                Some(AdaptiveRefresh { modes, current, frames_since_check: 0, idle_ticks: 0 })
+            }
+        }
+    };
 
     let (phys_w, phys_h) = connector.size().unwrap_or((0, 0));
     let scale = detect_output_scale((phys_w as i32, phys_h as i32), (wl_mode.size.w, wl_mode.size.h));
@@ -825,6 +940,7 @@ fn connector_connected(
             drm_output,
             frame_pending: false,
             gamma_control_bound: false,
+            adaptive_refresh,
         },
     );
 
@@ -996,6 +1112,13 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
                 match surface.drm_output.queue_frame(()) {
                     Ok(()) => {
                         surface.frame_pending = true;
+                        // A real, presented frame — see the module doc's
+                        // "Adaptive refresh rate" section: this is exactly
+                        // the "content actually updated" signal
+                        // `check_adaptive_refresh` samples once a second.
+                        if let Some(adaptive) = surface.adaptive_refresh.as_mut() {
+                            adaptive.frames_since_check += 1;
+                        }
                         // Only now — a locked frame has actually been
                         // built (via `render.rs`'s early-return guard) and
                         // successfully queued for real presentation — is
@@ -1048,6 +1171,138 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
     // separate internal tracking Vecs, so those need this periodic sweep too.
     state.image_copy_capture_state.cleanup();
     let _ = state.display_handle.flush_clients();
+}
+
+/// How often [`check_adaptive_refresh`] samples real queued-frame counts
+/// — see the module doc's "Adaptive refresh rate" section for why this
+/// is a coarse, timer-driven check rather than a per-frame decision.
+const ADAPTIVE_REFRESH_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Consecutive zero-frame ticks required before dropping to the minimum
+/// available refresh rate — hysteresis against flickering the mode on
+/// every brief pause (reading a line of text, thinking mid-sentence,
+/// ...). Ramping *up* to match faster content has no equivalent delay:
+/// responsiveness matters more there than avoiding one extra switch, and
+/// the very next real frame naturally corrects an over-eager upshift by
+/// simply not needing another one.
+const ADAPTIVE_REFRESH_IDLE_TICKS: u32 = 3;
+
+/// Pure decision logic behind [`check_adaptive_refresh`], factored out so
+/// it's unit-testable against plain refresh-rate numbers — real
+/// `DrmMode`/`connector::Handle` values are FFI-backed with no public
+/// constructor, so the surrounding function itself can't run outside a
+/// real DRM device. `modes_hz` must be non-empty and sorted ascending
+/// (`connector_connected`'s own `AdaptiveRefresh` construction already
+/// guarantees this). Mutates `idle_ticks` in place — the same per-tick
+/// bookkeeping `check_adaptive_refresh` itself needs regardless of
+/// whether a switch actually happens this tick. Returns `None` if the
+/// current mode should stay as-is (already matches the target, or an
+/// idle drop hasn't been quiet for long enough yet), `Some(new_index)`
+/// otherwise.
+fn adaptive_refresh_target(
+    modes_hz: &[u32],
+    current: usize,
+    observed_fps: u32,
+    idle_ticks: &mut u32,
+) -> Option<usize> {
+    let target = if observed_fps == 0 {
+        *idle_ticks = idle_ticks.saturating_add(1);
+        if *idle_ticks < ADAPTIVE_REFRESH_IDLE_TICKS {
+            // Not idle long enough yet — leave the current mode alone
+            // rather than dropping on the very first quiet tick.
+            return None;
+        }
+        0
+    } else {
+        *idle_ticks = 0;
+        // The smallest available mode whose own refresh rate still
+        // covers what content actually asked for this past second,
+        // capped at the connector's own fastest available mode if
+        // content is updating even faster than that.
+        modes_hz.iter().position(|&hz| hz >= observed_fps).unwrap_or(modes_hz.len() - 1)
+    };
+    (target != current).then_some(target)
+}
+
+/// The one timer-driven check in this backend — see the module doc's
+/// "Adaptive refresh rate for non-VRR connectors" section for the full
+/// design. For every crtc with real `AdaptiveRefresh` state (`None` for a
+/// `VRR_CAPABLE` connector or a single-refresh-rate one — see
+/// `connector_connected`'s setup), reads and resets this tick's
+/// `frames_since_check`, decides a target mode, and — only if that
+/// target actually differs from the mode already in use — calls
+/// `DrmOutput::use_mode` (a *pending* write; only actually applied to the
+/// display by the next real `render_frame`/`queue_frame` cycle, which
+/// this function pings for via `State::request_redraw` once at the end,
+/// covering every crtc that switched in this same tick with one ping).
+fn check_adaptive_refresh(state: &mut State, inner: &Rc<RefCell<Inner>>) {
+    let crtcs: Vec<crtc::Handle> = inner.borrow().surfaces.keys().copied().collect();
+    let mut any_switched = false;
+
+    for crtc in crtcs {
+        let mut inner_mut = inner.borrow_mut();
+        let Inner { renderer, surfaces, .. } = &mut *inner_mut;
+        let Some(surface) = surfaces.get_mut(&crtc) else {
+            continue;
+        };
+        let Some(adaptive) = surface.adaptive_refresh.as_mut() else {
+            continue;
+        };
+
+        let observed_fps = adaptive.frames_since_check;
+        adaptive.frames_since_check = 0;
+
+        let modes_hz: Vec<u32> = adaptive.modes.iter().map(refresh_hz).collect();
+        let Some(target) =
+            adaptive_refresh_target(&modes_hz, adaptive.current, observed_fps, &mut adaptive.idle_ticks)
+        else {
+            continue;
+        };
+        let new_mode = adaptive.modes[target];
+
+        let mut renderer_guard = renderer.borrow_mut();
+        let result = surface.drm_output.use_mode::<GlesRenderer, Elements>(
+            new_mode,
+            &mut renderer_guard,
+            &DrmOutputRenderElements::default(),
+        );
+        drop(renderer_guard);
+        match result {
+            Ok(()) => {
+                // Smithay/client-facing bookkeeping — see the module
+                // doc's own section on why this is a *separate* call from
+                // `use_mode` above (nothing links the two automatically).
+                surface.output.change_current_state(Some(WlMode::from(new_mode)), None, None, None);
+                if let Some(adaptive) = surface.adaptive_refresh.as_mut() {
+                    adaptive.current = target;
+                }
+                tracing::info!(
+                    "adaptive refresh: {crtc:?} switching to {}Hz (observed {observed_fps} real frame(s) last second)",
+                    refresh_hz(&new_mode),
+                );
+                any_switched = true;
+            }
+            Err(err) => {
+                tracing::warn!("adaptive refresh: failed to switch {crtc:?} to a new mode: {err}");
+            }
+        }
+    }
+
+    if any_switched {
+        state.request_redraw();
+    }
+}
+
+/// A `drm::control::Mode`'s own refresh rate, in whole Hz — rounded from
+/// [`WlMode::from`]'s millihertz (see its own doc comment for the exact
+/// conversion, which accounts for interlace/doublescan/vscan rather than
+/// reading a raw field). Whole Hz, not millihertz, since
+/// `AdaptiveRefresh::frames_since_check` is itself only ever an
+/// integer-frames-per-second-ish sample — matching precision to what the
+/// input signal actually supports rather than a false sense of
+/// sub-hertz accuracy.
+fn refresh_hz(mode: &DrmMode) -> u32 {
+    (WlMode::from(*mode).refresh as f64 / 1000.0).round().max(0.0) as u32
 }
 
 /// Build this frame's cursor render element(s) at `state.pointer_location`
@@ -1510,4 +1765,63 @@ fn apply_gamma(state: &mut State, active: &ActiveGammaControl, fd: OwnedFd) -> R
         .device()
         .set_gamma(active.crtc, red, green, blue)
         .map_err(|err| format!("set_gamma ioctl failed: {err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn picks_the_smallest_mode_covering_the_observed_rate() {
+        let modes = [48, 60, 90, 120];
+        let mut idle_ticks = 0;
+        assert_eq!(adaptive_refresh_target(&modes, 0, 55, &mut idle_ticks), Some(1));
+        assert_eq!(idle_ticks, 0);
+    }
+
+    #[test]
+    fn caps_at_the_fastest_available_mode() {
+        let modes = [48, 60, 90, 120];
+        let mut idle_ticks = 0;
+        assert_eq!(adaptive_refresh_target(&modes, 0, 240, &mut idle_ticks), Some(3));
+    }
+
+    #[test]
+    fn already_at_the_right_mode_is_a_no_op() {
+        let modes = [48, 60, 90, 120];
+        let mut idle_ticks = 0;
+        assert_eq!(adaptive_refresh_target(&modes, 1, 55, &mut idle_ticks), None);
+    }
+
+    #[test]
+    fn a_single_quiet_tick_does_not_drop_to_minimum_yet() {
+        let modes = [48, 60, 90, 120];
+        let mut idle_ticks = 0;
+        assert_eq!(adaptive_refresh_target(&modes, 3, 0, &mut idle_ticks), None);
+        assert_eq!(idle_ticks, 1);
+        assert_eq!(adaptive_refresh_target(&modes, 3, 0, &mut idle_ticks), None);
+        assert_eq!(idle_ticks, 2);
+    }
+
+    #[test]
+    fn drops_to_the_minimum_mode_after_enough_consecutive_quiet_ticks() {
+        let modes = [48, 60, 90, 120];
+        let mut idle_ticks = ADAPTIVE_REFRESH_IDLE_TICKS - 1;
+        assert_eq!(adaptive_refresh_target(&modes, 3, 0, &mut idle_ticks), Some(0));
+    }
+
+    #[test]
+    fn already_at_the_minimum_mode_while_idle_is_a_no_op() {
+        let modes = [48, 60, 90, 120];
+        let mut idle_ticks = ADAPTIVE_REFRESH_IDLE_TICKS - 1;
+        assert_eq!(adaptive_refresh_target(&modes, 0, 0, &mut idle_ticks), None);
+    }
+
+    #[test]
+    fn any_real_frame_immediately_resets_the_idle_counter() {
+        let modes = [48, 60, 90, 120];
+        let mut idle_ticks = ADAPTIVE_REFRESH_IDLE_TICKS - 1;
+        adaptive_refresh_target(&modes, 0, 60, &mut idle_ticks);
+        assert_eq!(idle_ticks, 0);
+    }
 }
