@@ -23,6 +23,9 @@
 // graph.
 #![allow(dead_code)]
 
+use smithay::backend::renderer::gles::GlesRenderer;
+
+use crate::console_hut::ConsoleHut;
 use crate::graph::{Graph, InputPort, Node, NodeId, OutputPort, PortKind, PortValue, RenderedContent};
 use crate::hut::{Axis, Direction, wrapping_step};
 use crate::redraw::{Redrawable, RedrawHandle, Signal};
@@ -150,6 +153,117 @@ impl Redrawable for TileNode {
     }
 }
 
+/// The real compositor's `Graph` environment (migration step 3, per the
+/// RFC's "Why `Graph<Env>`" section in `graph.rs`) — whatever a
+/// render-shaped node needs beyond the graph itself. Just a renderer for
+/// now; grows if a later node type needs more (nothing here yet does).
+pub struct RenderEnv<'a> {
+    pub renderer: &'a mut GlesRenderer,
+}
+
+const LEAF_OUTPUTS: &[OutputPort] = &[OutputPort { name: "content", kind: PortKind::Content }];
+
+/// Graph-native Console/Terminal leaf — wraps a real [`ConsoleHut`],
+/// producing real rendered content by calling straight into
+/// `ConsoleHut::redraw` from inside its own `resolve`. No inputs (a
+/// leaf); one `content: Content` output. Only implements `Node` for
+/// `RenderEnv<'_>` specifically (not generic over every `Env` the way
+/// `TabNode`/`TileNode` are) — it genuinely needs a real renderer,
+/// unlike a purely structural node.
+pub struct ConsoleNode {
+    pub hut: ConsoleHut,
+}
+
+impl ConsoleNode {
+    pub fn new(hut: ConsoleHut) -> Self {
+        Self { hut }
+    }
+}
+
+impl<'a> Node<RenderEnv<'a>> for ConsoleNode {
+    fn inputs(&self) -> &[InputPort] {
+        &[]
+    }
+    fn outputs(&self) -> &[OutputPort] {
+        LEAF_OUTPUTS
+    }
+    fn resolve(&mut self, graph: &mut Graph<RenderEnv<'a>>, _self_id: NodeId, _port: &'static str) -> PortValue {
+        let texture = self.hut.redraw(graph.env.renderer);
+        let damage = self.hut.element_damage_snapshot();
+        PortValue::Content(RenderedContent { texture, damage: Some(damage) })
+    }
+}
+
+impl Redrawable for ConsoleNode {
+    fn attach_redraw_handle(&mut self, handle: RedrawHandle) {
+        self.hut.attach_redraw_handle(handle);
+    }
+}
+
+const CLIENT_INPUTS: &[InputPort] = &[InputPort { name: "terminal", kind: PortKind::Hut }];
+
+/// Graph-native Wayland-client Hut: a single client toplevel window,
+/// linked to its owning terminal via a `terminal: Hut` reference input
+/// — the RFC's chosen **real content flow** design (not a bare ownership
+/// tag): while `showing_terminal` is set, this node's own `content`
+/// output is a *live* pass-through to whatever its linked terminal is
+/// currently showing, re-resolved fresh through the graph every call
+/// (via `Graph::resolve_output`, which is itself memoized per frame —
+/// see that method's doc comment — so this costs nothing extra within
+/// one frame), never a stale cached copy.
+///
+/// Real client-surface rendering (compositing the actual `Window`'s own
+/// buffer via `Space<HutSpaceElement>`, today's `main_window.rs`'s and
+/// `ConsoleHut::sync_main_window_space`'s role) is deliberately not
+/// built here yet — it's entangled with migration step 4's larger
+/// cutover of the real render pipeline (`render.rs::content_elements`'s
+/// existing Main-Window branch is the thing that would actually need
+/// reworking, not something separable ahead of that step). What's real
+/// and tested here is the pass-through mechanism itself: which content
+/// this node reports depends on live upstream graph state through a
+/// real link, not a cached flag copied at construction time.
+pub struct WaylandClientNode {
+    pub showing_terminal: Signal<bool>,
+}
+
+impl WaylandClientNode {
+    pub fn new() -> Self {
+        Self { showing_terminal: Signal::new(false) }
+    }
+}
+
+impl Default for WaylandClientNode {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<Env> Node<Env> for WaylandClientNode {
+    fn inputs(&self) -> &[InputPort] {
+        CLIENT_INPUTS
+    }
+    fn outputs(&self) -> &[OutputPort] {
+        LEAF_OUTPUTS
+    }
+    fn resolve(&mut self, graph: &mut Graph<Env>, self_id: NodeId, _port: &'static str) -> PortValue {
+        if *self.showing_terminal
+            && let Some(terminal) = graph.hut_input(self_id, "terminal")
+            && let Some(value) = graph.resolve_output(terminal, "content")
+        {
+            return value;
+        }
+        // Own client-surface content isn't wired up yet — see this
+        // struct's doc comment.
+        PortValue::Content(RenderedContent::default())
+    }
+}
+
+impl Redrawable for WaylandClientNode {
+    fn attach_redraw_handle(&mut self, handle: RedrawHandle) {
+        self.showing_terminal.attach_redraw_handle(handle);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,6 +338,55 @@ mod tests {
         graph.resolve_output(tile_id, "content");
         assert!(a_resolved.get(), "every pane should be resolved, not just one");
         assert!(b_resolved.get(), "every pane should be resolved, not just one");
+    }
+
+    #[test]
+    fn wayland_client_node_passes_through_to_its_linked_terminal_when_toggled() {
+        let mut graph = Graph::new();
+        let (terminal, terminal_resolved) = leaf(&mut graph);
+        let mut client = WaylandClientNode::new();
+        *client.showing_terminal = true;
+        let client_id = graph.add_node(Box::new(client));
+        graph.link_hut(client_id, "terminal", terminal).unwrap();
+
+        graph.begin_frame();
+        graph.resolve_output(client_id, "content");
+        assert!(
+            terminal_resolved.get(),
+            "toggled to terminal view, the client node should pass through to its linked terminal"
+        );
+    }
+
+    #[test]
+    fn wayland_client_node_does_not_pass_through_when_not_toggled() {
+        let mut graph = Graph::new();
+        let (terminal, terminal_resolved) = leaf(&mut graph);
+        // `showing_terminal` defaults to `false` — see `WaylandClientNode::new`.
+        let client_id = graph.add_node(Box::new(WaylandClientNode::new()));
+        graph.link_hut(client_id, "terminal", terminal).unwrap();
+
+        graph.begin_frame();
+        graph.resolve_output(client_id, "content");
+        assert!(
+            !terminal_resolved.get(),
+            "not toggled to terminal view, the client node shouldn't touch its linked terminal at all"
+        );
+    }
+
+    #[test]
+    fn wayland_client_node_toggled_but_unlinked_falls_back_to_placeholder_content() {
+        let mut graph = Graph::new();
+        let mut client = WaylandClientNode::new();
+        *client.showing_terminal = true;
+        let client_id = graph.add_node(Box::new(client));
+        // No `link_hut` call at all — e.g. an autostarted app with no
+        // owning terminal (see `ownership.rs`'s module doc).
+
+        graph.begin_frame();
+        assert!(
+            matches!(graph.resolve_output(client_id, "content"), Some(PortValue::Content(_))),
+            "an unlinked terminal input shouldn't panic or fail resolution, just fall back"
+        );
     }
 
     #[test]
