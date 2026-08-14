@@ -700,25 +700,64 @@ fn composite_normal_content(
             .bind(&mut target.texture)
             .inspect_err(|err| tracing::warn!("failed to bind offscreen buffer for normal content: {err}"))
             .ok()?;
-        target
+        // `age = 1`, not `0` — Smithay's own damage-tracker semantics
+        // (`OutputDamageTracker::damage_output_internal`) treat `age == 0`
+        // as "buffer state unknown, redraw everything," unconditionally
+        // reporting the *entire* output geometry as damaged on every
+        // single call regardless of whether any element actually changed
+        // — see this function's own damage-snapshot comment below for why
+        // that made this whole offscreen composite always look "changed."
+        // `1` is correct here specifically because `target.texture` is one
+        // persistently-reused buffer, not a multi-buffer swapchain being
+        // cycled through — its content really is exactly what the
+        // *immediately preceding* call left there, every time.
+        let result = target
             .tracker
-            .render_output(renderer, &mut bound, 0, &elements, [0.0, 0.0, 0.0, 0.0])
+            .render_output(renderer, &mut bound, 1, &elements, [0.0, 0.0, 0.0, 0.0])
             .inspect_err(|err| tracing::warn!("failed to render normal content offscreen: {err}"))
             .ok()?;
+        // The tracker's *own* real per-region damage — `Physical` here is
+        // numerically identical to this offscreen buffer's own pixel grid
+        // (the synthetic output backing `target.tracker` was built with
+        // `mode.size == size == buffer_size`, so no separate buffer-vs-
+        // physical scale factor exists to convert through), so this is a
+        // direct field copy, not a scaled conversion. Collected into an
+        // owned `Vec` *before* `bound`/`result` (which borrows
+        // `target.tracker`) are dropped.
+        let real_damage: Vec<Rectangle<i32, Buffer>> = result
+            .damage
+            .into_iter()
+            .flatten()
+            .map(|r| Rectangle::new((r.loc.x, r.loc.y).into(), (r.size.w, r.size.h).into()))
+            .collect();
         drop(bound);
 
         // A real, persistent damage snapshot — see `with_normal_content_damage`'s
         // doc comment for why a fresh `DamageBag::default()` built right
         // here (an earlier version of this function did exactly that) is
-        // wrong, not just redundant. Unconditionally marking the whole
-        // buffer damaged on every call (rather than tracking finer-grained
-        // damage) is still correct, not just simplest: this function only
-        // ever runs during an actual demand-driven redraw pass to begin
-        // with (Phase 2.6's damage-avoidance discipline lives one level
-        // up, in whatever decided to ping `redraw_ping`), so by the time
-        // it's called, something real already triggered it.
+        // wrong, not just redundant. **Real** damage from the render pass
+        // above, not an unconditional whole-buffer rect — a previous
+        // version of this function always marked the whole buffer damaged
+        // on every call, reasoning that "this function only ever runs
+        // during an actual demand-driven redraw pass, so something real
+        // already triggered it" — true of the *first* call in a chain, but
+        // `DamageBag::add`'s own commit-counter bump on every non-empty
+        // call meant this element's `current_commit()` changed on *every*
+        // single call, so the outer `DrmCompositor` never once saw zero
+        // damage — `render_frame`'s `is_empty` stayed permanently `false`,
+        // `queue_frame` always fired, and `udev_backend.rs::frame_finish`
+        // (which unconditionally re-renders after every completed commit)
+        // chained into the next vblank forever: a genuine infinite
+        // full-vblank-rate redraw loop from the very first frame ever
+        // drawn, confirmed live via `perf record` showing ~90% of CPU
+        // samples inside `render_surface`'s call tree over an arbitrary
+        // multi-second idle window. `DamageBag::add` already declines to
+        // bump its commit counter for a genuinely empty damage set (see
+        // its own doc comment), so feeding it the real per-region damage
+        // here — most calls end up empty when nothing actually changed —
+        // is what actually lets the loop terminate.
         let snapshot = with_normal_content_damage(output_index, |damage| {
-            damage.add([Rectangle::from_size(buffer_size)]);
+            damage.add(real_damage);
             damage.snapshot()
         });
 
