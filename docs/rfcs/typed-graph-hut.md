@@ -279,6 +279,33 @@ only ever creates one `OutputHut`, same as today.
    real content-flow pass-through port — this is where `ConsoleHut::
    showing_terminal`/`main_windows`/`active_main_window` actually start
    moving off the bundling struct and onto real graph nodes/links.
+
+   Open design question resolved during step 1/2's implementation, not
+   yet built: a real Console/Terminal node's `resolve("content")` needs
+   an actual `&mut GlesRenderer` (`ConsoleHut::redraw`'s own signature) —
+   but `graph.rs` deliberately has zero `GlesRenderer` dependency (its
+   own module doc: unit-testable against synthetic nodes, no GL context
+   needed), and `Node::resolve`'s signature has no renderer parameter.
+   Two options considered:
+   - Add a renderer parameter to `Node::resolve`/`Graph::resolve_output`
+     directly — rejected: forces `graph.rs` itself to import
+     `GlesRenderer`, breaking the boundary that makes its own tests
+     (and every synthetic-node test in `graph_nodes.rs`) runnable
+     without a real GL context at all.
+   - **Make `Graph` generic over an environment type**: `Graph<Env =
+     ()>`, with an `env: Env` field `Node::resolve` implementations
+     reach via `graph.env` — no change to `Node::resolve`'s own
+     signature. Every test so far uses `Graph<()>` (today's plain
+     `Graph::new()`, unaffected); the real compositor's graph becomes
+     `Graph<RenderEnv<'a>>` where `RenderEnv<'a> { renderer: &'a mut
+     GlesRenderer }`. This is the direction step 3 should take —
+     recorded here rather than implemented in the same sitting as steps
+     1/2, since retrofitting `Graph` to be generic is itself a real
+     mechanical change (every existing `Graph::new()` call site, plus
+     whatever `Env` bound `resolve_output`'s temporary-node-removal
+     trick needs) that deserves its own careful, separately-verified
+     step rather than being rushed in alongside a foundational decision
+     that's better made unhurried.
 4. **Cut over the real render/input/hit-test call paths** to walk the
    graph instead of the old enum — the actual "flip the switch" step;
    everything before this is provably-equivalent groundwork. The old
