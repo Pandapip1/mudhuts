@@ -138,6 +138,7 @@ pub struct State {
     pub stack: GraphStack,
     pub keymap: Keymap,
     pub theme: crate::theme::Theme,
+    pub display_config: crate::display_config::DisplayConfig,
     /// The output's current pixel size, tracked here (not just read inside
     /// `winit_backend.rs`'s redraw handler) so newly-focused Huts can be
     /// resized immediately on switch rather than showing a stale grid
@@ -431,6 +432,7 @@ impl State {
             stack,
             keymap: Keymap::load(),
             theme: crate::theme::Theme::load(),
+            display_config: crate::display_config::DisplayConfig::load(),
             output_size: (0, 0),
             text_selecting: false,
             text_selection_dragged: false,

@@ -78,8 +78,11 @@
 //!
 //! ## Adaptive refresh rate for non-VRR connectors
 //!
-//! The one genuine timer in this module: every real `VRR_CAPABLE`-`false`
-//! connector's own available modes at its current resolution are sampled
+//! Off by default — opt in via `[display] adaptive-refresh-rate = true`
+//! in `config.toml` (see `connector_connected`'s own doc comment on why,
+//! and `display_config.rs`). The one genuine timer in this module, when
+//! enabled: every real `VRR_CAPABLE`-`false` connector's own available
+//! modes at its current resolution are sampled
 //! once a second (`ADAPTIVE_REFRESH_CHECK_INTERVAL`) against how many real
 //! frames it actually queued in that second, and switched — via the
 //! low-level `DrmOutput::use_mode` (a pending-mode write, only actually
@@ -87,12 +90,16 @@
 //! cycle, which `check_adaptive_refresh` pings for) — to whichever
 //! available mode most closely matches: the smallest mode whose refresh
 //! covers the observed rate while content is actually updating, or the
-//! connector's own minimum available refresh once it's been quiet for
-//! several checks in a row (hysteresis against flickering the mode
-//! between a fast rate and idle on every brief pause). A real DRM
-//! modeset is visibly disruptive (a defined KMS property, not something
-//! Smithay works around) even at the same resolution, which is why this
-//! polls on a coarse 1-second cadence with idle hysteresis rather than
+//! connector's own minimum available refresh once nothing's queued a
+//! frame in a while — but only once that target has been the freshly-
+//! recomputed answer for `ADAPTIVE_REFRESH_STABLE_TICKS` consecutive
+//! ticks in a row, in *either* direction (see that constant's own doc
+//! comment: an earlier, up-instantly/down-after-a-few-ticks asymmetric
+//! version flapped constantly under ordinary bursty typing, each flap a
+//! real, visibly disruptive DRM modeset). A real modeset is disruptive
+//! (a defined KMS property, not something Smithay works around) even at
+//! the same resolution, which is why this polls on a coarse 1-second
+//! cadence with real, symmetric, generous hysteresis rather than
 //! reacting to every single frame — nothing about *rendering itself* is
 //! timer-driven, only this one refresh-rate decision. Skipped entirely
 //! for a `VRR_CAPABLE` connector (real adaptive sync, once enabled, is
@@ -208,12 +215,15 @@ struct AdaptiveRefresh {
     /// `check_adaptive_refresh` tick — an approximate "content updates
     /// per second" sample, reset every tick.
     frames_since_check: u32,
-    /// Consecutive `check_adaptive_refresh` ticks with zero queued
-    /// frames — only actually steps down to the minimum available
-    /// refresh once this reaches `ADAPTIVE_REFRESH_IDLE_TICKS`, so a
-    /// brief pause mid-typing doesn't flicker the mode; reset to `0` the
-    /// moment any frame lands.
-    idle_ticks: u32,
+    /// Whichever mode index has been the freshly-computed target for
+    /// `pending.1` consecutive ticks in a row now, if it differs from
+    /// `current` — a real switch only actually happens once this reaches
+    /// `ADAPTIVE_REFRESH_STABLE_TICKS`, in *either* direction (see
+    /// `adaptive_refresh_target`'s own doc comment on why symmetric
+    /// hysteresis, not just on the way down, turned out to matter in
+    /// practice). `None` whenever the freshly-computed target matches
+    /// `current` (nothing pending).
+    pending: Option<(usize, u32)>,
 }
 
 /// `pub(crate)` (not module-private) solely so `state.rs` can name this
@@ -784,13 +794,20 @@ fn connector_connected(
     // real `VRR_CAPABLE` connector (real adaptive sync beats mode-hopping
     // once enabled — not attempted here, this only chooses between fixed
     // rates) or one whose EDID only actually offers a single refresh rate
-    // at this resolution (nothing to adapt between).
+    // at this resolution (nothing to adapt between). Opt-in via
+    // `[display] adaptive-refresh-rate = true` in `config.toml` (see
+    // `display_config.rs`), not opt-out: even with real, generous
+    // hysteresis (see `ADAPTIVE_REFRESH_STABLE_TICKS`'s own doc comment
+    // on the live incident that motivated it), a real DRM modeset stays a
+    // visibly disruptive thing to do to someone's screen without asking
+    // first — this isn't the kind of feature that should surprise anyone
+    // who didn't specifically ask for it.
     let adaptive_refresh = {
         let inner_ref = inner.borrow();
         let drm_device = inner_ref.drm_output_manager.device();
         let vrr_capable = connector_bool_property(drm_device, connector.handle(), "vrr_capable");
         drop(inner_ref);
-        if vrr_capable {
+        if vrr_capable || !state.display_config.adaptive_refresh_rate {
             None
         } else {
             let mut modes: Vec<DrmMode> =
@@ -810,7 +827,7 @@ fn connector_connected(
                     .iter()
                     .position(|m| WlMode::from(*m).refresh == wl_mode.refresh)
                     .unwrap_or(modes.len() - 1);
-                Some(AdaptiveRefresh { modes, current, frames_since_check: 0, idle_ticks: 0 })
+                Some(AdaptiveRefresh { modes, current, frames_since_check: 0, pending: None })
             }
         }
     };
@@ -1178,14 +1195,24 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
 /// is a coarse, timer-driven check rather than a per-frame decision.
 const ADAPTIVE_REFRESH_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Consecutive zero-frame ticks required before dropping to the minimum
-/// available refresh rate — hysteresis against flickering the mode on
-/// every brief pause (reading a line of text, thinking mid-sentence,
-/// ...). Ramping *up* to match faster content has no equivalent delay:
-/// responsiveness matters more there than avoiding one extra switch, and
-/// the very next real frame naturally corrects an over-eager upshift by
-/// simply not needing another one.
-const ADAPTIVE_REFRESH_IDLE_TICKS: u32 = 3;
+/// Consecutive ticks a *different* target mode has to be freshly
+/// recomputed, in a row, before [`adaptive_refresh_target`] actually
+/// commits to switching — symmetric: applies equally whether the target
+/// just went up (content picked up) or down (content quieted, including
+/// the drop to the minimum available rate once nothing's queued a frame
+/// at all). Confirmed live this needed to be symmetric, not just gating
+/// the way down: an earlier version switched *up* on a single tick,
+/// which normal bursty typing/terminal-output patterns (a line typed,
+/// a pause, another line, ...) hit constantly — 20 real mode switches in
+/// 30 minutes of ordinary use, each one a real, visibly disruptive DRM
+/// modeset (a defined KMS property, not something to render around) —
+/// experienced as the screen repeatedly flashing black for a fraction of
+/// a second. `8` (real seconds, at this module's 1-second tick interval)
+/// is deliberately generous: the whole point is filtering out anything
+/// short of genuinely *sustained* demand at a different rate, since the
+/// cost of a wrong decision (a visible flash) is high relative to the
+/// benefit of shaving a few seconds off how quickly the rate adapts.
+const ADAPTIVE_REFRESH_STABLE_TICKS: u32 = 8;
 
 /// Pure decision logic behind [`check_adaptive_refresh`], factored out so
 /// it's unit-testable against plain refresh-rate numbers — real
@@ -1193,35 +1220,45 @@ const ADAPTIVE_REFRESH_IDLE_TICKS: u32 = 3;
 /// constructor, so the surrounding function itself can't run outside a
 /// real DRM device. `modes_hz` must be non-empty and sorted ascending
 /// (`connector_connected`'s own `AdaptiveRefresh` construction already
-/// guarantees this). Mutates `idle_ticks` in place — the same per-tick
+/// guarantees this). Mutates `pending` in place — the same per-tick
 /// bookkeeping `check_adaptive_refresh` itself needs regardless of
 /// whether a switch actually happens this tick. Returns `None` if the
-/// current mode should stay as-is (already matches the target, or an
-/// idle drop hasn't been quiet for long enough yet), `Some(new_index)`
-/// otherwise.
+/// current mode should stay as-is (the freshly-computed target already
+/// matches it, or a *different* target hasn't been consistently
+/// recomputed for `ADAPTIVE_REFRESH_STABLE_TICKS` ticks in a row yet),
+/// `Some(new_index)` once it has.
 fn adaptive_refresh_target(
     modes_hz: &[u32],
     current: usize,
     observed_fps: u32,
-    idle_ticks: &mut u32,
+    pending: &mut Option<(usize, u32)>,
 ) -> Option<usize> {
-    let target = if observed_fps == 0 {
-        *idle_ticks = idle_ticks.saturating_add(1);
-        if *idle_ticks < ADAPTIVE_REFRESH_IDLE_TICKS {
-            // Not idle long enough yet — leave the current mode alone
-            // rather than dropping on the very first quiet tick.
-            return None;
-        }
+    let raw_target = if observed_fps == 0 {
         0
     } else {
-        *idle_ticks = 0;
         // The smallest available mode whose own refresh rate still
         // covers what content actually asked for this past second,
         // capped at the connector's own fastest available mode if
         // content is updating even faster than that.
         modes_hz.iter().position(|&hz| hz >= observed_fps).unwrap_or(modes_hz.len() - 1)
     };
-    (target != current).then_some(target)
+
+    if raw_target == current {
+        *pending = None;
+        return None;
+    }
+
+    let ticks = match *pending {
+        Some((target, ticks)) if target == raw_target => ticks.saturating_add(1),
+        _ => 1,
+    };
+    *pending = Some((raw_target, ticks));
+
+    if ticks < ADAPTIVE_REFRESH_STABLE_TICKS {
+        return None;
+    }
+    *pending = None;
+    Some(raw_target)
 }
 
 /// The one timer-driven check in this backend — see the module doc's
@@ -1254,7 +1291,7 @@ fn check_adaptive_refresh(state: &mut State, inner: &Rc<RefCell<Inner>>) {
 
         let modes_hz: Vec<u32> = adaptive.modes.iter().map(refresh_hz).collect();
         let Some(target) =
-            adaptive_refresh_target(&modes_hz, adaptive.current, observed_fps, &mut adaptive.idle_ticks)
+            adaptive_refresh_target(&modes_hz, adaptive.current, observed_fps, &mut adaptive.pending)
         else {
             continue;
         };
@@ -1771,57 +1808,110 @@ fn apply_gamma(state: &mut State, active: &ActiveGammaControl, fd: OwnedFd) -> R
 mod tests {
     use super::*;
 
-    #[test]
-    fn picks_the_smallest_mode_covering_the_observed_rate() {
-        let modes = [48, 60, 90, 120];
-        let mut idle_ticks = 0;
-        assert_eq!(adaptive_refresh_target(&modes, 0, 55, &mut idle_ticks), Some(1));
-        assert_eq!(idle_ticks, 0);
-    }
-
-    #[test]
-    fn caps_at_the_fastest_available_mode() {
-        let modes = [48, 60, 90, 120];
-        let mut idle_ticks = 0;
-        assert_eq!(adaptive_refresh_target(&modes, 0, 240, &mut idle_ticks), Some(3));
+    /// Feeds `adaptive_refresh_target` the same `(current, observed_fps)`
+    /// pair `ticks` times in a row, returning whatever the *last* call
+    /// returned — mirrors `check_adaptive_refresh`'s own real per-tick
+    /// call pattern (one call per second, `current` only changes once a
+    /// switch actually commits).
+    fn feed(modes: &[u32], current: usize, observed_fps: u32, pending: &mut Option<(usize, u32)>, ticks: u32) -> Option<usize> {
+        let mut result = None;
+        for _ in 0..ticks {
+            result = adaptive_refresh_target(modes, current, observed_fps, pending);
+        }
+        result
     }
 
     #[test]
     fn already_at_the_right_mode_is_a_no_op() {
         let modes = [48, 60, 90, 120];
-        let mut idle_ticks = 0;
-        assert_eq!(adaptive_refresh_target(&modes, 1, 55, &mut idle_ticks), None);
+        let mut pending = None;
+        assert_eq!(adaptive_refresh_target(&modes, 1, 55, &mut pending), None);
+        assert_eq!(pending, None);
     }
 
     #[test]
-    fn a_single_quiet_tick_does_not_drop_to_minimum_yet() {
+    fn a_brief_burst_does_not_switch_yet() {
         let modes = [48, 60, 90, 120];
-        let mut idle_ticks = 0;
-        assert_eq!(adaptive_refresh_target(&modes, 3, 0, &mut idle_ticks), None);
-        assert_eq!(idle_ticks, 1);
-        assert_eq!(adaptive_refresh_target(&modes, 3, 0, &mut idle_ticks), None);
-        assert_eq!(idle_ticks, 2);
+        let mut pending = None;
+        // A rate that maps to a *different* mode than `current`, but not
+        // sustained anywhere near `ADAPTIVE_REFRESH_STABLE_TICKS` — the
+        // exact "type a line, pause" pattern that used to flap the mode
+        // every few seconds (see this constant's own doc comment).
+        assert_eq!(feed(&modes, 0, 55, &mut pending, 2), None);
     }
 
     #[test]
-    fn drops_to_the_minimum_mode_after_enough_consecutive_quiet_ticks() {
+    fn switches_up_once_sustained_for_enough_consecutive_ticks() {
         let modes = [48, 60, 90, 120];
-        let mut idle_ticks = ADAPTIVE_REFRESH_IDLE_TICKS - 1;
-        assert_eq!(adaptive_refresh_target(&modes, 3, 0, &mut idle_ticks), Some(0));
+        let mut pending = None;
+        assert_eq!(
+            feed(&modes, 0, 55, &mut pending, ADAPTIVE_REFRESH_STABLE_TICKS),
+            Some(1)
+        );
+        assert_eq!(pending, None, "committing a switch clears the pending state");
+    }
+
+    #[test]
+    fn caps_at_the_fastest_available_mode() {
+        let modes = [48, 60, 90, 120];
+        let mut pending = None;
+        assert_eq!(
+            feed(&modes, 0, 240, &mut pending, ADAPTIVE_REFRESH_STABLE_TICKS),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn an_inconsistent_target_never_accumulates_enough_stable_ticks() {
+        let modes = [48, 60, 90, 120];
+        let mut pending = None;
+        // Alternates between two different non-`current` targets every
+        // tick — real content whose rate keeps changing shouldn't ever
+        // "accidentally" satisfy the stability requirement by summing
+        // ticks across different targets.
+        for _ in 0..(ADAPTIVE_REFRESH_STABLE_TICKS * 2) {
+            assert_eq!(adaptive_refresh_target(&modes, 0, 55, &mut pending), None);
+            assert_eq!(adaptive_refresh_target(&modes, 0, 100, &mut pending), None);
+        }
+    }
+
+    #[test]
+    fn drops_to_the_minimum_mode_after_sustained_quiet() {
+        let modes = [48, 60, 90, 120];
+        let mut pending = None;
+        assert_eq!(
+            feed(&modes, 3, 0, &mut pending, ADAPTIVE_REFRESH_STABLE_TICKS),
+            Some(0)
+        );
     }
 
     #[test]
     fn already_at_the_minimum_mode_while_idle_is_a_no_op() {
         let modes = [48, 60, 90, 120];
-        let mut idle_ticks = ADAPTIVE_REFRESH_IDLE_TICKS - 1;
-        assert_eq!(adaptive_refresh_target(&modes, 0, 0, &mut idle_ticks), None);
+        let mut pending = None;
+        assert_eq!(
+            feed(&modes, 0, 0, &mut pending, ADAPTIVE_REFRESH_STABLE_TICKS),
+            None
+        );
     }
 
     #[test]
-    fn any_real_frame_immediately_resets_the_idle_counter() {
+    fn a_single_real_frame_mid_sequence_resets_the_pending_streak() {
         let modes = [48, 60, 90, 120];
-        let mut idle_ticks = ADAPTIVE_REFRESH_IDLE_TICKS - 1;
-        adaptive_refresh_target(&modes, 0, 60, &mut idle_ticks);
-        assert_eq!(idle_ticks, 0);
+        let mut pending = None;
+        // Almost enough consecutive idle ticks to drop to minimum...
+        feed(&modes, 3, 0, &mut pending, ADAPTIVE_REFRESH_STABLE_TICKS - 1);
+        // ...then one real frame breaks the streak (a different raw
+        // target: whatever mode covers observed_fps=60, not the idle
+        // target of 0) — the count has to start over, not just skip one
+        // tick, or a steady trickle of occasional frames could still
+        // eventually rack up enough *non-consecutive* idle ticks to drop
+        // the rate despite content never actually going quiet.
+        assert_eq!(adaptive_refresh_target(&modes, 3, 60, &mut pending), None);
+        assert_eq!(
+            feed(&modes, 3, 0, &mut pending, ADAPTIVE_REFRESH_STABLE_TICKS - 1),
+            None,
+            "the interruption should have reset the streak, not just cost one tick"
+        );
     }
 }

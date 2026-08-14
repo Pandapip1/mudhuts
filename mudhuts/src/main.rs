@@ -2,6 +2,7 @@ mod autostart;
 mod chrome;
 mod config;
 mod cursor;
+mod display_config;
 mod docks;
 mod gpu_term;
 mod grabs;
