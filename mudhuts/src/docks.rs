@@ -359,15 +359,19 @@ pub fn advance_drag(state: &mut State, pos: Point<f64, Physical>) {
         return;
     }
 
-    if let Some(window) = state.find_window_by_surface(&surface) {
+    // The owning Hut's own window list, not `state.find_window_by_surface`
+    // (a full graph-wide scan) — this runs on every pointer-motion sample
+    // for the rest of the drag, same hot-loop reasoning as the
+    // `find_mut_for` fast path above.
+    let hut = match state.stack.find_mut_for(output_index, hut_id) {
+        Some(hut) => Some(hut),
+        None => state.stack.find_mut(hut_id),
+    };
+    let Some(hut) = hut else {
+        return;
+    };
+    if let Some(window) = hut.floating_window_mut(&surface).map(|sub| sub.window.clone()) {
         let logical = pos.to_logical(Scale::from(scale)).to_i32_round();
-        let hut = match state.stack.find_mut_for(output_index, hut_id) {
-            Some(hut) => Some(hut),
-            None => state.stack.find_mut(hut_id),
-        };
-        let Some(hut) = hut else {
-            return;
-        };
         hut.space
             .map_element(crate::space_element::HutSpaceElement::Window(window), logical, true);
     }
