@@ -302,12 +302,24 @@ impl Terminal {
         // "did anything real change" check, not `damage` itself — the
         // cursor's own cell still belongs in the real redraw region below
         // (its row needs repainting wherever the cursor actually is).
+        //
+        // `cursor_point.line` is raw-grid (unadjusted), but `l.line` here
+        // is already viewport-space: alacritty_terminal's
+        // `TermDamageIterator::next()` adds `display_offset` to every
+        // yielded line (confirmed against the pinned 0.26.0 source —
+        // `damage_cursor()` writes the cursor's *raw* line into
+        // `damage.lines`, and the iterator only adds the offset on the
+        // way out). The two only lined up by coincidence at
+        // `display_offset == 0` (not scrolled into scrollback); scrolled
+        // up, this comparison never matched, so the cursor's damage entry
+        // was never filtered out and every frame looked damaged —
+        // continuous unnecessary redraws while scrolled.
+        let display_offset = term.grid().display_offset();
+        let cursor_line = cursor_point.line.0 as usize + display_offset;
         let has_content_damage = match &damage {
             render::Damage::Full => true,
             render::Damage::Lines(lines) => lines.iter().any(|l| {
-                !(l.line == cursor_point.line.0 as usize
-                    && l.left == cursor_point.column.0
-                    && l.right == cursor_point.column.0)
+                !(l.line == cursor_line && l.left == cursor_point.column.0 && l.right == cursor_point.column.0)
             }),
         };
         let has_selection = term.selection.is_some();
