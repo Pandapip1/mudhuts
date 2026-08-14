@@ -34,6 +34,9 @@
 // call paths over to the graph.
 #![allow(dead_code)]
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::desktop::Window;
 use smithay::utils::Point;
@@ -212,21 +215,59 @@ impl Redrawable for TileNode {
 
 /// The real compositor's `Graph` environment (migration step 3, per the
 /// RFC's "Why `Graph<Env>`" section in `graph.rs`) — whatever a
-/// render-shaped node needs beyond the graph itself. Just a renderer for
-/// now; grows if a later node type needs more (nothing here yet does).
-pub struct RenderEnv<'a> {
-    pub renderer: &'a mut GlesRenderer,
+/// render-shaped node needs beyond the graph itself. Holds the renderer
+/// via `Rc<RefCell<_>>`, not a plain `&mut GlesRenderer`: the graph
+/// itself is a long-lived structure (`ConsoleNode` owns real `ConsoleHut`
+/// state — a live PTY, a GPU glyph atlas — that has to survive across
+/// frames, so `Graph<RenderEnv>` has to be storable long-term on
+/// whatever replaces `MruStackHut`), but a render pass only ever has a
+/// renderer borrowed for the duration of *one* call. A struct field
+/// holding `&'a mut GlesRenderer` would tie that one call's lifetime to
+/// the whole `Graph`'s own lifetime, which can't work for a value stored
+/// across many calls. `Rc<RefCell<_>>` sidesteps this the same way
+/// `udev_backend.rs`'s own `Inner::renderer` already does (real
+/// precedent in this codebase, not a new pattern) — `RenderEnv` itself
+/// becomes a plain `'static`-compatible, `Clone`-able value.
+#[derive(Clone)]
+pub struct RenderEnv {
+    pub renderer: Rc<RefCell<GlesRenderer>>,
 }
 
 const LEAF_OUTPUTS: &[OutputPort] = &[OutputPort { name: "content", kind: PortKind::Content }];
 
 /// Graph-native Console/Terminal leaf — wraps a real [`ConsoleHut`],
-/// producing real rendered content by calling straight into
-/// `ConsoleHut::redraw` from inside its own `resolve`. No inputs (a
-/// leaf); one `content: Content` output. Only implements `Node` for
-/// `RenderEnv<'_>` specifically (not generic over every `Env` the way
-/// `TabNode`/`TileNode` are) — it genuinely needs a real renderer,
-/// unlike a purely structural node.
+/// replicating *all* of `render.rs::content_elements`'s per-ConsoleHut
+/// behavior (not just the terminal branch): while `showing_terminal` (or
+/// there are no Main Windows at all), a single `ContentPiece::Texture`
+/// from `ConsoleHut::redraw`, exactly as before; otherwise, one
+/// `ContentPiece::Window` per element mapped in `ConsoleHut::space`
+/// (whatever `ConsoleHut::sync_main_window_space` put there — the active
+/// Main Window plus its floating Floating Windows/Alerts), each already
+/// positioned by that `Space`'s own bookkeeping. This is why a separate
+/// `WaylandClientNode`/`MainWindowNode` per client isn't needed for a
+/// faithful cutover: `ConsoleHut` already bundles exactly this
+/// responsibility today, and `ConsoleNode` just needs to expose the same
+/// bundle through the graph, not redesign it — the real Main-Window-Hut
+/// redesign (`WaylandClientNode`'s real content-flow port, `MainWindowNode`'s
+/// `main`/`minimized` ports) is tracked as its own separate wishlist item,
+/// layered on *after* this cutover exists, not a prerequisite for it.
+///
+/// Real per-piece render-element construction (`AsRenderElements::
+/// render_elements`, which is what actually expands a `Window` into real
+/// `HutSpaceRenderElement`s — Smithay's own `Window` impl already walks
+/// `PopupManager::popups_for_surface` internally, so this loses no popup
+/// fidelity versus today's `space_render_elements` call, which delegates
+/// to the exact same `Window` impl under the hood) happens later, at
+/// whatever converts a resolved `Vec<ContentPiece>` into real frame
+/// elements — deliberately *not* here: `TextureRenderElement`/
+/// `WaylandSurfaceRenderElement` don't implement `Clone` (confirmed
+/// against Smithay's pinned source — each owns real per-element damage
+/// state with its own `Drop`-time bookkeeping), so they can never be the
+/// thing `Graph::resolve_output`'s per-frame memoization cache clones.
+///
+/// Only implements `Node` for `RenderEnv` specifically (not generic over
+/// every `Env` the way `TabNode`/`TileNode` are) — it genuinely needs a
+/// real renderer, unlike a purely structural node.
 pub struct ConsoleNode {
     pub hut: ConsoleHut,
 }
@@ -237,30 +278,50 @@ impl ConsoleNode {
     }
 }
 
-impl<'a> Node<RenderEnv<'a>> for ConsoleNode {
+impl Node<RenderEnv> for ConsoleNode {
     fn inputs(&self) -> &[InputPort] {
         &[]
     }
     fn outputs(&self) -> &[OutputPort] {
         LEAF_OUTPUTS
     }
-    fn resolve(&mut self, graph: &mut Graph<RenderEnv<'a>>, _self_id: NodeId, _port: &'static str) -> PortValue {
+    fn resolve(&mut self, graph: &mut Graph<RenderEnv>, _self_id: NodeId, _port: &'static str) -> PortValue {
         // Local origin (0, 0) — same convention `TileNode`'s pane
         // translation and `hut::TileHut::absolute_pane_rects` already
         // use: a node's own `content` output is in its *own* local
         // frame, translated by whatever composes it further up the tree
         // (ultimately the real output's `usable_area()` origin, applied
         // once at the very top, not baked in here).
-        let Some(texture) = self.hut.redraw(graph.env.renderer) else {
-            return PortValue::Content(Vec::new());
-        };
-        let damage = self.hut.element_damage_snapshot();
-        PortValue::Content(vec![ContentPiece::Texture {
-            id: self.hut.element_id.clone(),
-            texture,
-            damage,
-            position: (0.0, 0.0),
-        }])
+        if *self.hut.showing_terminal || self.hut.main_window_count() == 0 {
+            let mut renderer = graph.env.renderer.borrow_mut();
+            let Some(texture) = self.hut.redraw(&mut renderer) else {
+                return PortValue::Content(Vec::new());
+            };
+            let damage = self.hut.element_damage_snapshot();
+            return PortValue::Content(vec![ContentPiece::Texture {
+                id: self.hut.element_id.clone(),
+                texture,
+                damage,
+                position: (0.0, 0.0),
+            }]);
+        }
+
+        let pieces = self
+            .hut
+            .space
+            .elements()
+            .filter_map(|element| {
+                let crate::space_element::HutSpaceElement::Window(window) = element else {
+                    // No `Composited` element is ever mapped into a
+                    // ConsoleHut's own `space` in v1 — see
+                    // `state.rs::surface_under`'s identical comment.
+                    return None;
+                };
+                let location = self.hut.space.element_location(element)?;
+                Some(ContentPiece::Window { window: window.clone(), position: location })
+            })
+            .collect();
+        PortValue::Content(pieces)
     }
 }
 
