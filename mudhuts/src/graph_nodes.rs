@@ -317,8 +317,21 @@ impl Node<RenderEnv> for ConsoleNode {
                     // `state.rs::surface_under`'s identical comment.
                     return None;
                 };
-                let location = self.hut.space.element_location(element)?;
-                Some(ContentPiece::Window { window: window.clone(), position: location })
+                let mapped_at = self.hut.space.element_location(element)?;
+                // Matches `Space::render_elements_for_region`'s own
+                // `render_location()` formula exactly (checked against
+                // Smithay's pinned source: `self.location -
+                // self.element.geometry().loc`) — a window's own
+                // `geometry().loc` (its xdg-surface-reported content
+                // offset, typically `(0, 0)` but not always, e.g. a
+                // client-side-shadow-drawing toolkit) has to be
+                // subtracted the same way here, not just wherever
+                // `map_element` originally placed it, or a window with a
+                // non-zero geometry offset would render subtly
+                // mispositioned versus today's `space_render_elements`
+                // path.
+                let position = mapped_at - smithay::desktop::space::SpaceElement::geometry(window).loc;
+                Some(ContentPiece::Window { window: window.clone(), position })
             })
             .collect();
         PortValue::Content(pieces)

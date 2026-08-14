@@ -136,14 +136,29 @@ pub struct OutputPort {
 /// every frame goes through, not an acceptable tradeoff there the way
 /// it is for a popup only redrawn while open.
 ///
-/// Positions are physical-pixel positions *within the producing node's
-/// own local frame* — a leaf like `ConsoleNode` always reports `(0, 0)`;
-/// a compositing node (`TileNode`) translates each child's pieces by
-/// that child's own offset within its own local frame before passing
-/// them upward. The one absolute translation (by the real output's
-/// `usable_area()` origin) happens exactly once, at the very top of the
-/// tree — mirroring `hut::TileHut::absolute_pane_rects`'s own "local
-/// `pane_rects`, translated by the caller" shape.
+/// `Texture` positions are physical-pixel positions *within the
+/// producing node's own local frame* — a leaf like `ConsoleNode` always
+/// reports `(0, 0)` for its terminal texture; a compositing node
+/// (`TileNode`) translates each child's pieces by that child's own
+/// offset within its own local frame before passing them upward. The one
+/// absolute translation (by the real output's `usable_area()` origin)
+/// happens exactly once, at the very top of the tree — mirroring
+/// `hut::TileHut::absolute_pane_rects`'s own "local `pane_rects`,
+/// translated by the caller" shape.
+///
+/// **`Window` positions are the one exception — already absolute, not
+/// local-frame-relative.** `ConsoleNode` reads them straight from
+/// `ConsoleHut::space`, whose own elements were mapped with
+/// `usable_area()`'s origin already baked in (`sync_main_window_space`'s
+/// `map_element(window, area_origin, ...)` call) — matching exactly how
+/// today's `space_render_elements`-based rendering already positions
+/// them. Whatever ultimately converts a resolved `Vec<ContentPiece>`
+/// into real frame elements must apply the top-of-tree origin
+/// translation to `Texture` pieces only, never `Window` ones, or a
+/// Main Window would render offset twice. `TileNode::translate_piece`
+/// already reflects this (a `Window` piece passes through untouched) —
+/// consistent, since a Tile-Hut pane never shows Main-Window content in
+/// v1 scope anyway (see `hut.rs`'s own module doc).
 #[derive(Clone)]
 pub enum ContentPiece {
     /// A GPU-rendered texture (a Console/Terminal's own content, or —
