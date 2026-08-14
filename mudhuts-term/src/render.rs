@@ -262,6 +262,31 @@ pub enum Damage {
     Lines(Vec<LineDamage>),
 }
 
+/// The row/column bounding box (cell coordinates, all four bounds
+/// inclusive) covering every damaged region — `None` for [`Damage::Full`]
+/// (nothing to bound; the whole grid counts as damaged). A single
+/// bounding box, not one rect per line: simpler for callers that
+/// scissor/clear one rectangular region (the GPU path in
+/// `mudhuts::gpu_term`) at the cost of sometimes covering a few extra
+/// untouched cells when damage is scattered across non-adjacent lines —
+/// still strictly bounded by the real damage, never a false negative
+/// (every actually-damaged cell is always inside the box). `Lines(vec![])`
+/// (shouldn't happen in practice — callers only reach this once something
+/// real changed) falls back to `None`/"treat as full" rather than an
+/// empty, wrong bounding box.
+pub fn damage_bounds(damage: &Damage) -> Option<(usize, usize, usize, usize)> {
+    match damage {
+        Damage::Full => None,
+        Damage::Lines(lines) => {
+            let min_line = lines.iter().map(|l| l.line).min()?;
+            let max_line = lines.iter().map(|l| l.line).max()?;
+            let min_col = lines.iter().map(|l| l.left).min()?;
+            let max_col = lines.iter().map(|l| l.right).max()?;
+            Some((min_line, max_line, min_col, max_col))
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct LineDamage {
     pub line: usize,
@@ -284,22 +309,23 @@ pub struct CellInfo {
     pub bg: Rgb,
 }
 
-/// Collect every visible cell's resolved colors/character. Unlike
-/// [`render`], this always covers the whole viewport — the GPU path
-/// redraws every cell whenever *anything* changed rather than tracking
-/// fine-grained per-line damage, since instanced GPU draws make that
-/// optimization unnecessary (see the Phase 2.6 plan notes). `capacity`
-/// (`columns * screen_lines`, known to the caller before `content`'s own
-/// `GridIterator` is ever walked — `GridIterator` isn't `ExactSizeIterator`,
-/// so this can't be derived from `content` itself) avoids reallocating/
-/// copy-growing this `Vec` on every single call, called on every terminal
-/// redraw.
-pub fn collect_cells(content: RenderableContent<'_>, capacity: usize) -> Vec<CellInfo> {
+/// Collect every cell's resolved colors/character within `damage`'s own
+/// bounding box (the whole viewport for [`Damage::Full`], matching
+/// [`damage_bounds`]'s doc comment on why a single box rather than
+/// per-line precision). `capacity` (`columns * screen_lines`, known to
+/// the caller before `content`'s own `GridIterator` is ever walked —
+/// `GridIterator` isn't `ExactSizeIterator`, so this can't be derived
+/// from `content` itself) is a safe upper-bound capacity hint, not an
+/// exact size — real damage is usually well under a full grid, so this
+/// slightly over-allocates for a `Lines` damage rather than under, which
+/// is the cheaper direction to be wrong in.
+pub fn collect_cells(content: RenderableContent<'_>, capacity: usize, damage: &Damage) -> Vec<CellInfo> {
     let colors: &Colors = content.colors;
     let cursor_point = content.cursor.point;
     let cursor_shape = content.cursor.shape;
     let cursor_visible = !matches!(cursor_shape, CursorShape::Hidden);
     let selection = content.selection;
+    let bounds = damage_bounds(damage);
 
     let display_offset = content.display_offset as i32;
     let mut cells = Vec::with_capacity(capacity);
@@ -313,6 +339,13 @@ pub fn collect_cells(content: RenderableContent<'_>, capacity: usize) -> Vec<Cel
         // dropped as soon as the view was scrolled at all.
         let row = (indexed.point.line.0 + display_offset) as usize;
         let col = indexed.point.column.0;
+
+        if let Some((min_line, max_line, min_col, max_col)) = bounds
+            && (row < min_line || row > max_line || col < min_col || col > max_col)
+        {
+            continue;
+        }
+
         let cell = indexed.cell;
 
         let is_cursor_cell = cursor_visible && indexed.point == cursor_point;
@@ -444,5 +477,39 @@ pub fn render(
                 height: ch,
             })
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_damage_has_no_bounding_box() {
+        assert_eq!(damage_bounds(&Damage::Full), None);
+    }
+
+    #[test]
+    fn a_single_damaged_line_bounds_to_just_that_line() {
+        let damage = Damage::Lines(vec![LineDamage { line: 5, left: 10, right: 20 }]);
+        assert_eq!(damage_bounds(&damage), Some((5, 5, 10, 20)));
+    }
+
+    #[test]
+    fn multiple_damaged_lines_bound_to_their_union() {
+        let damage = Damage::Lines(vec![
+            LineDamage { line: 5, left: 10, right: 20 },
+            LineDamage { line: 8, left: 0, right: 5 },
+            LineDamage { line: 2, left: 30, right: 40 },
+        ]);
+        // (min_line, max_line, min_col, max_col) across all three lines —
+        // not one rect per line (see `damage_bounds`'s own doc comment on
+        // why a single box is the deliberate simplification).
+        assert_eq!(damage_bounds(&damage), Some((2, 8, 0, 40)));
+    }
+
+    #[test]
+    fn empty_lines_falls_back_to_no_bound_rather_than_a_bogus_empty_box() {
+        assert_eq!(damage_bounds(&Damage::Lines(vec![])), None);
     }
 }

@@ -264,13 +264,31 @@ impl Terminal {
     }
 
     /// If anything changed since the last call (content damage or an
-    /// active selection), every visible cell's resolved character/colors —
-    /// for the GPU atlas rendering path, which redraws everything whenever
-    /// *anything* changed rather than tracking fine-grained damage (see
-    /// [`render::collect_cells`]). Returns `None` when nothing changed, so
-    /// the caller can skip re-rendering entirely.
-    pub fn take_dirty_cells(&self) -> Option<Vec<render::CellInfo>> {
+    /// active selection): every changed cell's resolved character/colors,
+    /// plus the real [`render::Damage`] region they came from — the GPU
+    /// atlas rendering path uses this to scissor its own redraw (and the
+    /// outer compositor-facing damage it reports) to that same real
+    /// region instead of the whole terminal, see
+    /// [`crate::gpu_term::GpuTermRenderer::redraw`]'s doc comment.
+    /// Returns `None` when nothing changed, so the caller can skip
+    /// re-rendering entirely.
+    pub fn take_dirty_cells(&self) -> Option<(Vec<render::CellInfo>, render::Damage)> {
         let mut term = self.term.lock();
+        let cursor_point = term.grid().cursor.point;
+        let damage = match term.damage() {
+            alacritty_terminal::term::TermDamage::Full => render::Damage::Full,
+            alacritty_terminal::term::TermDamage::Partial(lines) => render::Damage::Lines(
+                lines
+                    .map(|l| render::LineDamage {
+                        line: l.line,
+                        left: l.left,
+                        right: l.right,
+                    })
+                    .collect(),
+            ),
+        };
+        term.reset_damage();
+
         // `Term::damage()` unconditionally marks the cursor's current cell
         // damaged on *every* call (`damage_cursor()` in alacritty_terminal,
         // called regardless of whether the cursor moved), as a single
@@ -280,23 +298,33 @@ impl Terminal {
         // fully idle terminal — without filtering it out, every frame
         // looks "damaged" and we'd redraw the whole grid continuously at
         // whatever rate the compositor tries to redraw, regardless of
-        // whether anything is actually happening.
-        let cursor_point = term.grid().cursor.point;
-        let has_content_damage = match term.damage() {
-            alacritty_terminal::term::TermDamage::Full => true,
-            alacritty_terminal::term::TermDamage::Partial(lines) => lines.into_iter().any(|l| {
+        // whether anything is actually happening. Only affects this
+        // "did anything real change" check, not `damage` itself — the
+        // cursor's own cell still belongs in the real redraw region below
+        // (its row needs repainting wherever the cursor actually is).
+        let has_content_damage = match &damage {
+            render::Damage::Full => true,
+            render::Damage::Lines(lines) => lines.iter().any(|l| {
                 !(l.line == cursor_point.line.0 as usize
                     && l.left == cursor_point.column.0
                     && l.right == cursor_point.column.0)
             }),
         };
-        let changed = has_content_damage || term.selection.is_some();
-        term.reset_damage();
-        if !changed {
+        let has_selection = term.selection.is_some();
+        if !(has_content_damage || has_selection) {
             return None;
         }
+        // Selection changes (e.g. dragging to extend it) aren't reflected
+        // in `Term`'s own damage tracking at all — it only tracks cell
+        // *content* changes — so treat the whole grid as damaged whenever
+        // one's active, same as `Terminal::render`'s own identical
+        // handling, rather than trying to cheaply bound a selection's own
+        // (frequently changing, easily grid-spanning) extent.
+        let damage = if has_selection { render::Damage::Full } else { damage };
+
         let capacity = term.columns() * term.screen_lines();
-        Some(render::collect_cells(term.renderable_content(), capacity))
+        let cells = render::collect_cells(term.renderable_content(), capacity, &damage);
+        Some((cells, damage))
     }
 
     /// Rasterize the current grid into `buf` (RGBA8, `width * height * 4`

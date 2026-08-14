@@ -26,10 +26,11 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::rc::Rc;
 
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture, ffi};
+use smithay::utils::{Buffer, Point, Rectangle, Size};
 
 use mudhuts_term::GlyphCache;
 use mudhuts_term::palette::Rgb;
-use mudhuts_term::render::CellInfo;
+use mudhuts_term::render::{CellInfo, Damage, damage_bounds};
 
 const ATLAS_SIZE: u32 = 1024;
 
@@ -507,6 +508,15 @@ impl GlyphAtlas {
 /// through `program`. Used by both [`GpuTermRenderer::redraw`] (a whole
 /// terminal grid) and [`LabelRenderer::render`] (one short string) — same
 /// shader/vertex layout, different content and target.
+///
+/// `scissor` — `(x, y, width, height)`, in the *same* raw window/pixel
+/// coordinate space `dst_pos`/`u_target_size` already use (see
+/// `GpuTermRenderer::redraw`'s doc comment on why no separate Y-flip
+/// conversion is needed to compute it) — clips both the clear and the
+/// instanced draws below to that region, `None` for the normal
+/// whole-target clear+redraw. Always disabled again before returning
+/// (regardless of whether it was enabled), since `gl` is a shared context
+/// other draw calls reuse afterward.
 #[allow(clippy::too_many_arguments)]
 fn draw_instances(
     gl: &ffi::Gles2,
@@ -520,6 +530,7 @@ fn draw_instances(
     tex_size: (i32, i32),
     instances: &[Instance],
     bg_count: usize,
+    scissor: Option<(i32, i32, i32, i32)>,
 ) {
     unsafe {
         gl.BindBuffer(ffi::ARRAY_BUFFER, instance_vbo);
@@ -545,6 +556,10 @@ fn draw_instances(
 
         gl.BindFramebuffer(ffi::FRAMEBUFFER, fbo);
         gl.Viewport(0, 0, tex_size.0, tex_size.1);
+        if let Some((x, y, w, h)) = scissor {
+            gl.Enable(ffi::SCISSOR_TEST);
+            gl.Scissor(x, y, w, h);
+        }
         gl.ClearColor(0.0, 0.0, 0.0, 1.0);
         gl.Clear(ffi::COLOR_BUFFER_BIT);
 
@@ -590,6 +605,10 @@ fn draw_instances(
         draw(0, bg_count);
         draw(bg_count, instances.len() - bg_count);
 
+        // Unconditionally, even if `scissor` was `None` (a no-op then,
+        // `SCISSOR_TEST` starts disabled and nothing else in this shared
+        // context enables it) — see this function's own doc comment.
+        gl.Disable(ffi::SCISSOR_TEST);
         gl.BindFramebuffer(ffi::FRAMEBUFFER, 0);
     }
 }
@@ -749,20 +768,44 @@ impl GpuTermRenderer {
     }
 
     /// Redraw `cells` into the offscreen target (resized to `width`x
-    /// `height` if needed), returning the up-to-date `GlesTexture`.
+    /// `height` if needed), returning the up-to-date `GlesTexture`. Only
+    /// actually clears/redraws `damage`'s own bounding box (see
+    /// `damage_bounds`'s doc comment) rather than the whole target —
+    /// correct because `color_texture` is one persistently-reused GPU
+    /// texture, not reallocated fresh each call (see its own field doc):
+    /// whatever this call *doesn't* touch is still exactly what the
+    /// previous call left there, real prior content, not garbage. `cells`
+    /// itself must already be limited to that same bounding box (see
+    /// `mudhuts_term::render::collect_cells`) — the scissor rect below is
+    /// computed independently from `damage`, not derived from `cells`,
+    /// so the two have to already agree or real content would get
+    /// clipped out.
+    ///
+    /// The scissor rect needs no Y-flip/coordinate conversion despite
+    /// `VERTEX_SHADER`'s clip-space math looking like it flips things:
+    /// `clip.y = px.y/target_size.y*2-1` combined with the standard GL
+    /// NDC-to-window mapping `winY = (clip.y+1)/2*H` algebraically
+    /// simplifies to `winY = px.y` exactly (`H` cancels) — so `glScissor`
+    /// takes the *same* raw `row * cell_h` value `dst_pos.y` already
+    /// uses, not `tex_size.1` minus it. This holds regardless of whether
+    /// something downstream additionally flips the finished texture for
+    /// display — that's a separate concern from whether the scissor rect
+    /// lines up with where *this shader* itself places quads, which it
+    /// does by construction (same formula, same inputs).
     #[allow(clippy::too_many_arguments)]
     pub fn redraw(
         &mut self,
         renderer: &mut GlesRenderer,
         glyph_cache: &mut GlyphCache,
         cells: &[CellInfo],
+        damage: &Damage,
         cell_w: usize,
         cell_h: usize,
         baseline: usize,
         width: i32,
         height: i32,
-    ) -> Result<GlesTexture, String> {
-        self.ensure_size(renderer, width, height)?;
+    ) -> Result<(GlesTexture, Option<Rectangle<i32, Buffer>>), String> {
+        let resized = self.ensure_size(renderer, width, height)?;
 
         let white = self.atlas.borrow().white;
         let mut instances = Vec::with_capacity(cells.len() * 2);
@@ -826,6 +869,26 @@ impl GpuTermRenderer {
         instances.truncate(bg_count);
         instances.extend(glyph_instances);
 
+        // A freshly (re)allocated target has no prior content to preserve
+        // at all — `ensure_size`'s own doc comment: "returns `true` if it
+        // was (re)created, meaning the whole thing needs redrawing" —
+        // regardless of what `damage` itself says (a resize also implies
+        // a fresh `Terminal::render`/first-ever redraw upstream, but
+        // don't rely on that alone; this is the one place that actually
+        // knows whether the *target* is fresh).
+        let touched: Option<Rectangle<i32, Buffer>> = if resized {
+            None
+        } else {
+            damage_bounds(damage).map(|(min_line, max_line, min_col, max_col)| {
+                let x = (min_col * cell_w) as i32;
+                let y = (min_line * cell_h) as i32;
+                let w = ((max_col - min_col + 1) * cell_w) as i32;
+                let h = ((max_line - min_line + 1) * cell_h) as i32;
+                Rectangle::new(Point::from((x, y)), Size::from((w, h)))
+            })
+        };
+        let scissor = touched.map(|r| (r.loc.x, r.loc.y, r.size.w, r.size.h));
+
         let (instance_vbo, fbo) = (self.instance_vbo, self.fbo);
         let atlas = self.atlas.borrow();
         let (program, u_target_size, quad_vbo, atlas_tex) = (
@@ -849,6 +912,7 @@ impl GpuTermRenderer {
                     tex_size,
                     &instances,
                     bg_count,
+                    scissor,
                 )
             })
             .map_err(|e| e.to_string())?;
@@ -856,9 +920,11 @@ impl GpuTermRenderer {
         // Cheap: an `Arc` clone (see the `color_texture` field doc),
         // pointing at the same GPU texture `ensure_size` just rendered
         // into above — not a pixel copy.
-        self.color_texture
+        let texture = self
+            .color_texture
             .clone()
-            .ok_or_else(|| "no color texture allocated (width/height were <= 0?)".to_string())
+            .ok_or_else(|| "no color texture allocated (width/height were <= 0?)".to_string())?;
+        Ok((texture, touched))
     }
 }
 
@@ -988,6 +1054,10 @@ impl LabelRenderer {
                     (width, height),
                     &instances,
                     bg_count,
+                    // Always a fresh target (this type's own doc comment:
+                    // "always allocates a fresh target texture per call")
+                    // — nothing to preserve, so no scissor.
+                    None,
                 )
             })
             .map_err(|e| e.to_string())?;

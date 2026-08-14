@@ -649,7 +649,7 @@ impl ConsoleHut {
         }
         let gpu = self.gpu.as_mut()?;
 
-        let Some(cells) = self.terminal.take_dirty_cells() else {
+        let Some((cells, damage)) = self.terminal.take_dirty_cells() else {
             return self.last_texture.clone();
         };
 
@@ -660,15 +660,27 @@ impl ConsoleHut {
             renderer,
             &mut self.glyphs,
             &cells,
+            &damage,
             cell_w,
             cell_h,
             baseline,
             width,
             height,
         ) {
-            Ok(texture) => {
+            Ok((texture, touched)) => {
+                // `touched` — the real region `gpu.redraw` actually
+                // repainted (see its own doc comment) — `None` for a
+                // full redraw (first frame, a resize, or `Damage::Full`
+                // upstream), matching `Rectangle::from_size(texture.size())`'s
+                // old always-whole-texture behavior exactly for that
+                // case; `Some(rect)` reports the real, usually much
+                // smaller, damaged region instead, so the outer
+                // compositor-facing damage tracker (and everything
+                // downstream of `element_damage_snapshot`) sees real
+                // per-redraw damage rather than "the whole terminal
+                // changed" on every single keystroke.
                 self.damage_tracker
-                    .add([Rectangle::from_size(texture.size())]);
+                    .add([touched.unwrap_or_else(|| Rectangle::from_size(texture.size()))]);
                 self.last_texture = Some(texture.clone());
                 Some(texture)
             }
