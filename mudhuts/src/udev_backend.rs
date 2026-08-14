@@ -169,6 +169,14 @@ type Elements = OutputRenderElements<GlesRenderer, HutSpaceRenderElement>;
 
 struct SurfaceData {
     output: Output,
+    /// This output's own `wl_output` global — kept so
+    /// `connector_disconnected` can call `DisplayHandle::remove_global`
+    /// on hotplug-disconnect. `Output::create_global` returning a real,
+    /// meaningful `GlobalId` (rather than nothing worth keeping) is
+    /// itself the signal that this global has to be explicitly torn
+    /// down somewhere; nothing about `Output`/`Global` does that
+    /// automatically on drop.
+    global: smithay::reexports::wayland_server::backend::GlobalId,
     /// Which `GraphStack::outputs()` slot this crtc drives — real
     /// multi-monitor: `render_surface` needs this to resolve/build this
     /// crtc's own content, not necessarily whichever output currently has
@@ -554,6 +562,22 @@ pub fn init_udev(
                     if let Some(leasing_global) = state.drm_leasing_global.as_mut() {
                         leasing_global.resume::<State>();
                     }
+                    // A commit queued right as `PauseSession` hit can
+                    // leave `frame_pending` stuck `true` forever: `pause()`
+                    // above drops DRM master mid-flight, and once that
+                    // happens the kernel has no way to ever deliver that
+                    // commit's `DrmEvent::VBlank` — the only place that
+                    // clears `frame_pending` (`frame_finish`). Without
+                    // resetting it here, `render_surface`'s own
+                    // `frame_pending` guard would then bail out on every
+                    // future redraw for that crtc, leaving the output
+                    // frozen until mudhuts restarts. Safe to clear
+                    // unconditionally for every surface: DRM master was
+                    // just reacquired above, so there is no in-flight
+                    // commit left that could still complete after this.
+                    for surface in inner.borrow_mut().surfaces.values_mut() {
+                        surface.frame_pending = false;
+                    }
                     // Nothing else re-kicks rendering after a resume —
                     // explicitly force a fresh pass on every crtc.
                     state.stack.begin_frame();
@@ -845,7 +869,7 @@ fn connector_connected(
             serial_number: "unknown".into(),
         },
     );
-    let _global = output.create_global::<State>(&state.display_handle);
+    let global = output.create_global::<State>(&state.display_handle);
     output.set_preferred(wl_mode);
     output.change_current_state(
         Some(wl_mode),
@@ -953,6 +977,7 @@ fn connector_connected(
         crtc,
         SurfaceData {
             output,
+            global,
             output_index,
             drm_output,
             frame_pending: false,
@@ -998,6 +1023,16 @@ fn connector_disconnected(
     let removed = inner_mut.surfaces.remove(&crtc);
     drop(inner_mut);
     if let Some(surface) = removed {
+        // The physical connector is really gone — remove its `wl_output`
+        // global regardless of whether `GraphStack::remove_output` below
+        // actually drops the logical `OutputSlot` too (it refuses to for
+        // the very last one, see its own comment just below): clients
+        // shouldn't be able to bind a `wl_output` for a display that no
+        // longer exists. Without this, every hotplug-disconnect leaked
+        // one global (`create_global`'s `GlobalId` was previously
+        // discarded entirely, with nothing anywhere ever calling
+        // `DisplayHandle::remove_global`).
+        state.display_handle.remove_global::<State>(surface.global);
         // Refuses to actually remove the last remaining slot (see
         // `GraphStack::remove_output`'s doc comment) — the disconnected
         // connector's `OutputSlot` is left in place with its now-stale
@@ -1170,7 +1205,14 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
     // *outgoing* protocol messages (configures, frame callbacks, ...) to
     // client sockets under this backend.
     let elapsed = state.start_time.elapsed();
-    let hut = state.stack.focused_mut();
+    // `focused_mut_for(output_index)` — this crtc's own output, not
+    // `focused_mut()` (whichever output currently has *input* focus,
+    // possibly a different one entirely on a multi-monitor session).
+    // Using the globally-focused Hut here meant a window on a
+    // non-focused output never received a `wl_surface.frame` callback at
+    // all from *its own* output's render pass, so a well-behaved client
+    // pacing redraws off that callback drew once and then stalled.
+    let hut = state.stack.focused_mut_for(output_index);
     hut.space.elements().for_each(|element| {
         if let crate::space_element::HutSpaceElement::Window(window) = element {
             window.send_frame(
