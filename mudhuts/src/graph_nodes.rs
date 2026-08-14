@@ -264,6 +264,150 @@ impl Redrawable for WaylandClientNode {
     }
 }
 
+const MAIN_WINDOW_INPUTS: &[InputPort] = &[
+    InputPort { name: "main", kind: PortKind::Hut },
+    InputPort { name: "minimized", kind: PortKind::HutList },
+];
+
+/// Migration step 5: Main-Window Hut — the user's own framing, "the
+/// main/floating display/minimization... should be done with a hut."
+/// Accepts one Hut on `main` (shown full-size) and a separate list on
+/// `minimized` (today's `docks.rs`/`FloatingWindow`/`Dock::Docked`
+/// concept, replacing a per-struct enum field with a real port).
+///
+/// `resolve`'s `content` output is `main`'s own content, unmodified —
+/// real compositing of `minimized`'s docked-handle chrome
+/// (`docks::build`'s current role) on top of it isn't built here yet,
+/// same reasoning `WaylandClientNode`'s doc comment gives for deferring
+/// real client-surface rendering: entangled with migration step 4's
+/// render-pipeline cutover, not separable ahead of it. What's real and
+/// tested here: `main` is what's actually shown, and every minimized
+/// entry is still a real, reachable graph node (traversed once per
+/// resolve, proven the same way `TileNode`'s "touch every child" test
+/// proves its own list traversal) even though nothing composites them
+/// visually yet.
+pub struct MainWindowNode;
+
+impl<Env> Node<Env> for MainWindowNode {
+    fn inputs(&self) -> &[InputPort] {
+        MAIN_WINDOW_INPUTS
+    }
+    fn outputs(&self) -> &[OutputPort] {
+        LEAF_OUTPUTS
+    }
+    fn resolve(&mut self, graph: &mut Graph<Env>, self_id: NodeId, _port: &'static str) -> PortValue {
+        // Every minimized entry gets touched (proves reachability; see
+        // this struct's doc comment) even though the result isn't
+        // composited into anything yet.
+        for minimized in graph.hut_list_input(self_id, "minimized") {
+            graph.resolve_output(minimized, "content");
+        }
+        match graph.hut_input(self_id, "main") {
+            Some(main) => graph
+                .resolve_output(main, "content")
+                .unwrap_or_else(|| PortValue::Content(RenderedContent::default())),
+            None => PortValue::Content(RenderedContent::default()),
+        }
+    }
+}
+
+const LAYER_SHELL_INPUTS: &[InputPort] = &[
+    InputPort { name: "display", kind: PortKind::Hut },
+    InputPort { name: "layers", kind: PortKind::HutList },
+];
+
+/// Migration step 6: Layer-Shell Hut — one per output (see the RFC's
+/// Multi-Monitor section), replacing today's global
+/// `layer_map_for_output`/`space_render_elements` consolidation with a
+/// real graph node. `display` is "whatever's underneath" (today's whole
+/// Stack/Tab/Tile content — in the fully cut-over graph, the root of
+/// whatever's linked to this output); `layers` is the list of
+/// layer-shell client Huts stacked above/below it.
+///
+/// Same deferred-compositing scope as `MainWindowNode`/
+/// `WaylandClientNode`: `content` resolves to `display`'s own content
+/// unmodified; real per-layer positioning/exclusive-zone math
+/// (`layer.rs`'s existing `arrange`/`non_exclusive_zone`, already
+/// verified correct in `project_known_issues`'s "layer-shell rendering
+/// bug" write-up — the bug was never in that logic) plugs in at
+/// migration step 4's cutover, not here.
+pub struct LayerShellNode;
+
+impl<Env> Node<Env> for LayerShellNode {
+    fn inputs(&self) -> &[InputPort] {
+        LAYER_SHELL_INPUTS
+    }
+    fn outputs(&self) -> &[OutputPort] {
+        LEAF_OUTPUTS
+    }
+    fn resolve(&mut self, graph: &mut Graph<Env>, self_id: NodeId, _port: &'static str) -> PortValue {
+        for layer in graph.hut_list_input(self_id, "layers") {
+            graph.resolve_output(layer, "content");
+        }
+        match graph.hut_input(self_id, "display") {
+            Some(display) => graph
+                .resolve_output(display, "content")
+                .unwrap_or_else(|| PortValue::Content(RenderedContent::default())),
+            None => PortValue::Content(RenderedContent::default()),
+        }
+    }
+}
+
+const OUTPUT_INPUTS: &[InputPort] = &[InputPort { name: "display", kind: PortKind::Hut }];
+
+/// Migration step 7: Output Hut — a physical monitor, modeled as a real
+/// graph node with an input and *no* output at all (nothing is ever
+/// downstream of a real display). This is the insight that makes real
+/// multi-monitor support fall out of the graph model almost for free
+/// (see the RFC's Multi-Monitor section, and the user's own framing:
+/// "make each monitor a hut with just an input and no output") — a
+/// second monitor is just a second `OutputHut` linked to whatever Hut
+/// subtree should show on it, real mirroring is linking the *same*
+/// subtree to two `OutputHut`s, and nothing about the graph core needed
+/// to change to support either.
+///
+/// `present` is deliberately not `Node::resolve`-shaped — an output has
+/// no `Content`/`Control` output port for anything to pull a value from
+/// (`outputs()` is empty), it's a true sink. Presenting a frame is
+/// itself the side effect: resolve `display`'s content, then hand it to
+/// whatever real backend (`udev_backend.rs`'s `render_surface`, today;
+/// `winit_backend.rs`'s single always-present `OutputHut` under that
+/// backend) actually owns the real `DrmOutput`/window this represents.
+/// Wiring a real `OutputHut` per connected connector into
+/// `udev_backend.rs`'s existing per-crtc `SurfaceData` map (which
+/// already loops over every known crtc — see the RFC's Multi-Monitor
+/// section on how little of the real DRM scanning path actually assumes
+/// single-output) is real, hardware-facing work deliberately left
+/// unstarted this session: it touches the exact code path the user's
+/// live `mudhuts --tty` session depends on today, and — unlike every
+/// other node in this file — isn't verifiable by a unit test at all, so
+/// it deserves to be built and reviewed with the user present, not
+/// blind while they're away.
+pub struct OutputHut;
+
+impl OutputHut {
+    /// Resolve and return whatever's linked to `display`, if anything —
+    /// the one real operation an output sink needs, called once per
+    /// render pass by whatever backend owns the actual hardware output
+    /// this represents.
+    pub fn present<Env>(&self, graph: &mut Graph<Env>, self_id: NodeId) -> Option<PortValue> {
+        let display = graph.hut_input(self_id, "display")?;
+        graph.resolve_output(display, "content")
+    }
+}
+
+impl<Env> Node<Env> for OutputHut {
+    fn inputs(&self) -> &[InputPort] {
+        OUTPUT_INPUTS
+    }
+    fn outputs(&self) -> &[OutputPort] {
+        &[]
+    }
+    fn resolve(&mut self, _graph: &mut Graph<Env>, _self_id: NodeId, _port: &'static str) -> PortValue {
+        unreachable!("OutputHut has no outputs — see Self::present, not Node::resolve")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,6 +531,68 @@ mod tests {
             matches!(graph.resolve_output(client_id, "content"), Some(PortValue::Content(_))),
             "an unlinked terminal input shouldn't panic or fail resolution, just fall back"
         );
+    }
+
+    #[test]
+    fn main_window_node_shows_main_and_still_touches_every_minimized_entry() {
+        let mut graph = Graph::new();
+        let (main, main_resolved) = leaf(&mut graph);
+        let (min_a, min_a_resolved) = leaf(&mut graph);
+        let (min_b, min_b_resolved) = leaf(&mut graph);
+        let node_id = graph.add_node(Box::new(MainWindowNode));
+        graph.link_hut(node_id, "main", main).unwrap();
+        graph.set_hut_list(node_id, "minimized", vec![min_a, min_b]).unwrap();
+
+        graph.begin_frame();
+        graph.resolve_output(node_id, "content");
+        assert!(main_resolved.get(), "main should be resolved — it's what's actually shown");
+        assert!(min_a_resolved.get(), "every minimized entry should still be reachable/traversed");
+        assert!(min_b_resolved.get(), "every minimized entry should still be reachable/traversed");
+    }
+
+    #[test]
+    fn main_window_node_with_no_main_linked_falls_back_to_placeholder() {
+        let mut graph = Graph::new();
+        let node_id = graph.add_node(Box::new(MainWindowNode));
+        graph.begin_frame();
+        assert!(matches!(graph.resolve_output(node_id, "content"), Some(PortValue::Content(_))));
+    }
+
+    #[test]
+    fn layer_shell_node_shows_display_and_touches_every_layer() {
+        let mut graph = Graph::new();
+        let (display, display_resolved) = leaf(&mut graph);
+        let (layer, layer_resolved) = leaf(&mut graph);
+        let node_id = graph.add_node(Box::new(LayerShellNode));
+        graph.link_hut(node_id, "display", display).unwrap();
+        graph.set_hut_list(node_id, "layers", vec![layer]).unwrap();
+
+        graph.begin_frame();
+        graph.resolve_output(node_id, "content");
+        assert!(display_resolved.get());
+        assert!(layer_resolved.get(), "layer-shell clients should still be reachable/traversed");
+    }
+
+    #[test]
+    fn output_hut_present_resolves_whatever_is_linked_to_display() {
+        let mut graph = Graph::new();
+        let (display, display_resolved) = leaf(&mut graph);
+        let output_id = graph.add_node(Box::new(OutputHut));
+        graph.link_hut(output_id, "display", display).unwrap();
+
+        graph.begin_frame();
+        let output = OutputHut;
+        assert!(output.present(&mut graph, output_id).is_some());
+        assert!(display_resolved.get());
+    }
+
+    #[test]
+    fn output_hut_present_with_nothing_linked_is_none_not_a_panic() {
+        let mut graph = Graph::new();
+        let output_id = graph.add_node(Box::new(OutputHut));
+        graph.begin_frame();
+        let output = OutputHut;
+        assert!(output.present(&mut graph, output_id).is_none());
     }
 
     #[test]
