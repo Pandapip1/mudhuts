@@ -38,32 +38,40 @@ impl XdgShellHandler for State {
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Activated);
         });
-        if self.output.is_some() {
-            // Sized to the *usable* area, not the raw output geometry —
-            // shrunk by any layer-shell surface's exclusive zone (a
-            // status bar, say) — see `State::usable_area`'s doc comment.
-            // Logical, not physical: this is a real `xdg_toplevel`
-            // configure, which Wayland always expresses in logical
-            // coordinates — see `State::usable_area_logical`'s doc
-            // comment.
-            let (_, _, usable_w, usable_h) = self.usable_area_logical();
-            surface.with_pending_state(|state| {
-                state.states.set(xdg_toplevel::State::Fullscreen);
-                state.size = Some(smithay::utils::Size::from((usable_w, usable_h)));
-            });
-        }
-
         // Default ConsoleHut assignment needs no protocol: walk the connecting
         // client's process ancestry back to a known ConsoleHut's shell PID (see
         // the plan's Phase 4 notes). Falls back to the focused ConsoleHut if the
         // client's credentials aren't available or no ancestor matches
         // (e.g. it wasn't actually launched from one of our shells).
+        //
+        // Resolved before the initial-configure sizing below (not after)
+        // so that sizing can use this window's own real owning output —
+        // possibly a backgrounded one with a different size/scale than
+        // the focused output — instead of baking in the wrong size on
+        // the client's very first frame.
         let owning_hut_id = surface
             .wl_surface()
             .client()
             .and_then(|client| client.get_credentials(&self.display_handle).ok())
             .and_then(|creds| ownership::find_owning_hut(creds.pid as u32, &self.stack))
             .unwrap_or_else(|| self.stack.focused().id);
+
+        if let Some(output_index) = self.stack.output_index_for_hut(owning_hut_id) {
+            // Sized to the *usable* area, not the raw output geometry —
+            // shrunk by any layer-shell surface's exclusive zone (a
+            // status bar, say) — see `State::usable_area`'s doc comment.
+            // Logical, not physical: this is a real `xdg_toplevel`
+            // configure, which Wayland always expresses in logical
+            // coordinates — see `State::usable_area_logical`'s doc
+            // comment. Per this window's own owning output, not
+            // `self.usable_area_logical()` (the focused one) — see this
+            // block's own reordering note above.
+            let (_, _, usable_w, usable_h) = self.usable_area_logical_for(output_index);
+            surface.with_pending_state(|state| {
+                state.states.set(xdg_toplevel::State::Fullscreen);
+                state.size = Some(smithay::utils::Size::from((usable_w, usable_h)));
+            });
+        }
 
         let window = Window::new_wayland_window(surface);
         let wl_surface = window.toplevel().map(|t| t.wl_surface().clone());
@@ -181,6 +189,7 @@ impl XdgShellHandler for State {
         // output's Hut by the time `motion`/`unset` run later, if the
         // pointer crosses onto another monitor mid-drag.
         let hut_id = self.stack.focused().id;
+        let output_index = self.stack.focused_output_index();
 
         let Some(window) = self.find_window_by_surface(&wl_surface) else {
             return;
@@ -201,6 +210,7 @@ impl XdgShellHandler for State {
             surface: wl_surface,
             floating_window: is_floating_window,
             hut_id,
+            output_index,
         };
 
         pointer.set_grab(self, grab, serial, Focus::Clear);

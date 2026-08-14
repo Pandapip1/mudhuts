@@ -86,6 +86,24 @@ pub struct DockDrag {
     /// `DockDrag` is constructed in [`start_drag`] — `None` only for the
     /// instant between the two, never observed by anything else.
     redraw: Option<RedrawHandle>,
+    /// The `ConsoleHut` that actually owns the dragged handle — captured
+    /// once at drag-start time, not re-resolved via
+    /// `state.stack.focused_mut()` on every callback. Mirrors
+    /// `grabs.rs`'s `MoveSurfaceGrab::hut_id`: real multi-monitor's
+    /// focus-follows-mouse can move input focus to a different output
+    /// mid-drag, and writing the drag's position/scale lookups against
+    /// *that* output instead of the drag's real owner would silently
+    /// migrate it into an unrelated Hut/output.
+    hut_id: u64,
+    /// `hut_id`'s output at drag-start time — a fast-path hint for
+    /// `advance_drag`'s hot loop (driven by every pointer-motion sample
+    /// during a drag), same tradeoff as `grabs.rs`'s
+    /// `MoveSurfaceGrab::output_index`: an output unplug/renumber
+    /// mid-drag can make it stale, so [`advance_drag`]'s Hut lookup
+    /// falls back to a full search rather than ever trusting a miss here
+    /// as "the Hut exited" (its scale lookup, less critical, just
+    /// tolerates staying stale for that one rare case).
+    output_index: usize,
 }
 
 impl Redrawable for DockDrag {
@@ -284,6 +302,8 @@ pub fn start_drag(state: &mut State, pos: Point<f64, Physical>) -> bool {
         start: pos,
         detached: false,
         redraw: None,
+        hut_id: state.stack.focused().id,
+        output_index: state.stack.focused_output_index(),
     };
     drag.attach_redraw_handle(state.redraw_handle());
     state.dock_drag = Some(drag);
@@ -305,14 +325,31 @@ pub fn advance_drag(state: &mut State, pos: Point<f64, Physical>) {
     let surface = drag.surface.clone();
     let start = drag.start;
     let detached = drag.detached;
+    let hut_id = drag.hut_id;
+    let output_index = drag.output_index;
+    // The drag's own owning output, not `state.output_scale()`/the
+    // focused one — see [`DockDrag::output_index`]'s doc comment. Cached
+    // rather than re-resolved every call (this runs on every
+    // pointer-motion sample during a drag).
+    let scale = state.output_scale_for(output_index);
 
     if !detached {
         let delta = pos - start;
-        if delta.x.hypot(delta.y) <= DETACH_THRESHOLD * state.output_scale() {
+        if delta.x.hypot(delta.y) <= DETACH_THRESHOLD * scale {
             return;
         }
-        let logical = pos.to_logical(Scale::from(state.output_scale())).to_i32_round();
-        if let Some(sub) = state.stack.focused_mut().floating_window_mut(&surface) {
+        let logical = pos.to_logical(Scale::from(scale)).to_i32_round();
+        // Fast path first (see `output_index`'s doc comment) — falls
+        // back to the full graph-wide search only on a miss.
+        let hut = match state.stack.find_mut_for(output_index, hut_id) {
+            Some(hut) => Some(hut),
+            None => state.stack.find_mut(hut_id),
+        };
+        let Some(hut) = hut else {
+            // The owning Hut exited mid-drag — nothing left to update.
+            return;
+        };
+        if let Some(sub) = hut.floating_window_mut(&surface) {
             sub.dock = Dock::Floating(logical);
         }
         if let Some(drag) = &mut state.dock_drag {
@@ -323,11 +360,15 @@ pub fn advance_drag(state: &mut State, pos: Point<f64, Physical>) {
     }
 
     if let Some(window) = state.find_window_by_surface(&surface) {
-        let logical = pos.to_logical(Scale::from(state.output_scale())).to_i32_round();
-        state
-            .stack
-            .focused_mut()
-            .space
+        let logical = pos.to_logical(Scale::from(scale)).to_i32_round();
+        let hut = match state.stack.find_mut_for(output_index, hut_id) {
+            Some(hut) => Some(hut),
+            None => state.stack.find_mut(hut_id),
+        };
+        let Some(hut) = hut else {
+            return;
+        };
+        hut.space
             .map_element(crate::space_element::HutSpaceElement::Window(window), logical, true);
     }
 }
@@ -349,23 +390,34 @@ pub fn finish_drag(state: &mut State) {
     let Some(window) = state.find_window_by_surface(&drag.surface) else {
         return;
     };
-    let Some(location) = state
-        .stack
-        .focused()
-        .space
-        .element_location(&crate::space_element::HutSpaceElement::Window(window.clone()))
+    // The drag's own owning Hut, not `state.stack.focused()` — see
+    // [`DockDrag::hut_id`]'s doc comment: the pointer may have crossed
+    // onto a different output mid-drag.
+    let Some(hut) = state.stack.find_mut(drag.hut_id) else {
+        // The owning Hut exited mid-drag — nothing left to persist.
+        return;
+    };
+    let Some(location) =
+        hut.space
+            .element_location(&crate::space_element::HutSpaceElement::Window(window.clone()))
     else {
         return;
     };
     let size = window.geometry().size;
-    // `location`/`size` come from the focused Console Hut's own `space`,
-    // so they're genuinely Logical — compared against the output's
-    // Logical size here, not
-    // `state.output_size` (physical), to keep both sides of every
-    // distance check in the same space (see `State::output_size_logical`'s
-    // doc comment).
-    let redock_edge = nearest_edge_within_threshold(state.output_size_logical(), location, size);
-    if let Some(sub) = state.stack.focused_mut().floating_window_mut(&drag.surface) {
+    // `location`/`size` come from the drag's own owning Hut's `space`,
+    // so they're genuinely Logical — compared against *that Hut's own
+    // output's* Logical size, not `state.output_size_logical()` (the
+    // focused output, possibly a different one by now), to keep the
+    // distance check meaningful for the output the window is actually
+    // being dropped on.
+    let Some(output_index) = state.stack.output_index_for_hut(drag.hut_id) else {
+        return;
+    };
+    let redock_edge = nearest_edge_within_threshold(state.output_size_logical_for(output_index), location, size);
+    let Some(hut) = state.stack.find_mut(drag.hut_id) else {
+        return;
+    };
+    if let Some(sub) = hut.floating_window_mut(&drag.surface) {
         sub.dock = match redock_edge {
             Some(edge) => Dock::Docked(edge),
             None => Dock::Floating(location),

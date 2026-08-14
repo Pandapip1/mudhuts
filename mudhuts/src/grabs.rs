@@ -51,6 +51,13 @@ pub struct MoveSurfaceGrab {
     /// owner's would silently migrate it into an unrelated Hut's window
     /// set while the actual owner's own data model went stale.
     pub hut_id: u64,
+    /// `hut_id`'s output at grab-start time — a fast-path hint for
+    /// `motion`'s hot loop (see `GraphStack::find_mut_for`'s doc
+    /// comment), not assumed to still be correct on every later
+    /// callback: an output unplug/renumber mid-drag can make it stale,
+    /// so every use falls back to a full `GraphStack::find_mut` rather
+    /// than ever trusting a miss here as "the Hut exited."
+    pub output_index: usize,
 }
 
 impl PointerGrab<State> for MoveSurfaceGrab {
@@ -66,7 +73,15 @@ impl PointerGrab<State> for MoveSurfaceGrab {
 
         let delta = event.location - self.start_data.location;
         let new_location = self.initial_window_location.to_f64() + delta;
-        let Some(hut) = data.stack.find_mut(self.hut_id) else {
+        // Fast path first (see `output_index`'s doc comment) — falls
+        // back to the full graph-wide search only on a miss, so a
+        // stale/unplugged-mid-drag output index can never be mistaken
+        // for the Hut itself having exited.
+        let hut = match data.stack.find_mut_for(self.output_index, self.hut_id) {
+            Some(hut) => Some(hut),
+            None => data.stack.find_mut(self.hut_id),
+        };
+        let Some(hut) = hut else {
             // The owning Hut exited mid-drag (its shell exited under the
             // dragged window) — nothing left to update.
             return;
@@ -235,7 +250,16 @@ impl PointerGrab<State> for MoveSurfaceGrab {
             return;
         };
         let redock_edge = nearest_edge_within_threshold(data.output_size_logical_for(output_index), location, size);
-        let hut = data.stack.find_mut(self.hut_id).expect("just resolved above");
+        // Re-resolved rather than reusing `hut` above — the borrow
+        // checker requires it (an immutable borrow of `data.stack` sits
+        // between the two), not because the Hut could plausibly have
+        // gone away in the gap. Handled gracefully rather than
+        // `.expect()`-ing that assumption anyway, matching this
+        // function's own no-panics handling everywhere else.
+        let Some(hut) = data.stack.find_mut(self.hut_id) else {
+            data.request_redraw();
+            return;
+        };
         if let Some(sub) = hut.floating_window_mut(&self.surface) {
             sub.dock = match redock_edge {
                 Some(edge) => Dock::Docked(edge),
