@@ -917,31 +917,28 @@ impl State {
                 }
 
                 if self.showing_terminal_effective() && vertical_amount != 0.0 {
-                    // Accumulate raw `vertical_amount` (the same
-                    // physical-pixel-ish unit libinput/Wayland's
-                    // `wp_pointer.axis` always uses) and only act once a
-                    // full `WHEEL_CLICK_PX` has built up, carrying the
-                    // remainder — rather than treating every single
-                    // `PointerAxis` event as "at least one click," which
-                    // is what both branches below used to do. A real
-                    // discrete mouse wheel already sends ~15px (one
-                    // click) per event, so this changes nothing for it;
-                    // a trackpad's continuous `AxisSource::Finger` events
-                    // are much smaller and much more frequent, and
-                    // treating each of those as its own click was making
-                    // a single gentle swipe register as dozens of clicks
-                    // — both scrolling a TUI app's (vim/less/btop/...)
-                    // own scrollback far faster than the same physical
-                    // motion should, and (when no app has grabbed the
-                    // mouse) mudhuts' own terminal scrollback the same
-                    // way.
-                    let hut = self.stack.focused_mut();
-                    hut.scroll_accum += vertical_amount;
-                    let clicks = (hut.scroll_accum / WHEEL_CLICK_PX).trunc() as i32;
-                    if clicks != 0 {
-                        hut.scroll_accum -= clicks as f64 * WHEEL_CLICK_PX;
+                    if self.stack.focused().terminal.wants_mouse_reports() {
+                        // Accumulate raw `vertical_amount` (the same
+                        // physical-pixel-ish unit libinput/Wayland's
+                        // `wp_pointer.axis` always uses) and only act once
+                        // a full `WHEEL_CLICK_PX` has built up, carrying
+                        // the remainder — rather than treating every
+                        // single `PointerAxis` event as "at least one
+                        // click." A real discrete mouse wheel already
+                        // sends ~15px (one click) per event, so this
+                        // changes nothing for it; a trackpad's continuous
+                        // `AxisSource::Finger` events are much smaller and
+                        // much more frequent, and treating each of those
+                        // as its own click was making a single gentle
+                        // swipe register as dozens of clicks, scrolling a
+                        // TUI app's (vim/less/btop/...) own scrollback far
+                        // faster than the same physical motion should.
+                        let hut = self.stack.focused_mut();
+                        hut.wheel_click_accum += vertical_amount;
+                        let clicks = (hut.wheel_click_accum / WHEEL_CLICK_PX).trunc() as i32;
+                        if clicks != 0 {
+                            hut.wheel_click_accum -= clicks as f64 * WHEEL_CLICK_PX;
 
-                        if self.stack.focused().terminal.wants_mouse_reports() {
                             if let Some(pointer) = self.seat.get_pointer() {
                                 let pos = self.to_physical(pointer.current_location());
                                 let (ox, oy) = self.active_pane_offset();
@@ -963,16 +960,30 @@ impl State {
                                     );
                                 }
                             }
-                        } else {
-                            // No app has grabbed the mouse — scroll this
-                            // ConsoleHut's own scrollback instead of doing
-                            // nothing, 3 lines per click (unchanged from
-                            // before this fix). `clicks > 0` is "scroll
-                            // down" (same convention as the wheel-report
-                            // mapping above); `Terminal::scroll`'s sign is
-                            // the opposite (positive moves further *up*
-                            // into history).
-                            self.stack.focused().terminal.scroll(-clicks * 3);
+                        }
+                    } else {
+                        // No app has grabbed the mouse — scroll this
+                        // ConsoleHut's own scrollback instead. Thresholded
+                        // against the terminal's *real* cell height, not
+                        // `WHEEL_CLICK_PX` (an unrelated wheel-click
+                        // convention that only matters for the SGR-report
+                        // branch above) — one line per full cell-height's
+                        // worth of accumulated motion, so a scroll gesture
+                        // moves the view by roughly the distance it
+                        // visually covered, rather than jumping a fixed
+                        // multiple of lines per 15px regardless of how
+                        // tall a line actually is.
+                        let cell_h = self.stack.focused().glyphs.cell_height() as f64;
+                        let hut = self.stack.focused_mut();
+                        hut.scroll_line_accum += vertical_amount;
+                        let lines = (hut.scroll_line_accum / cell_h).trunc() as i32;
+                        if lines != 0 {
+                            hut.scroll_line_accum -= lines as f64 * cell_h;
+                            // `lines > 0` is "scroll down" (same convention
+                            // as the wheel-report mapping above);
+                            // `Terminal::scroll`'s sign is the opposite
+                            // (positive moves further *up* into history).
+                            self.stack.focused().terminal.scroll(-lines);
                             self.request_redraw();
                         }
                     }

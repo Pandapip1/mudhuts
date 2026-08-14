@@ -129,12 +129,24 @@ pub struct ConsoleHut {
     pub showing_terminal: Signal<bool>,
     /// Fractional scroll-wheel/trackpad distance (physical pixels,
     /// signed the same way `input.rs`'s `PointerAxis` handling reads
-    /// `vertical_amount`) not yet converted into a whole line of
-    /// scrollback movement. See `input.rs`'s `PointerAxis` handler for
-    /// why accumulating this (instead of flooring every event to at
-    /// least one line) matters for continuous-scroll devices like a
-    /// trackpad, which send many small events per swipe.
-    pub scroll_accum: f64,
+    /// `vertical_amount`) not yet converted into a whole discrete wheel
+    /// "click" — thresholded against `input.rs::WHEEL_CLICK_PX`, the
+    /// ~15px-per-click convention a grabbing TUI app (vim/less/btop/...)
+    /// expects its SGR mouse-wheel reports to use. See `input.rs`'s
+    /// `PointerAxis` handler for why accumulating this (instead of
+    /// flooring every event to at least one click) matters for
+    /// continuous-scroll devices like a trackpad, which send many small
+    /// events per swipe.
+    pub wheel_click_accum: f64,
+    /// Same idea as [`Self::wheel_click_accum`], but thresholded against
+    /// the terminal's own real cell height instead of a wheel-click
+    /// convention — used only when nothing's grabbed the mouse, to scroll
+    /// this ConsoleHut's *own* scrollback exactly one line per full
+    /// cell-height's worth of accumulated motion, rather than
+    /// `wheel_click_accum`'s click-then-multiply approach (which made a
+    /// gentle trackpad swipe jump several lines at once, tied to an
+    /// unrelated 15px unit instead of how tall a line actually is).
+    pub scroll_line_accum: f64,
 
     /// This ConsoleHut's own `Space<HutSpaceElement>` (composable Hut
     /// hierarchy RFC migration step 5 sub-step 2) — replaces the old single
@@ -215,7 +227,8 @@ impl ConsoleHut {
                 main_windows: Vec::new(),
                 active_main_window: Signal::new(0),
                 showing_terminal: Signal::new(true),
-                scroll_accum: 0.0,
+                wheel_click_accum: 0.0,
+                scroll_line_accum: 0.0,
             },
             events,
         ))
