@@ -539,6 +539,24 @@ impl GraphStack {
         Some(&mut self.graph.downcast_mut::<ConsoleNode>(node_id)?.hut)
     }
 
+    /// [`Self::find_mut`], scoped to one output's own subtree — a cheap
+    /// fast path for hot loops (`grabs.rs`'s `MoveSurfaceGrab::motion`,
+    /// `docks.rs`'s `advance_drag`, both driven by every pointer-motion
+    /// sample during a drag) that already know which output a captured
+    /// `hut_id` last resolved to, instead of paying `find_mut`'s full
+    /// every-output walk on every single sample. `None` scoped just to
+    /// `output_index` doesn't necessarily mean the Hut is gone —
+    /// `output_index` can go stale if an output was unplugged/renumbered
+    /// mid-drag — so callers on a hot path should fall back to
+    /// [`Self::find_mut`] before concluding the Hut actually exited.
+    pub fn find_mut_for(&mut self, output_index: usize, id: u64) -> Option<&mut ConsoleHut> {
+        let node_id = self
+            .all_node_ids_for(output_index)
+            .into_iter()
+            .find(|&node_id| self.graph.downcast::<ConsoleNode>(node_id).is_some_and(|c| c.hut.id == id))?;
+        Some(&mut self.graph.downcast_mut::<ConsoleNode>(node_id)?.hut)
+    }
+
     /// Every `ConsoleHut` anywhere in the graph, across every output —
     /// mirrors `MruStackHut::all_huts`.
     pub fn all_huts(&self) -> impl Iterator<Item = &ConsoleHut> {
@@ -1030,6 +1048,14 @@ impl GraphStack {
                 // long session of repeated tab open/close.
                 let max_index = children.len().saturating_sub(1);
                 let _ = self.graph.set_hut_list(parent, "children", children);
+                // Shift `active` left by one if the removed child sat
+                // before it (so it keeps pointing at the same surviving
+                // child, which has now slid down one index), otherwise
+                // just clamp — a plain `.min(max_index)` alone would
+                // leave `active` pointing at the *next* child over
+                // whenever the removed one was before it, silently
+                // changing which tab/pane reads as focused.
+                let shift_active = |old: usize| if removed_index < old { old - 1 } else { old.min(max_index) };
                 if let Some(tab) = self.graph.downcast_mut::<TabNode>(parent) {
                     if removed_index < tab.label_cache.len() {
                         tab.label_cache.remove(removed_index);
@@ -1040,12 +1066,12 @@ impl GraphStack {
                     if removed_index < tab.bg_tracker.len() {
                         tab.bg_tracker.remove(removed_index);
                     }
-                    *tab.active = (*tab.active).min(max_index);
+                    *tab.active = shift_active(*tab.active);
                 } else if let Some(tile) = self.graph.downcast_mut::<TileNode>(parent) {
                     if removed_index < tile.fracs.len() {
                         tile.fracs.remove(removed_index);
                     }
-                    *tile.active = (*tile.active).min(max_index);
+                    *tile.active = shift_active(*tile.active);
                 }
             }
             return;
@@ -1344,6 +1370,42 @@ mod tests {
         assert_eq!(tab.label_cache.len(), 2, "shrunk in step with children");
         assert_eq!(tab.tab_ids.len(), 2);
         assert_eq!(tab.bg_tracker.len(), 2);
+    }
+
+    #[test]
+    fn remove_child_shifts_active_left_when_the_removed_child_sat_before_it() {
+        // Regression case: a plain `.min(max_index)` clamp alone leaves
+        // `active` pointing at the *next* child over whenever the
+        // removed child sat before it, since clamping only catches the
+        // "removed the last child" case — it doesn't shift `active` to
+        // keep tracking the same surviving child. 4 children, active
+        // pointing at the 3rd (index 2); removing the 1st (index 0)
+        // should leave `active` at index 1 (still the same child, now
+        // shifted down), not clamped-but-wrong at index 2.
+        let mut stack = new_stack();
+        let a_id = stack.focused().id;
+        stack.spawn_and_insert().unwrap();
+        stack.spawn_and_insert().unwrap();
+        stack.spawn_and_insert().unwrap();
+        let node_ids: Vec<NodeId> = stack.outputs[0].huts.drain(..).collect();
+        assert_eq!(node_ids.len(), 4);
+
+        let mut tab = TabNode::new();
+        *tab.active = 2; // pointing at the 3rd child
+        Redrawable::attach_redraw_handle(&mut tab, stack.redraw.clone());
+        let tab_id = stack.graph.add_node(Box::new(tab));
+        stack.graph.set_hut_list(tab_id, "children", node_ids.clone()).unwrap();
+        stack.outputs[0].huts.push(tab_id);
+        stack.outputs[0].current = 0;
+
+        let expected_survivor = node_ids[2];
+        stack.remove_exited(a_id).unwrap(); // removes the 1st child, before `active`
+
+        let children = stack.graph.hut_list_input(tab_id, "children");
+        assert_eq!(children.len(), 3);
+        let tab = stack.graph.downcast::<TabNode>(tab_id).unwrap();
+        assert_eq!(*tab.active, 1, "shifted left to keep pointing at the same surviving child");
+        assert_eq!(children[*tab.active], expected_survivor, "active still resolves to the child that was focused before the removal");
     }
 
     #[test]
