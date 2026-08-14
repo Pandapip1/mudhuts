@@ -271,7 +271,7 @@ pub(crate) struct Inner {
     /// these) — without this, every single render pass would re-upload
     /// the same pixel data to a fresh GPU texture even when the cursor's
     /// visible frame hasn't changed since the last one.
-    pointer_image_cache: Vec<((CursorIcon, usize), MemoryRenderBuffer)>,
+    pointer_image_cache: Vec<((CursorIcon, usize, i32), MemoryRenderBuffer)>,
     /// Connectors currently classified as leasable (see the module doc's
     /// DRM-leasing section) together with the CRTC `rescan_connectors`
     /// found for them. Never gets a desktop `Output`/`SurfaceData` entry
@@ -1401,7 +1401,7 @@ fn build_cursor_elements(
     renderer: &mut GlesRenderer,
     pointer_images: &mut HashMap<CursorIcon, Cursor>,
     pointer_element: &mut PointerElement,
-    pointer_image_cache: &mut Vec<((CursorIcon, usize), MemoryRenderBuffer)>,
+    pointer_image_cache: &mut Vec<((CursorIcon, usize, i32), MemoryRenderBuffer)>,
     output_index: usize,
 ) -> Vec<Elements> {
     // A client's cursor surface can be destroyed without the client ever
@@ -1446,8 +1446,8 @@ fn build_cursor_elements(
             let pointer_image = pointer_images.entry(*icon).or_insert_with(|| Cursor::load(*icon));
             match pointer_image.frame(scale_int as u32, state.start_time.elapsed()) {
                 Some((frame_index, image)) => {
-                    // Cache key is `(icon, frame_index)` — a cheap
-                    // identity, not `Image`'s own `PartialEq`, which
+                    // Cache key is `(icon, frame_index, scale_int)` — a
+                    // cheap identity, not `Image`'s own `PartialEq`, which
                     // includes the raw pixel buffer
                     // (`pixels_rgba`/`pixels_argb`) and did a byte-for-
                     // byte comparison against every cached entry on
@@ -1456,8 +1456,16 @@ fn build_cursor_elements(
                     // because `Cursor::icons` (`cursor.rs`) is a fixed
                     // list built once at `Cursor::load` time and never
                     // mutated afterward, so a given `(icon, frame_index)`
-                    // always names the same frame for this session.
-                    let key = (*icon, frame_index);
+                    // always names the same frame's pixels for this
+                    // session — but `scale_int` still has to be part of
+                    // the key: a theme with only one bitmap size per icon
+                    // returns the same `frame_index` regardless of the
+                    // scale requested, and the buffer built below bakes
+                    // `scale_int` into `MemoryRenderBuffer::from_slice`.
+                    // Without it, two differently-scaled outputs showing
+                    // the same icon collided on one cache entry and
+                    // reused a buffer built for the wrong scale.
+                    let key = (*icon, frame_index, scale_int);
                     let buffer = pointer_image_cache
                         .iter()
                         .find(|(cached, _)| *cached == key)
