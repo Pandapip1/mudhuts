@@ -15,12 +15,19 @@
 //! exclusive-zone-shrunk rect to everything that sizes/positions normal
 //! content (`render.rs`, `handlers/xdg_shell.rs`, `stack.rs`).
 //!
-//! v1 scope: layer surfaces are always mapped on mudhuts' one output
-//! (single-output throughout, like everything else here); a layer
-//! surface hosting its own `xdg_popup` (`get_popup`) isn't given any
-//! special positioning support (`new_popup` is a no-op) — a documented
-//! gap, not expected to matter for the common panel/launcher/notification
-//! cases this is aimed at.
+//! Real multi-monitor (step 7): a layer surface can map on any real
+//! output, not just the focused one (`new_layer_surface` honors a
+//! client's explicit `wl_output` choice) — `handle_commit`/
+//! `layer_destroyed` search every output's own `LayerMap` rather than
+//! assuming `State::output` (the focused one), and
+//! `reconfigure_main_windows` only touches Main Windows on the specific
+//! output whose exclusive zone actually changed
+//! (`GraphStack::all_huts_for`), never an unrelated monitor's.
+//!
+//! v1 scope gap, unrelated to the above: a layer surface hosting its own
+//! `xdg_popup` (`get_popup`) isn't given any special positioning support
+//! (`new_popup` is a no-op) — not expected to matter for the common
+//! panel/launcher/notification cases this is aimed at.
 
 use smithay::desktop::{LayerSurface, WindowSurfaceType, layer_map_for_output};
 use smithay::output::Output;
@@ -63,12 +70,18 @@ impl WlrLayerShellHandler for State {
     }
 
     fn layer_destroyed(&mut self, surface: smithay::wayland::shell::wlr_layer::LayerSurface) {
-        let found = self.output.as_ref().and_then(|o| {
-            let map = layer_map_for_output(o);
-            map.layers()
+        // Search every real output's own layer map, not just the focused
+        // one (`self.output`) — a layer surface can be mapped on any
+        // output (see `new_layer_surface`'s explicit `wl_output`
+        // handling), so a status bar closing on a backgrounded monitor
+        // must still be found and unmapped from *its own* map.
+        let outputs: Vec<Output> = self.stack.outputs().iter().map(|slot| slot.output.clone()).collect();
+        let found = outputs.into_iter().find_map(|o| {
+            let layer = layer_map_for_output(&o)
+                .layers()
                 .find(|l| l.layer_surface() == &surface)
-                .cloned()
-                .map(|l| (o.clone(), l))
+                .cloned();
+            layer.map(|l| (o, l))
         });
         if let Some((output, layer)) = found {
             // `unmap_layer` re-`arrange()`s internally too — same
@@ -79,13 +92,15 @@ impl WlrLayerShellHandler for State {
             // Three separate, sequential (non-overlapping) locks, not one
             // held across all three calls — `reconfigure_main_windows`
             // itself also locks this same per-output `Mutex` internally
-            // (via `State::usable_area_logical`), so nothing here can
+            // (via `State::usable_area_logical_for`), so nothing here can
             // still be held by the time that runs either.
             let before = layer_map_for_output(&output).non_exclusive_zone();
             layer_map_for_output(&output).unmap_layer(&layer);
             let after = layer_map_for_output(&output).non_exclusive_zone();
-            if before != after {
-                reconfigure_main_windows(self);
+            if before != after
+                && let Some(output_index) = self.stack.output_index_for(&output)
+            {
+                reconfigure_main_windows(self, output_index);
             }
         }
         self.request_redraw();
@@ -99,16 +114,17 @@ impl WlrLayerShellHandler for State {
 /// one yet. A no-op if `surface` isn't a layer surface at all. Called
 /// from `handlers/compositor.rs`'s `commit()`.
 pub fn handle_commit(state: &mut State, surface: &WlSurface) {
-    let Some(output) = state
-        .output
-        .as_ref()
-        .filter(|o| {
-            layer_map_for_output(o)
-                .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
-                .is_some()
-        })
-        .cloned()
-    else {
+    // Search every real output's own layer map, not just the focused one
+    // (`state.output`) — `new_layer_surface` honors a client's explicit
+    // `wl_output` choice, so a status bar bound to a backgrounded monitor
+    // would otherwise never be found here, never get its initial
+    // configure, and never render.
+    let outputs: Vec<Output> = state.stack.outputs().iter().map(|slot| slot.output.clone()).collect();
+    let Some(output) = outputs.into_iter().find(|o| {
+        layer_map_for_output(o)
+            .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
+            .is_some()
+    }) else {
         return;
     };
 
@@ -137,10 +153,10 @@ pub fn handle_commit(state: &mut State, surface: &WlSurface) {
     // appeared (or before the panel grew its exclusive zone) kept
     // rendering at its original, now-too-large size, visibly overlapping
     // the panel. Comparing the zone before/after `arrange()` (not calling
-    // `State::usable_area_logical()`, which would try to lock this same
-    // per-output `Mutex` a second time while `map` is still held) and
-    // reconfiguring every already-mapped Main Window only when it
-    // actually changed fixes that.
+    // `State::usable_area_logical_for()`, which would try to lock this
+    // same per-output `Mutex` a second time while `map` is still held)
+    // and reconfiguring every already-mapped Main Window *on this same
+    // output* only when it actually changed fixes that.
     let before = map.non_exclusive_zone();
     map.arrange();
     let after = map.non_exclusive_zone();
@@ -151,25 +167,31 @@ pub fn handle_commit(state: &mut State, surface: &WlSurface) {
     }
     drop(map);
 
-    if before != after {
-        reconfigure_main_windows(state);
+    if before != after
+        && let Some(output_index) = state.stack.output_index_for(&output)
+    {
+        reconfigure_main_windows(state, output_index);
     }
 }
 
-/// Re-sends every already-mapped Main Window (across every ConsoleHut,
-/// not just the focused one — a backgrounded Hut's window should already
-/// be correctly sized by the time the user Alt-Tabs to it, not resize
-/// visibly right as it becomes visible) a fresh `xdg_toplevel.configure`
-/// at the current usable-area size — see `handle_commit`'s own doc
-/// comment on why this needs to happen explicitly rather than just
-/// falling out of the normal per-frame redraw. Every mudhuts window is
-/// always fullscreen (see `handlers/xdg_shell.rs::new_toplevel`'s doc
-/// comment) — there's no other window state that would make a different
-/// size correct for some windows and not others.
-fn reconfigure_main_windows(state: &mut State) {
-    let (_, _, w, h) = state.usable_area_logical();
+/// Re-sends every already-mapped Main Window on `output_index`'s own
+/// output (across every ConsoleHut on that output, not just the focused
+/// one — a backgrounded Hut's window should already be correctly sized
+/// by the time the user Alt-Tabs to it, not resize visibly right as it
+/// becomes visible) a fresh `xdg_toplevel.configure` at that output's
+/// current usable-area size — see `handle_commit`'s own doc comment on
+/// why this needs to happen explicitly rather than just falling out of
+/// the normal per-frame redraw. Deliberately scoped to just this one
+/// output (`GraphStack::all_huts_for`, not `all_huts`): a zone change on
+/// one monitor must never resize windows on an unrelated one. Every
+/// mudhuts window is always fullscreen (see
+/// `handlers/xdg_shell.rs::new_toplevel`'s doc comment) — there's no
+/// other window state that would make a different size correct for some
+/// windows and not others.
+fn reconfigure_main_windows(state: &mut State, output_index: usize) {
+    let (_, _, w, h) = state.usable_area_logical_for(output_index);
     let size = Size::from((w, h));
-    for hut in state.stack.all_huts() {
+    for hut in state.stack.all_huts_for(output_index) {
         for entry in hut.main_windows() {
             let Some(toplevel) = entry.window.toplevel() else {
                 continue;

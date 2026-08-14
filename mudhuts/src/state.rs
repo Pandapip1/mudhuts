@@ -737,6 +737,20 @@ impl State {
         (zone.loc.x, zone.loc.y, zone.size.w, zone.size.h)
     }
 
+    /// [`Self::usable_area_logical`], for a *specific* output rather than
+    /// implicitly the focused one — mirrors [`Self::usable_area_for`]'s
+    /// own reason for existing: `handlers/layer_shell.rs`'s
+    /// `reconfigure_main_windows` must build an `xdg_toplevel` configure
+    /// size against the output a change actually happened on, which is
+    /// not always the currently-focused one.
+    pub fn usable_area_logical_for(&self, output_index: usize) -> (i32, i32, i32, i32) {
+        let Some(slot) = self.stack.outputs().get(output_index) else {
+            return (0, 0, self.output_size.0, self.output_size.1);
+        };
+        let zone = layer_map_for_output(&slot.output).non_exclusive_zone();
+        (zone.loc.x, zone.loc.y, zone.size.w, zone.size.h)
+    }
+
     /// The whole output's current size, genuinely [`Logical`] (scale-
     /// divided) — as opposed to `self.output_size`, which is always
     /// physical. Used wherever a physical-pixel-native value (a dragged

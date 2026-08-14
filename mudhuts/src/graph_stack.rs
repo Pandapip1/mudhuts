@@ -254,6 +254,19 @@ impl GraphStack {
         self.focused_output
     }
 
+    /// Which `OutputSlot` (if any) wraps this real `Output` — `Output`'s
+    /// own `PartialEq` is `Arc::ptr_eq` (real handle identity, not mode/
+    /// name comparison), so this correctly picks out one specific
+    /// connector even if two outputs briefly share a mode/scale. Needed
+    /// anywhere a real `Output` handle is the only thing on hand (a
+    /// layer-shell surface's own `wl_output`, resolved via
+    /// `Output::from_resource`) and the caller needs to reach that
+    /// output's own `_for(output_index)` accessors instead of always the
+    /// focused one.
+    pub fn output_index_for(&self, output: &Output) -> Option<usize> {
+        self.outputs.iter().position(|slot| &slot.output == output)
+    }
+
     /// Per the user's resolved multi-monitor policy: focus follows the
     /// mouse across outputs. Called from `input.rs`'s pointer-motion
     /// handling with whichever output's real geometry now contains the
@@ -544,11 +557,35 @@ impl GraphStack {
             .map(|n| &n.hut)
     }
 
+    /// Every `ConsoleHut` reachable from a single output's own top-level
+    /// entries — the per-output counterpart of [`Self::all_huts`], for
+    /// anything that must only touch what's actually on one specific
+    /// output's own screen (`handlers/layer_shell.rs`'s
+    /// `reconfigure_main_windows`, which must not resize windows on an
+    /// unrelated monitor just because *this* output's exclusive zone
+    /// changed).
+    pub fn all_huts_for(&self, output_index: usize) -> impl Iterator<Item = &ConsoleHut> {
+        self.all_node_ids_for(output_index)
+            .into_iter()
+            .filter_map(|id| self.graph.downcast::<ConsoleNode>(id))
+            .map(|n| &n.hut)
+    }
+
     /// Every node id reachable from any output's top-level entries —
     /// the graph-native walk `MruStackHut::all_huts`'s `Hut::all_huts`
     /// recursion used to do directly on owned `Vec<Hut>` structure, done
     /// here against `hut_list_input` links instead.
     fn all_node_ids(&self) -> Vec<NodeId> {
+        self.all_node_ids_from(self.all_top_level_entries().copied())
+    }
+
+    /// [`Self::all_node_ids`], scoped to one output's own top-level
+    /// entries only.
+    fn all_node_ids_for(&self, output_index: usize) -> Vec<NodeId> {
+        self.all_node_ids_from(self.top_level_entries_for(output_index).copied())
+    }
+
+    fn all_node_ids_from(&self, tops: impl Iterator<Item = NodeId>) -> Vec<NodeId> {
         fn walk(graph: &Graph<RenderEnv>, id: NodeId, out: &mut Vec<NodeId>) {
             out.push(id);
             for child in graph.hut_list_input(id, "children") {
@@ -556,7 +593,7 @@ impl GraphStack {
             }
         }
         let mut out = Vec::new();
-        for &top in self.all_top_level_entries().collect::<Vec<_>>() {
+        for top in tops {
             walk(&self.graph, top, &mut out);
         }
         out
