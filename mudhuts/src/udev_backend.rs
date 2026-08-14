@@ -1184,6 +1184,36 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
     // on the simpler, more universally-exercised pure-composition path
     // is the safer default until there's a specific reason to want the
     // performance/power benefit of scanout.
+    // A locked frame reflecting the current locked state has been built
+    // (via `render.rs`'s early-return guard) into `elements` above,
+    // regardless of whether this particular render pass finds any actual
+    // pixel damage — called from both the "queued a new frame" and "no
+    // damage, already showing this" branches below. See
+    // `handlers/session_lock.rs`'s `lock` doc comment for why confirming
+    // can't happen any earlier (e.g. synchronously inside that handler).
+    // Only tells the locking client its lock succeeded once *every*
+    // currently-connected output has reached this point — see
+    // `State::pending_lock_confirmed_outputs`'s doc comment: each crtc
+    // queues independently, so confirming on the first one to finish
+    // would let every other monitor's pre-lock content stay visible
+    // after the client's already been told the session is secured.
+    let mark_this_output_confirmed = |state: &mut State| {
+        if !state.locked || state.pending_lock.is_none() {
+            return;
+        }
+        if !state.pending_lock_confirmed_outputs.contains(&output) {
+            state.pending_lock_confirmed_outputs.push(output.clone());
+        }
+        let all_confirmed = state
+            .stack
+            .outputs()
+            .iter()
+            .all(|slot| state.pending_lock_confirmed_outputs.contains(&slot.output));
+        if all_confirmed && let Some(confirmation) = state.pending_lock.take() {
+            confirmation.lock();
+        }
+    };
+
     match surface
         .drm_output
         .render_frame(renderer, &elements, [0.0, 0.0, 0.0, 1.0], FrameFlags::empty())
@@ -1201,39 +1231,24 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
                         if let Some(adaptive) = surface.adaptive_refresh.as_mut() {
                             adaptive.frames_since_check += 1;
                         }
-                        // A locked frame has actually been built (via
-                        // `render.rs`'s early-return guard) and
-                        // successfully queued for real presentation on
-                        // *this* output. See `handlers/session_lock.rs`'s
-                        // `lock` doc comment for why confirming can't
-                        // happen any earlier (e.g. synchronously inside
-                        // that handler). But this only tells the locking
-                        // client its lock succeeded once *every*
-                        // currently-connected output has reached this
-                        // point — see `State::pending_lock_confirmed_outputs`'s
-                        // doc comment: each crtc queues independently, so
-                        // confirming on the first one to finish would let
-                        // every other monitor's pre-lock content stay
-                        // visible after the client's already been told
-                        // the session is secured.
-                        if state.locked && state.pending_lock.is_some() {
-                            if !state.pending_lock_confirmed_outputs.contains(&output) {
-                                state.pending_lock_confirmed_outputs.push(output.clone());
-                            }
-                            let all_confirmed = state
-                                .stack
-                                .outputs()
-                                .iter()
-                                .all(|slot| state.pending_lock_confirmed_outputs.contains(&slot.output));
-                            if all_confirmed && let Some(confirmation) = state.pending_lock.take() {
-                                confirmation.lock();
-                            }
-                        }
+                        mark_this_output_confirmed(state);
                     }
                     Err(err) => tracing::warn!("failed to queue DRM frame: {err}"),
                 }
             } else {
                 tracing::debug!("render_surface: no damage for {crtc:?}, waiting for the next redraw ping");
+                // No damage means this output's *currently displayed*
+                // frame already matches `elements` pixel-for-pixel — if
+                // locked, it's already correctly showing the locked
+                // backdrop this exact render pass just built, so this
+                // output can be marked confirmed too. Without this, a
+                // lock→unlock→lock cycle fast enough that an output's
+                // damage tracker sees no diff against its own
+                // already-blanked last frame never got added to
+                // `pending_lock_confirmed_outputs` at all, stalling the
+                // confirmation forever unless some unrelated redraw
+                // happened to perturb that specific output later.
+                mark_this_output_confirmed(state);
             }
         }
         Err(err) => tracing::warn!("render_frame failed: {err}"),
