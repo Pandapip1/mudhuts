@@ -28,12 +28,6 @@
 //! stays fully unit-tested, since none of them need a live context to
 //! construct or resolve.
 
-// Nothing in `main.rs`/`render.rs`/`input.rs` constructs these node
-// types yet — the module's own unit tests already exercise everything
-// that can be (see above). Remove once migration step 4 cuts the real
-// call paths over to the graph.
-#![allow(dead_code)]
-
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -54,11 +48,19 @@ const CONTENT_OUTPUT: &[OutputPort] = &[OutputPort { name: "content", kind: Port
 /// with a `children: HutList` input instead of an owned `Vec<Hut>`.
 pub struct TabNode {
     pub active: Signal<usize>,
+    /// Per-child tab-strip chrome caches — mirrors `TabbedHut::
+    /// label_cache`/`tab_ids`/`bg_tracker` exactly (same "parallel array,
+    /// caller keeps it in sync with `children`" convention `TileNode::
+    /// fracs` already uses; see that field's own doc comment). Consumed
+    /// by `village_chrome.rs`'s graph-based tab-strip rendering.
+    pub label_cache: Vec<crate::render::LabelCache<(String, bool)>>,
+    pub tab_ids: Vec<(smithay::backend::renderer::element::Id, smithay::backend::renderer::element::Id)>,
+    pub bg_tracker: Vec<crate::render::ChangeTracker<bool>>,
 }
 
 impl TabNode {
     pub fn new() -> Self {
-        Self { active: Signal::new(0) }
+        Self { active: Signal::new(0), label_cache: Vec::new(), tab_ids: Vec::new(), bg_tracker: Vec::new() }
     }
 
     /// Meta+Left/Right's own-level step, once nothing deeper had
@@ -144,11 +146,29 @@ pub struct TileNode {
     pub active: Signal<usize>,
     pub fracs: Vec<f64>,
     pub size: (i32, i32),
+    /// Stable identities for the 4 border strips drawn around whichever
+    /// pane is `active` — mirrors `TileHut::highlight_ids` exactly (see
+    /// that field's own doc comment). The actual border-drawing code
+    /// stays a `render.rs`-level concern, not this node's own `resolve`
+    /// — same split the enum version already has (`TileHut` just carries
+    /// the ids; `render.rs::build_tile_elements` draws them).
+    pub highlight_ids: [smithay::backend::renderer::element::Id; 4],
 }
 
 impl TileNode {
     pub fn new(axis: Axis) -> Self {
-        Self { axis, active: Signal::new(0), fracs: Vec::new(), size: (0, 0) }
+        Self {
+            axis,
+            active: Signal::new(0),
+            fracs: Vec::new(),
+            size: (0, 0),
+            highlight_ids: [
+                smithay::backend::renderer::element::Id::new(),
+                smithay::backend::renderer::element::Id::new(),
+                smithay::backend::renderer::element::Id::new(),
+                smithay::backend::renderer::element::Id::new(),
+            ],
+        }
     }
 
     /// Same wraparound rule as [`TabNode::cycle`], applied to which pane
@@ -298,7 +318,29 @@ impl Redrawable for TileNode {
 /// drive rendering in the first place.
 #[derive(Clone)]
 pub struct RenderEnv {
-    pub renderer: Rc<RefCell<Option<GlesRenderer>>>,
+    /// `Option<Rc<...>>`, not `Rc<RefCell<Option<...>>>` — this needs to
+    /// be the *exact same* `Rc<RefCell<GlesRenderer>>` allocation a
+    /// backend already owns (`udev_backend.rs`'s `Inner::renderer`,
+    /// shared via `State::dmabuf_renderer`), not an independently-owned
+    /// second one: there is only ever one real `GlesRenderer` (one GL
+    /// context) for the whole compositor, and a node like `ConsoleNode`
+    /// rendering into a *different* `GlesRenderer` instance than the one
+    /// the rest of a frame composites with would be a real correctness
+    /// bug (a texture created in one GL context can't be used by
+    /// another). `None` only in the brief window before a backend
+    /// creates the real renderer — same reasoning as the `Option` on
+    /// `GraphStack`'s placeholder output (see that module's doc comment).
+    ///
+    /// **Callers resolving graph content must never hold their own
+    /// borrow of this same `Rc<RefCell<_>>` (e.g. via
+    /// `State::dmabuf_renderer`) at the same time they call into the
+    /// graph** — `RefCell::borrow_mut` panics on a second concurrent
+    /// borrow, and this genuinely is the same allocation. See
+    /// `render.rs::resolve_frame_content`'s own doc comment for the real
+    /// call-ordering discipline this requires: resolve the graph
+    /// *before* a backend's own render pass acquires its own borrow, not
+    /// during.
+    pub renderer: Option<Rc<RefCell<GlesRenderer>>>,
 }
 
 const LEAF_OUTPUTS: &[OutputPort] = &[OutputPort { name: "content", kind: PortKind::Content }];
@@ -367,11 +409,11 @@ impl Node<RenderEnv> for ConsoleNode {
         // (ultimately the real output's `usable_area()` origin, applied
         // once at the very top, not baked in here).
         if *self.hut.showing_terminal || self.hut.main_window_count() == 0 {
-            let mut guard = graph.env.renderer.borrow_mut();
-            let Some(renderer) = guard.as_mut() else {
+            let Some(renderer_rc) = graph.env.renderer.as_ref() else {
                 return PortValue::Content(Vec::new());
             };
-            let Some(texture) = self.hut.redraw(renderer) else {
+            let mut guard = renderer_rc.borrow_mut();
+            let Some(texture) = self.hut.redraw(&mut guard) else {
                 return PortValue::Content(Vec::new());
             };
             let damage = self.hut.element_damage_snapshot();
@@ -441,6 +483,17 @@ impl Redrawable for ConsoleNode {
     }
 }
 
+// WaylandClientNode/MainWindowNode/LayerShellNode/OutputHut, below, are
+// deliberately not wired into any real call path by migration step 4's
+// cutover — ConsoleNode alone (bundling terminal + Main Windows, exactly
+// like ConsoleHut already does) was enough for a faithful cutover of
+// today's actual behavior. These four are the real Main-Window-Hut
+// redesign's building blocks (separate main/minimized ports, a real
+// per-output Layer-Shell root, a true no-output sink) — a distinct,
+// larger, not-yet-started wishlist item layered on *after* this cutover,
+// not a prerequisite for it. Kept here, fully built and unit-tested
+// (hence the per-item `#[allow(dead_code)]` below, not a deletion).
+#[allow(dead_code)]
 const CLIENT_INPUTS: &[InputPort] = &[InputPort { name: "terminal", kind: PortKind::Hut }];
 
 /// Graph-native Wayland-client Hut: a single client toplevel window,
@@ -459,11 +512,13 @@ const CLIENT_INPUTS: &[InputPort] = &[InputPort { name: "terminal", kind: PortKi
 /// element tree, including subsurfaces/popups, so this node doesn't need
 /// to enumerate any of that itself — same "local frame, translated by
 /// the caller" convention as `ConsoleNode`/`TileNode`.
+#[allow(dead_code)]
 pub struct WaylandClientNode {
     pub window: Window,
     pub showing_terminal: Signal<bool>,
 }
 
+#[allow(dead_code)]
 impl WaylandClientNode {
     pub fn new(window: Window) -> Self {
         Self { window, showing_terminal: Signal::new(false) }
@@ -477,6 +532,7 @@ impl WaylandClientNode {
 /// `WaylandClientNode` needing a real `Window` to even construct (see
 /// this module's doc comment on why nothing GPU/protocol-shaped can be
 /// unit-tested past that point).
+#[allow(dead_code)]
 fn terminal_pass_through_target(showing_terminal: bool, terminal: Option<NodeId>) -> Option<NodeId> {
     if showing_terminal { terminal } else { None }
 }
@@ -511,6 +567,7 @@ impl Redrawable for WaylandClientNode {
     }
 }
 
+#[allow(dead_code)]
 const MAIN_WINDOW_INPUTS: &[InputPort] = &[
     InputPort { name: "main", kind: PortKind::Hut },
     InputPort { name: "minimized", kind: PortKind::HutList },
@@ -533,6 +590,7 @@ const MAIN_WINDOW_INPUTS: &[InputPort] = &[
 /// resolve, proven the same way `TileNode`'s "touch every child" test
 /// proves its own list traversal) even though nothing composites them
 /// visually yet.
+#[allow(dead_code)]
 pub struct MainWindowNode;
 
 impl<Env> Node<Env> for MainWindowNode {
@@ -564,6 +622,7 @@ impl<Env> Node<Env> for MainWindowNode {
     }
 }
 
+#[allow(dead_code)]
 const LAYER_SHELL_INPUTS: &[InputPort] = &[
     InputPort { name: "display", kind: PortKind::Hut },
     InputPort { name: "layers", kind: PortKind::HutList },
@@ -584,6 +643,7 @@ const LAYER_SHELL_INPUTS: &[InputPort] = &[
 /// verified correct in `project_known_issues`'s "layer-shell rendering
 /// bug" write-up — the bug was never in that logic) plugs in at
 /// migration step 4's cutover, not here.
+#[allow(dead_code)]
 pub struct LayerShellNode;
 
 impl<Env> Node<Env> for LayerShellNode {
@@ -612,6 +672,7 @@ impl<Env> Node<Env> for LayerShellNode {
     }
 }
 
+#[allow(dead_code)]
 const OUTPUT_INPUTS: &[InputPort] = &[InputPort { name: "display", kind: PortKind::Hut }];
 
 /// Migration step 7: Output Hut — a physical monitor, modeled as a real
@@ -642,8 +703,10 @@ const OUTPUT_INPUTS: &[InputPort] = &[InputPort { name: "display", kind: PortKin
 /// other node in this file — isn't verifiable by a unit test at all, so
 /// it deserves to be built and reviewed with the user present, not
 /// blind while they're away.
+#[allow(dead_code)]
 pub struct OutputHut;
 
+#[allow(dead_code)]
 impl OutputHut {
     /// Resolve and return whatever's linked to `display`, if anything —
     /// the one real operation an output sink needs, called once per
@@ -676,9 +739,6 @@ impl<Env> Node<Env> for OutputHut {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hut::{Hut, TabbedHut};
-    use crate::render::{ChangeTracker, LabelCache};
-    use smithay::backend::renderer::element::Id;
 
     /// A minimal leaf `Node` for these tests — no inputs, a `Content`
     /// output identifiable enough (via `resolve_count`) to prove *which*
@@ -722,19 +782,6 @@ mod tests {
         let resized: std::rc::Rc<std::cell::Cell<(i32, i32)>> = Default::default();
         let id = graph.add_node(Box::new(LeafNode { resolved: Default::default(), resized: resized.clone() }));
         (id, resized)
-    }
-
-    /// A cheap placeholder `Hut::Tab` — mirrors `hut::tests::placeholder`
-    /// (private to that module), needed here to build a real `TabbedHut`
-    /// fixture to compare `TabNode::cycle` against.
-    fn placeholder_hut() -> Hut {
-        Hut::Tab(TabbedHut {
-            children: Vec::new(),
-            active: Signal::new(0),
-            label_cache: Vec::new(),
-            tab_ids: Vec::new(),
-            bg_tracker: Vec::new(),
-        })
     }
 
     #[test]
@@ -902,45 +949,31 @@ mod tests {
     }
 
     #[test]
-    fn tab_node_cycling_matches_hut_tab_cycling_step_for_step() {
-        // Real `TabbedHut` fixture (3 children) alongside a `TabNode`
-        // fixture with the same child count — stepping both through the
-        // same Next/Next/Prev sequence and asserting their `active`
-        // indices agree at every step is a genuine equivalence check,
-        // not just a resemblance: both ultimately call the exact same
-        // `wrapping_step` helper (see this module's doc comment), so a
-        // future edit to one wraparound rule without the other would
-        // fail this test rather than silently diverge.
-        let mut enum_tab = TabbedHut {
-            children: vec![placeholder_hut(), placeholder_hut(), placeholder_hut()],
-            active: Signal::new(0),
-            label_cache: vec![LabelCache::new(), LabelCache::new(), LabelCache::new()],
-            tab_ids: vec![(Id::new(), Id::new()), (Id::new(), Id::new()), (Id::new(), Id::new())],
-            bg_tracker: vec![ChangeTracker::new(), ChangeTracker::new(), ChangeTracker::new()],
-        };
-
+    fn tab_node_cycling_wraps_in_both_directions_across_three_children() {
+        // The equivalence-with-the-old-enum version of this test (`hut::
+        // TabbedHut` no longer exists — migration step 4's cutover, see
+        // `docs/rfcs/typed-graph-hut.md`) is superseded by `graph_stack::
+        // tests::cycle_innermost_bubbles_up_and_wraps` and friends, which
+        // exercise this same `wrapping_step` call through a real, live
+        // `GraphStack`. This one stays as a plain, direct check of
+        // `TabNode::cycle`'s own wraparound sequence in isolation.
         let mut graph = Graph::new();
         let (a, _) = leaf(&mut graph);
         let (b, _) = leaf(&mut graph);
         let (c, _) = leaf(&mut graph);
-        // Registered in the graph only to reserve a real id with the
-        // right declared port shape for `set_hut_list`'s kind-check —
-        // the actual node stepped below is a separate, standalone
-        // `TabNode` value (`graph_tab`), since `cycle` only needs shared
-        // read access to the graph (for the child count), not to be the
-        // exact boxed instance living inside it.
         let tab_id = graph.add_node(Box::new(TabNode::new()));
         graph.set_hut_list(tab_id, "children", vec![a, b, c]).unwrap();
-        let mut graph_tab = TabNode::new();
+        let mut tab = TabNode::new();
 
-        for dir in [Direction::Next, Direction::Next, Direction::Prev, Direction::Prev, Direction::Prev] {
-            let enum_len = enum_tab.children.len();
-            *enum_tab.active = wrapping_step(enum_len, *enum_tab.active, dir);
-            graph_tab.cycle(&graph, tab_id, dir);
-            assert_eq!(
-                *graph_tab.active, *enum_tab.active,
-                "TabNode and TabbedHut should land on the same active index for {dir:?}"
-            );
+        for (dir, expected) in [
+            (Direction::Next, 1),
+            (Direction::Next, 2),
+            (Direction::Next, 0),
+            (Direction::Prev, 2),
+            (Direction::Prev, 1),
+        ] {
+            tab.cycle(&graph, tab_id, dir);
+            assert_eq!(*tab.active, expected, "wrong active index after cycling {dir:?}");
         }
     }
 }

@@ -20,7 +20,6 @@ use smithay::utils::{Buffer, Rectangle, Scale, Transform};
 use crate::State;
 use crate::chrome::to_color32f;
 use crate::console_hut::ConsoleHut;
-use crate::hut::Hut;
 use crate::space_element::{CompositedTexture, HutSpaceElement, HutSpaceRenderElement, synthetic_output};
 use crate::{chrome, docks, switcher, village_chrome};
 
@@ -497,80 +496,103 @@ pub(crate) fn hut_thumbnail_texture(id: u64) -> Option<(GlesTexture, DamageSnaps
     })
 }
 
-/// Whichever content this tick's focused view actually shows — a
-/// Tile-Hut's panes, the terminal, or the focused Console Hut's own
-/// `space` — built the same way each of `build_frame_elements`'s three
-/// branches always has, in the same real-output-*absolute* physical
-/// coordinates they always have: **every** branch (the terminal included)
-/// positions its content at `usable_area()`'s own origin, not literally
-/// `(0, 0)` — matching `State::active_pane_offset()`'s identical
-/// assumption for mouse routing (selection, click, scroll) in exactly
-/// this non-Tile case. The terminal branch didn't for a while (rendered
-/// unconditionally at `(0, 0)`) — a real bug, not a documented exception:
-/// invisible whenever `usable_area()`'s origin was already `(0, 0)`
-/// (`usable_area()` only reserves from below/the sides shift `w`/`h`, not
-/// `loc`, unless something's anchored to the *top* or *left* edge —
-/// e.g. a bottom-anchored `wlr-layer-shell` panel, which never moves the
-/// origin), which is why it went unnoticed until a top-anchored panel
-/// (reported live: waybar's `position: top`) made the terminal's content
-/// render `origin.y` pixels higher than every mouse/selection coordinate
-/// assumed it was, while the panel's own surface — positioned by
-/// Smithay's own `layer_map_for_output`/`space_render_elements`, entirely
-/// unrelated machinery — rendered and hit-tested correctly the whole
-/// time. See [`composite_normal_content`]'s own doc comment on why using
-/// real-output-absolute coordinates throughout has to stay true all the
-/// way through to the offscreen texture this gets rendered into.
-fn content_elements(state: &mut State, renderer: &mut GlesRenderer) -> Vec<Element> {
-    if matches!(state.stack.focused_top_level(), Hut::Tile(tile) if tile.children.len() >= 2) {
-        return build_tile_elements(state, renderer);
+/// Resolve whichever content this tick's focused view actually shows —
+/// migration step 4's real cutover point: walks the typed graph
+/// (`docs/rfcs/typed-graph-hut.md`) instead of recursing through the old
+/// `Hut` enum. **Must be called before the caller's own backend acquires
+/// its own borrow of the shared renderer** (`udev_backend.rs`'s
+/// `render_surface`, `winit_backend.rs`'s redraw handler) — this
+/// internally borrows the exact same `Rc<RefCell<GlesRenderer>>` a
+/// backend's own render pass also borrows (see `graph_nodes::RenderEnv`'s
+/// own doc comment for why they have to be the same allocation), and
+/// `RefCell` panics on a second concurrent borrow. Called once per real
+/// frame (the returned `Vec<ContentPiece>` is then threaded through
+/// [`build_frame_elements`]), not resolved fresh at every point something
+/// needs it.
+///
+/// Empty while `state.locked` — matches the old pre-graph behavior
+/// exactly (`content_elements` was only ever reachable through
+/// `composite_normal_content`, itself only called after
+/// `build_frame_elements`'s own locked-session early return) — no reason
+/// to spend a real GPU redraw on content that's never going to be shown.
+pub fn resolve_frame_content(state: &mut State) -> Vec<crate::graph::ContentPiece> {
+    if state.locked {
+        return Vec::new();
     }
+    let top = state.stack.focused_top_level();
+    state.stack.begin_frame();
+    state.stack.resolve_content(top)
+}
 
-    if state.showing_terminal_effective() {
-        let scale = state.output_scale();
-        // Computed before taking `hut`'s mutable borrow below —
-        // `usable_area` needs `&state` as a whole, which the borrow
-        // checker won't allow alongside an active `&mut state.stack`
-        // borrow (same reasoning as `State::sync_visible_main_window`).
-        let (area_x, area_y, _, _) = state.usable_area();
-        let hut = state.stack.focused_mut();
-        let Some(texture) = hut.redraw(renderer) else {
-            return Vec::new();
-        };
-        // `from_texture_with_damage`, not `from_static_texture` — the
-        // terminal's content genuinely changes every keystroke, and
-        // `from_static_texture` is documented by Smithay as creating an
-        // element with no damage tracking at all (see
-        // `ConsoleHut::damage_tracker`'s doc comment).
-        //
-        // Buffer scale, not an explicit `size` — see
-        // `texture_buffer_scale`'s doc comment for why leaving this `1`
-        // double-applies the output's scale once it's non-1.0, and why an
-        // explicit `size` alone isn't the right fix either.
-        let element = TextureRenderElement::from_texture_with_damage(
-            hut.element_id.clone(),
-            renderer.context_id(),
-            (area_x as f64, area_y as f64),
-            texture,
-            texture_buffer_scale(scale),
-            Transform::Normal,
-            None,
-            None,
-            None,
-            None,
-            hut.element_damage_snapshot(),
-            Kind::Unspecified,
-        );
-        return vec![OutputRenderElements::from(element)];
-    }
+/// Convert `content` (already resolved by [`resolve_frame_content`],
+/// *before* `renderer` was ever borrowed — see that function's doc
+/// comment) into real frame elements, in the same real-output-*absolute*
+/// physical coordinates every branch always used pre-graph: `Texture`
+/// pieces arrive local-frame-relative and get `usable_area()`'s own
+/// origin applied here (matching `State::active_pane_offset()`'s
+/// identical assumption for mouse routing); `Window` pieces arrive
+/// already-absolute and don't (see `graph::ContentPiece`'s own doc
+/// comment on why the two aren't symmetric).
+///
+/// Also draws a Tile-Hut's active-pane border highlight — the one piece
+/// of `content_elements`'s pre-graph job that stays a `render.rs`-level
+/// concern rather than something `TileNode::resolve` itself produces
+/// (see `TileNode::highlight_ids`'s own doc comment) — using the exact
+/// same `hut::pane_rects` call `TileNode`'s own `resolve`/
+/// `resize_to_pixels` already use, so this can never disagree with where
+/// a pane actually is.
+fn content_elements(
+    state: &mut State,
+    renderer: &mut GlesRenderer,
+    content: Vec<crate::graph::ContentPiece>,
+) -> Vec<Element> {
+    let area = state.usable_area();
+    let scale = state.output_scale();
+    let mut elements = content_pieces_to_elements(content, renderer, (area.0 as f64, area.1 as f64), scale);
 
-    let hut = state.stack.focused_mut();
-    match space_render_elements::<_, HutSpaceElement, _>(renderer, [&hut.space], &hut.space_output, 1.0) {
-        Ok(space_elements) => space_elements.into_iter().map(OutputRenderElements::from).collect(),
-        Err(err) => {
-            tracing::warn!("failed to collect space elements: {err}");
-            Vec::new()
+    let top = state.stack.focused_top_level();
+    if let Some(tile) = state.stack.graph().downcast::<crate::graph_nodes::TileNode>(top) {
+        let children_len = state.stack.graph().hut_list_input(top, "children").len();
+        if children_len >= 2 {
+            let fracs = if tile.fracs.len() == children_len { tile.fracs.clone() } else { vec![1.0; children_len] };
+            let active = (*tile.active).min(children_len.saturating_sub(1));
+            let highlight_ids = tile.highlight_ids.clone();
+            let rects = crate::hut::pane_rects(tile.axis, fracs.into_iter(), (area.2, area.3));
+            if let Some(&(x, y, w, h)) = rects.get(active) {
+                let (x, y) = (x + area.0, y + area.1);
+                const BASE_BORDER: i32 = 3;
+                let border = scaled(BASE_BORDER, scale).max(1);
+                let color = to_color32f(state.theme.tile_border);
+                let strips = [
+                    (x, y, w, border),
+                    (x, y + h - border, w, border),
+                    (x, y, border, h),
+                    (x + w - border, y, border, h),
+                ];
+                let mut highlights = Vec::new();
+                for (id, (sx, sy, sw, sh)) in highlight_ids.into_iter().zip(strips) {
+                    let background = SolidColorRenderElement::new(
+                        id,
+                        Rectangle::<i32, smithay::utils::Physical>::new(
+                            smithay::utils::Point::from((sx, sy)),
+                            smithay::utils::Size::from((sw, sh)),
+                        ),
+                        CommitCounter::default(),
+                        color,
+                        Kind::Unspecified,
+                    );
+                    highlights.push(OutputRenderElements::from(background));
+                }
+                // Frontmost — pushed ahead of the pane content itself, per
+                // this module's front-to-back push order (index 0 renders
+                // on top), so the border actually renders *above* the
+                // active pane's content instead of being hidden behind it.
+                elements.splice(0..0, highlights);
+            }
         }
     }
+
+    elements
 }
 
 /// Composite [`content_elements`]'s current output into one offscreen
@@ -617,12 +639,13 @@ fn composite_normal_content(
     state: &mut State,
     renderer: &mut GlesRenderer,
     size: (i32, i32),
+    content: Vec<crate::graph::ContentPiece>,
 ) -> Option<CompositedTexture> {
     if size.0 <= 0 || size.1 <= 0 {
         return None;
     }
     let scale = state.output_scale();
-    let elements = content_elements(state, renderer);
+    let elements = content_elements(state, renderer, content);
     let buffer_size: smithay::utils::Size<i32, Buffer> = size.into();
 
     thread_local! {
@@ -747,6 +770,7 @@ pub fn build_frame_elements(
     state: &mut State,
     renderer: &mut GlesRenderer,
     size: (i32, i32),
+    content: Vec<crate::graph::ContentPiece>,
 ) -> Vec<OutputRenderElements<GlesRenderer, HutSpaceRenderElement>> {
     // First, always — regardless of what else this frame does (even a
     // locked session below still has a live renderer here): reclaim
@@ -770,7 +794,9 @@ pub fn build_frame_elements(
     }
 
     let show_terminal = state.showing_terminal_effective();
-    let is_tile = matches!(state.stack.focused_top_level(), Hut::Tile(tile) if tile.children.len() >= 2);
+    let top = state.stack.focused_top_level();
+    let is_tile = state.stack.graph().downcast::<crate::graph_nodes::TileNode>(top).is_some()
+        && state.stack.graph().hut_list_input(top, "children").len() >= 2;
     let scale = state.output_scale();
     let mut elements = Vec::new();
 
@@ -779,10 +805,18 @@ pub fn build_frame_elements(
     // thumbnail, so while it's open they all need fresh cached textures.
     // Redundant with the focused ConsoleHut's own redraw further down (cheap: a
     // second `redraw` call in the same tick is a no-op cache hit, since
-    // damage was already reset by the first).
+    // damage was already reset by the first). Uses the already-borrowed
+    // `renderer` parameter directly (safe here — this runs *after*
+    // `resolve_frame_content` already released its own internal borrow of
+    // the same underlying renderer; see that function's doc comment),
+    // not another `graph.resolve_output` call.
     if state.stack.is_previewing() {
-        for hut in state.stack.top_level_huts_mut() {
-            hut.redraw(renderer);
+        let top_level: Vec<crate::graph::NodeId> = state.stack.all_top_level_entries().copied().collect();
+        for &top in &top_level {
+            let leaf = state.stack.graph().focused_leaf(top);
+            if let Some(console) = state.stack.graph_mut().downcast_mut::<crate::graph_nodes::ConsoleNode>(leaf) {
+                console.hut.redraw(renderer);
+            }
         }
         // Same "only while previewing" gate, for entries showing a Main
         // Window instead of their terminal — see
@@ -792,9 +826,14 @@ pub fn build_frame_elements(
         // anywhere else the way `ConsoleHut::redraw`'s terminal texture
         // already is).
         let (area_x, area_y, _, _) = state.usable_area();
-        for entry in state.stack.top_level_entries_mut() {
-            if !entry.shows_terminal_effective() {
-                refresh_hut_content_thumbnail(entry.focused_hut_mut(), renderer, (area_x, area_y), size, scale);
+        for &top in &top_level {
+            if !state.stack.shows_terminal_effective(top) {
+                let leaf = state.stack.graph().focused_leaf(top);
+                if let Some(console) =
+                    state.stack.graph_mut().downcast_mut::<crate::graph_nodes::ConsoleNode>(leaf)
+                {
+                    refresh_hut_content_thumbnail(&mut console.hut, renderer, (area_x, area_y), size, scale);
+                }
             }
         }
     }
@@ -811,10 +850,10 @@ pub fn build_frame_elements(
     // terminal (never a Main Window — see `village.rs`'s module doc on
     // why that's this pass's deliberate scope), so there's no Hut-level
     // tab strip / Main-Window tab strip / dock handle to draw. A 1-child
-    // (or empty) Tile never actually exists (`Hut::collapse_if_singleton`
-    // unwraps it immediately), but the length check (`is_tile`, above)
-    // stays as a defensive fallback to the normal pipeline rather than
-    // assumed.
+    // (or empty) Tile never actually exists (`GraphStack::remove_exited`'s
+    // collapse rule unwraps it immediately), but the length check
+    // (`is_tile`, above) stays as a defensive fallback to the normal
+    // pipeline rather than assumed.
     if !is_tile {
         // Hut-level tab strip(s) (Phase 6) — one per Tab-Hut along
         // the active path, stacked from the top of the screen, outermost
@@ -824,7 +863,8 @@ pub fn build_frame_elements(
         let cell_w = state.stack.focused().glyphs.cell_width().max(1);
         let cell_h = state.stack.focused().glyphs.cell_height().max(1) as i32;
         let (village_tab_elements, next_y) = village_chrome::build(
-            state.stack.focused_top_level_mut(),
+            state.stack.graph_mut(),
+            top,
             renderer,
             0,
             cell_w,
@@ -869,7 +909,7 @@ pub fn build_frame_elements(
     // inside it is already positioned in real-output-absolute coordinates,
     // so the canvas it's rendered onto (and where that canvas then lands)
     // has to match that same coordinate range, not a smaller, re-based one.
-    let composited = composite_normal_content(state, renderer, size);
+    let composited = composite_normal_content(state, renderer, size, content);
     if let Some(output) = state.output.clone() {
         let mut root_space = Space::<HutSpaceElement>::default();
         root_space.map_output(&output, (0, 0));
@@ -893,130 +933,3 @@ pub fn build_frame_elements(
     elements
 }
 
-/// Build a Tile-Hut's panes side by side: each child's own terminal
-/// texture (already sized to its pane by `Hut::resize_to_pixels` — see
-/// that method and [`crate::hut::pane_rects`]), composited at its pane's
-/// screen position via a private `Space<HutSpaceElement>` (composable Hut
-/// hierarchy RFC migration step 5 sub-step 3 — each pane's texture is a
-/// `HutSpaceElement::Composited`, mapped and rendered the same generic way
-/// `ConsoleHut::space` already composites its own content, rather than
-/// hand-rolled `TextureRenderElement` construction), plus a highlight
-/// border around whichever pane currently has keyboard focus. Only called
-/// once the caller's confirmed the focused top-level Hut really is a
-/// `Hut::Tile` with 2+ children.
-///
-/// The `Space` here is a fresh, per-call local, *not* a persistent
-/// `TileHut` field the way `ConsoleHut::space` is — unlike a Console Hut's
-/// Main Window (a real, persistent `Window` `sync_visible_main_window`
-/// only remaps on focus/visibility changes), every pane's content here is
-/// an ephemeral, single-use `CompositedTexture` rebuilt fresh every frame
-/// regardless (v1 scope: a pane only ever shows its Console Hut's
-/// terminal, never a real Main Window — see `hut.rs`'s module doc), so
-/// there's no frame-to-frame state actually worth keeping — mirrors
-/// `hut_space.rs`'s original step-3 prototype's own local-`Space` pattern,
-/// now for real.
-///
-/// Panes are normal content — like the terminal-visible branch above,
-/// sized and positioned against [`State::usable_area`], not the raw
-/// output rect. Gets its actual rects from [`crate::hut::TileHut::absolute_pane_rects`],
-/// the same computation `State::active_pane_offset` and
-/// `input.rs::try_click_chrome`'s pane hit-test share (composable Hut
-/// hierarchy RFC's Q3) — the three can never disagree about where a pane
-/// actually is, since there's only one computation left to disagree with
-/// itself. The pane `Space`'s own synthetic output is always mapped at
-/// `(0, 0)` within it (same reasoning as `ConsoleHut::space_output`), so
-/// mapping each pane's element at its *absolute* screen position (not
-/// re-derived relative to the pane `Space`'s own origin) still comes out
-/// byte-identical to what direct `TextureRenderElement` construction
-/// produced before — confirmed against `Space::render_elements_for_region`'s
-/// own math (it subtracts the output's own location, which is zero here).
-fn build_tile_elements(
-    state: &mut State,
-    renderer: &mut GlesRenderer,
-) -> Vec<OutputRenderElements<GlesRenderer, HutSpaceRenderElement>> {
-    let area = state.usable_area();
-    let scale = state.output_scale();
-    let Hut::Tile(tile) = state.stack.focused_top_level_mut() else {
-        return Vec::new();
-    };
-    let rects = tile.absolute_pane_rects(area);
-    let active = *tile.active;
-    let highlight_ids = tile.highlight_ids.clone();
-
-    let mut elements = Vec::new();
-
-    // Pushed first — frontmost, per this module's front-to-back push
-    // order (index 0 renders on top) — so the border actually renders
-    // *above* the active pane's content instead of being hidden behind
-    // it. A border, not a filled rect: four thin solid-color strips
-    // around the pane's edges, since a single filled rectangle would
-    // just hide its content instead of framing it.
-    if let Some(&(x, y, w, h)) = rects.get(active) {
-        const BASE_BORDER: i32 = 3;
-        let border = scaled(BASE_BORDER, scale).max(1);
-        let color = to_color32f(state.theme.tile_border);
-        let strips = [
-            (x, y, w, border),                // top
-            (x, y + h - border, w, border),   // bottom
-            (x, y, border, h),                // left
-            (x + w - border, y, border, h),   // right
-        ];
-        for (id, (sx, sy, sw, sh)) in highlight_ids.into_iter().zip(strips) {
-            let background = SolidColorRenderElement::new(
-                id,
-                Rectangle::<i32, smithay::utils::Physical>::new(
-                    smithay::utils::Point::from((sx, sy)),
-                    smithay::utils::Size::from((sw, sh)),
-                ),
-                CommitCounter::default(),
-                color,
-                Kind::Unspecified,
-            );
-            elements.push(OutputRenderElements::from(background));
-        }
-    }
-
-    let (_, _, area_w, area_h) = area;
-    // Cached rather than rebuilt every call — same reasoning as
-    // `NormalContentTarget`'s doc comment (a fresh `Output` every frame
-    // means a real allocation plus a Debug-formatted `tracing::info!` span
-    // on every single Tile-Hut frame); this one has no GL texture or damage
-    // tracker riding on it, just the `Output` itself.
-    thread_local! {
-        static PANE_OUTPUT: RefCell<Option<(Output, (i32, i32))>> = const { RefCell::new(None) };
-    }
-    let pane_output = PANE_OUTPUT.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        if !matches!(slot.as_ref(), Some((_, size)) if *size == (area_w, area_h)) {
-            *slot = Some((synthetic_output("tile-hut-space", (area_w, area_h), 1.0), (area_w, area_h)));
-        }
-        slot.as_ref().expect("just ensured Some above").0.clone()
-    });
-    let mut pane_space = Space::<HutSpaceElement>::default();
-    pane_space.map_output(&pane_output, (0, 0));
-    for ((child, _), (x, y, _, _)) in tile.children.iter_mut().zip(rects) {
-        let hut = child.focused_hut_mut();
-        let Some(texture) = hut.redraw(renderer) else {
-            continue;
-        };
-        let composited = CompositedTexture::new(
-            hut.element_id.clone(),
-            texture,
-            scale,
-            hut.element_damage_snapshot(),
-        );
-        // Absolute (real screen) coordinates, not re-derived relative to
-        // `pane_space`'s own origin — see this function's doc comment on
-        // why that's still correct: `pane_output` is always mapped at
-        // `(0, 0)` within `pane_space`.
-        pane_space.map_element(HutSpaceElement::Composited(composited), (x, y), false);
-    }
-    match space_render_elements::<_, HutSpaceElement, _>(renderer, [&pane_space], &pane_output, 1.0) {
-        Ok(space_elements) => {
-            elements.extend(space_elements.into_iter().map(OutputRenderElements::from))
-        }
-        Err(err) => tracing::warn!("failed to collect tile-pane space elements: {err}"),
-    }
-
-    elements
-}

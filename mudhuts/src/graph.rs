@@ -65,13 +65,6 @@
 //! ever resolved inside a test's `Graph<()>` or the real `Graph<
 //! RenderEnv<'_>>`.
 
-// Migration step 1 (see this module's doc comment): nothing in
-// `main.rs`/`state.rs` constructs a real `Graph` yet, so every item here
-// is genuinely dead code from the non-test binary's point of view — the
-// module's own unit tests already exercise the whole API (see below).
-// Remove once migration step 4 wires a real `Graph` into `main.rs`.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 
 use crate::redraw::RedrawHandle;
@@ -409,6 +402,20 @@ impl<Env> Graph<Env> {
         Env: 'static,
     {
         self.nodes.get_mut(&id).map(|b| &mut **b)
+    }
+
+    /// Every node in the graph, mutably, in one pass — unlike repeated
+    /// individual [`Self::node_mut`]/[`Self::downcast_mut`] calls (which
+    /// each need their own separate borrow of `self`), `HashMap::
+    /// values_mut` safely hands out every entry's own distinct `&mut`
+    /// simultaneously as a single streaming iterator, which is what lets
+    /// callers like `GraphStack::all_huts_mut` return an `Iterator`
+    /// instead of an eagerly-collected `Vec`.
+    pub fn nodes_mut(&mut self) -> impl Iterator<Item = &mut (dyn Node<Env> + 'static)>
+    where
+        Env: 'static,
+    {
+        self.nodes.values_mut().map(|b| &mut **b)
     }
 
     /// Call `f` with mutable access to node `id` *and* the rest of the

@@ -160,12 +160,20 @@ impl State {
             .user_data()
             .get_or_insert(|| RefCell::new(OutputDamageTracker::from_output(&output)));
 
+        // Resolved *before* either branch below acquires its own borrow
+        // of the (possibly shared) renderer — see
+        // `render::resolve_frame_content`'s own doc comment for why that
+        // ordering isn't optional: it internally borrows the same
+        // `Rc<RefCell<GlesRenderer>>` `self.dmabuf_renderer` shares, and
+        // `RefCell` panics on a second concurrent borrow.
+        let content = render::resolve_frame_content(self);
+
         let pixels = if let Some(renderer) = self.dmabuf_renderer.clone() {
             let mut renderer = renderer.borrow_mut();
-            self.render_capture(&mut renderer, size, fourcc, tracker)?
+            self.render_capture(&mut renderer, size, fourcc, tracker, content)?
         } else if let Some(backend) = self.winit_backend.clone() {
             let mut backend = backend.borrow_mut();
-            self.render_capture(backend.renderer(), size, fourcc, tracker)?
+            self.render_capture(backend.renderer(), size, fourcc, tracker, content)?
         } else {
             // Shouldn't happen — one of the two is always set once either
             // backend has finished starting up — but stay panic-free.
@@ -189,8 +197,9 @@ impl State {
         size: (i32, i32),
         fourcc: Fourcc,
         tracker: &RefCell<OutputDamageTracker>,
+        content: Vec<crate::graph::ContentPiece>,
     ) -> Result<Vec<u8>, FailureReason> {
-        let elements = render::build_frame_elements(self, renderer, size);
+        let elements = render::build_frame_elements(self, renderer, size, content);
 
         let buffer_size: Size<i32, BufferCoord> = (size.0, size.1).into();
         let mut texture = Offscreen::<GlesTexture>::create_buffer(renderer, fourcc, buffer_size)

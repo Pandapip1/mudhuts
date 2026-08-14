@@ -289,7 +289,7 @@ pub fn handle_commit(popups: &mut PopupManager, window: Option<Window>, surface:
 /// propagate a compositor-driven size change on its own. Only bare Main
 /// Windows are fullscreen — Floating Windows/Alerts float at whatever size
 /// their own CSD/content wants, so they're left alone here.
-pub(crate) fn resize_all_main_windows(stack: &crate::stack::MruStackHut, size: Size<i32, Logical>) {
+pub(crate) fn resize_all_main_windows(stack: &crate::graph_stack::GraphStack, size: Size<i32, Logical>) {
     for hut in stack.all_huts() {
         for entry in hut.main_windows() {
             let Some(toplevel) = entry.window.toplevel() else {

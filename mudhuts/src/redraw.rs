@@ -126,3 +126,36 @@ impl<T: std::fmt::Debug> std::fmt::Debug for Signal<T> {
         std::fmt::Debug::fmt(&self.value, f)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Moved here from `hut.rs` (migration step 4's cutover — see
+    /// `docs/rfcs/typed-graph-hut.md`) once `TileHut` itself was deleted:
+    /// this tests `Signal`'s own core contract directly rather than via
+    /// a now-gone wrapper type, since it was never really about
+    /// `TileHut` in the first place.
+    #[test]
+    fn writing_through_a_signal_marks_the_attached_redraw_handle_dirty() {
+        let mut value = Signal::new(0);
+        let (ping, source) = smithay::reexports::calloop::ping::make_ping().unwrap();
+        value.attach_redraw_handle(RedrawHandle::new(ping));
+
+        *value = 1;
+        assert_eq!(value, 1);
+
+        let mut event_loop: smithay::reexports::calloop::EventLoop<'static, ()> =
+            smithay::reexports::calloop::EventLoop::try_new().unwrap();
+        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let fired_clone = fired.clone();
+        event_loop
+            .handle()
+            .insert_source(source, move |_, _, _| fired_clone.set(true))
+            .unwrap();
+        event_loop
+            .dispatch(std::time::Duration::from_millis(0), &mut ())
+            .unwrap();
+        assert!(fired.get(), "writing through the Signal should have pinged the attached RedrawHandle");
+    }
+}

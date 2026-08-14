@@ -32,13 +32,13 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::stack::MruStackHut;
+use crate::graph_stack::GraphStack;
 
 /// Scans both autostart directories and spawns every entry that resolves,
 /// all owned by one new background Hut — a no-op (no Hut created) if
 /// nothing resolves. Logs and skips whatever fails along the way; never
 /// treated as fatal to the rest of startup.
-pub fn run(stack: &mut MruStackHut, extra_env: &[(String, String)]) {
+pub fn run(stack: &mut GraphStack, extra_env: &[(String, String)]) {
     let mut seen = HashSet::new();
     let mut argvs = Vec::new();
 

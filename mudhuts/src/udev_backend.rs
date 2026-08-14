@@ -341,6 +341,11 @@ pub fn init_udev(
     // has no renderer of its own otherwise).
     let renderer = Rc::new(RefCell::new(renderer));
     state.dmabuf_renderer = Some(renderer.clone());
+    // The graph's own `RenderEnv` needs the *same* `Rc<RefCell<_>>` —
+    // see `graph_nodes::RenderEnv::renderer`'s own doc comment for why a
+    // separately-owned second `GlesRenderer` would be a real correctness
+    // bug, not just wasteful.
+    state.stack.set_renderer(renderer.clone());
     let dmabuf_formats: Vec<_> = renderer.borrow().dmabuf_formats().iter().copied().collect();
     match DmabufFeedbackBuilder::new(node.dev_id(), dmabuf_formats).build() {
         Ok(default_feedback) => {
@@ -732,6 +737,12 @@ fn connector_connected(
     };
 
     state.output = Some(output.clone());
+    // Slot 0 — this module still only ever drives a single desktop
+    // connector today (see this module's own doc comment on scope); real
+    // multi-monitor (a second connector calling `GraphStack::add_output`
+    // instead) is tracked as its own remaining piece of the RFC's Step 7,
+    // not built here.
+    state.stack.set_output(0, output.clone());
     state.output_size = (wl_mode.size.w, wl_mode.size.h);
     // Catches up the initial ConsoleHut (spawned in `main.rs` before this
     // backend existed, at scale 1.0) and remembers `scale` for every ConsoleHut
@@ -801,36 +812,24 @@ fn connector_disconnected(
 }
 
 fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Handle) {
-    let mut inner_mut = inner.borrow_mut();
-    let Inner {
-        renderer,
-        surfaces,
-        pointer_images,
-        pointer_element,
-        pointer_image_cache,
-        ..
-    } = &mut *inner_mut;
-    let mut renderer = renderer.borrow_mut();
-    let renderer = &mut *renderer;
-    let Some(surface) = surfaces.get_mut(&crtc) else {
-        tracing::debug!("render_surface: no surface for {crtc:?}, dropping the render chain here");
-        return;
-    };
-
-    if surface.frame_pending {
-        // A previous commit for this crtc hasn't completed yet — see
-        // `SurfaceData::frame_pending`'s doc comment. `frame_finish` will
-        // call back in here once it does.
-        tracing::debug!("render_surface: frame already pending for {crtc:?}, skipping");
-        return;
+    // Bail out early using only `inner`'s own borrow — deliberately
+    // *before* touching the renderer at all, so the common "nothing to
+    // do" cases (no surface, a commit already in flight) don't pay for a
+    // real graph resolve pass (a terminal redraw) just to throw it away.
+    {
+        let inner_ref = inner.borrow();
+        let Some(surface) = inner_ref.surfaces.get(&crtc) else {
+            tracing::debug!("render_surface: no surface for {crtc:?}, dropping the render chain here");
+            return;
+        };
+        if surface.frame_pending {
+            // A previous commit for this crtc hasn't completed yet — see
+            // `SurfaceData::frame_pending`'s doc comment. `frame_finish`
+            // will call back in here once it does.
+            tracing::debug!("render_surface: frame already pending for {crtc:?}, skipping");
+            return;
+        }
     }
-
-    let size = surface
-        .output
-        .current_mode()
-        .map(|mode| (mode.size.w, mode.size.h))
-        .unwrap_or((0, 0));
-    let output = surface.output.clone();
 
     // Every render pass, not just once at connector setup — matches
     // `winit_backend.rs`'s own redraw handler, which does the same
@@ -845,13 +844,45 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
     let (_, _, usable_w, usable_h) = state.usable_area();
     state.stack.resize_all(usable_w, usable_h);
 
+    // Resolved *before* acquiring the renderer borrow below — see
+    // `render::resolve_frame_content`'s own doc comment for why that
+    // ordering isn't optional (it borrows the exact same
+    // `Rc<RefCell<GlesRenderer>>` acquired just below, and `RefCell`
+    // panics on a second concurrent borrow).
+    let content = render::resolve_frame_content(state);
+
+    let mut inner_mut = inner.borrow_mut();
+    let Inner {
+        renderer,
+        surfaces,
+        pointer_images,
+        pointer_element,
+        pointer_image_cache,
+        ..
+    } = &mut *inner_mut;
+    let mut renderer = renderer.borrow_mut();
+    let renderer = &mut *renderer;
+    // Already confirmed to exist and not be frame_pending above — this
+    // module never removes an entry between that check and here (single-
+    // threaded, no other code runs in between).
+    let Some(surface) = surfaces.get_mut(&crtc) else {
+        return;
+    };
+
+    let size = surface
+        .output
+        .current_mode()
+        .map(|mode| (mode.size.w, mode.size.h))
+        .unwrap_or((0, 0));
+    let output = surface.output.clone();
+
     tracing::debug!(
         "render_surface: focused hut={} showing_terminal_effective={} output_size={size:?}",
         state.stack.focused().id,
         state.showing_terminal_effective(),
     );
 
-    let mut elements = render::build_frame_elements(state, renderer, size);
+    let mut elements = render::build_frame_elements(state, renderer, size, content);
 
     // Prepended, not appended — elements render front-to-back (index 0
     // on top, per the same convention `switcher::build`'s doc comment

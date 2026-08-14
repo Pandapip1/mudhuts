@@ -16,13 +16,6 @@
 //! it, matching the RFC's own "delete the old enum only once every call
 //! site has moved" migration rule.
 
-// Nothing in `main.rs`/`render.rs`/`input.rs` constructs a real
-// GraphStack yet — the module's own unit tests already exercise the
-// whole API (ported from stack.rs's own test suite, including its most
-// load-bearing regression cases). Remove once the real call paths cut
-// over.
-#![allow(dead_code)]
-
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -40,7 +33,7 @@ use crate::console_hut::ConsoleHut;
 use crate::graph::{Graph, Node, NodeId};
 use crate::graph_nodes::{ConsoleNode, RenderEnv, TabNode, TileNode};
 use crate::hut::{Axis, Direction};
-use crate::redraw::{Redrawable, RedrawHandle, Signal};
+use crate::redraw::{Redrawable, RedrawHandle};
 
 /// One physical output's own independent MRU stack — see this module's
 /// doc comment on the user's resolved multi-monitor policy. A
@@ -116,16 +109,22 @@ impl GraphStack {
     /// call using the same `extra_env` given here. `output` is the real
     /// physical output this first (and, at construction time, only)
     /// `OutputSlot` shows on.
+    /// `output` starts as a harmless synthetic placeholder (see
+    /// `space_element::synthetic_output`'s own doc comment on why one is
+    /// always safe to construct with no hardware coupling at all) — like
+    /// `RenderEnv`'s renderer slot, `main.rs` constructs the stack before
+    /// either backend creates the real `Output`, so there's a real, if
+    /// brief, window where none exists yet. Whichever backend creates
+    /// the real one calls [`Self::set_output`] once it does.
     pub fn new(
         first: ConsoleHut,
         first_events: Channel<TermEvent>,
-        output: Output,
         loop_handle: LoopHandle<'static, State>,
         extra_env: Vec<(String, String)>,
         redraw: RedrawHandle,
     ) -> Result<Self, String> {
         let mut graph: Graph<RenderEnv> =
-            Graph::with_env(RenderEnv { renderer: Rc::new(RefCell::new(None)) });
+            Graph::with_env(RenderEnv { renderer: None });
         let id = first.id;
         let mut node = ConsoleNode::new(first);
         Redrawable::attach_redraw_handle(&mut node, redraw.clone());
@@ -134,7 +133,7 @@ impl GraphStack {
         let stack = Self {
             graph,
             outputs: vec![OutputSlot {
-                output,
+                output: crate::space_element::synthetic_output("pending", (0, 0), 1.0),
                 position: Point::from((0, 0)),
                 huts: vec![node_id],
                 current: 0,
@@ -154,8 +153,97 @@ impl GraphStack {
     /// Fills in the real renderer once a backend creates one — see
     /// `graph_nodes::RenderEnv`'s doc comment for why this can't happen
     /// at construction time.
-    pub fn set_renderer(&mut self, renderer: GlesRenderer) {
-        *self.graph.env.renderer.borrow_mut() = Some(renderer);
+    /// `renderer` must be the *same* `Rc<RefCell<GlesRenderer>>`
+    /// allocation a backend already owns (see `RenderEnv::renderer`'s
+    /// own doc comment for why) — pass a `.clone()` of it (a cheap `Rc`
+    /// clone, not a duplicated GL context), never a freshly-constructed
+    /// one.
+    pub fn set_renderer(&mut self, renderer: Rc<RefCell<GlesRenderer>>) {
+        self.graph.env.renderer = Some(renderer);
+    }
+
+    /// Resolve `top`'s own `content` output — the graph-side half of a
+    /// render pass. **Must be called before whatever backend render pass
+    /// this feeds into acquires its own borrow of the shared renderer**
+    /// (see `RenderEnv::renderer`'s doc comment): this internally
+    /// borrows the exact same `Rc<RefCell<GlesRenderer>>` a backend's
+    /// own render pass also borrows, and `RefCell` panics on a second
+    /// concurrent borrow — the two must be sequential, never nested.
+    /// Call [`Self::begin_frame`] once per real frame before this, not
+    /// once per call (memoization spans the whole frame, not just one
+    /// resolve).
+    pub fn resolve_content(&mut self, top: NodeId) -> Vec<crate::graph::ContentPiece> {
+        match self.graph.resolve_output(top, "content") {
+            Some(crate::graph::PortValue::Content(pieces)) => pieces,
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn begin_frame(&mut self) {
+        self.graph.begin_frame();
+    }
+
+    /// Fills in the real output for slot `index` once a backend creates
+    /// one — see [`Self::new`]'s doc comment for why the first slot
+    /// starts with a harmless synthetic placeholder instead.
+    pub fn set_output(&mut self, index: usize, output: Output) {
+        if let Some(slot) = self.outputs.get_mut(index) {
+            slot.output = output;
+        }
+    }
+
+    /// Add a genuinely new output — real multi-monitor (a second
+    /// connector) — with its own independent MRU stack, seeded with one
+    /// freshly-spawned `ConsoleHut`, per the user's resolved policy
+    /// (each output starts as its own independent workspace, not
+    /// mirrored). Returns the new `OutputSlot`'s index.
+    pub fn add_output(&mut self, output: Output, position: Point<i32, Logical>) -> Result<usize, String> {
+        let (hut, events) = ConsoleHut::spawn(self.extra_env.clone(), self.scale)?;
+        let id = hut.id;
+        let mut node = ConsoleNode::new(hut);
+        Redrawable::attach_redraw_handle(&mut node, self.redraw.clone());
+        let node_id = self.graph.add_node(Box::new(node));
+        self.insert_channel(id, events)?;
+        self.outputs.push(OutputSlot {
+            output,
+            position,
+            huts: vec![node_id],
+            current: 0,
+            preview: None,
+            panel_id: Id::new(),
+        });
+        Ok(self.outputs.len() - 1)
+    }
+
+    /// Remove output `index` (a real connector disconnected) — every
+    /// node under its own stack is dropped along with it; nothing
+    /// migrates to another output (deferred per the user's resolved
+    /// policy — see this module's doc comment). Refuses to remove the
+    /// last remaining output (mirrors every other "never end up with
+    /// zero entries" rule in this codebase).
+    pub fn remove_output(&mut self, index: usize) {
+        if self.outputs.len() <= 1 || index >= self.outputs.len() {
+            return;
+        }
+        let removed = self.outputs.remove(index);
+        for id in removed.huts {
+            for node in self.all_ids_under(id) {
+                self.graph.remove_node(node);
+            }
+        }
+        if self.focused_output >= self.outputs.len() {
+            self.focused_output = self.outputs.len() - 1;
+        } else if self.focused_output > index {
+            self.focused_output -= 1;
+        }
+    }
+
+    fn all_ids_under(&self, id: NodeId) -> Vec<NodeId> {
+        let mut out = vec![id];
+        for child in self.graph.hut_list_input(id, "children") {
+            out.extend(self.all_ids_under(child));
+        }
+        out
     }
 
     pub fn outputs(&self) -> &[OutputSlot] {
@@ -220,6 +308,78 @@ impl GraphStack {
         self.outputs.iter().flat_map(|o| o.huts.iter())
     }
 
+    /// Whether `top`'s own terminal (vs. its focused ConsoleHut's active
+    /// Main Window) is what's currently effectively shown — mirrors
+    /// `Hut::shows_terminal_effective` exactly.
+    pub fn shows_terminal_effective(&self, top: NodeId) -> bool {
+        if self.graph.downcast::<TileNode>(top).is_some() && self.graph.hut_list_input(top, "children").len() >= 2 {
+            return true;
+        }
+        let leaf = self.graph.focused_leaf(top);
+        let Some(console) = self.graph.downcast::<ConsoleNode>(leaf) else {
+            return true;
+        };
+        *console.hut.showing_terminal || console.hut.main_window_count() == 0
+    }
+
+    /// `root`'s absolute physical-pixel rect right now, if it's a Main
+    /// Window currently on screen under `top` — mirrors
+    /// `Hut::leaf_absolute_rect` exactly (same real-output-absolute
+    /// coordinates convention, computed via the same `hut::pane_rects`
+    /// call `TileNode`'s own `resolve`/`resize_to_pixels` already use,
+    /// so this can never disagree with what's actually rendered/sized).
+    pub fn leaf_absolute_rect(
+        &self,
+        top: NodeId,
+        root: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+        area: (i32, i32, i32, i32),
+    ) -> Option<(i32, i32, i32, i32)> {
+        if let Some(console) = self.graph.downcast::<ConsoleNode>(top) {
+            return console.hut.main_windows().iter().any(|e| e.matches(root)).then_some(area);
+        }
+        if let Some(tab) = self.graph.downcast::<TabNode>(top) {
+            let children = self.graph.hut_list_input(top, "children");
+            let next = *children.get(*tab.active)?;
+            return self.leaf_absolute_rect(next, root, area);
+        }
+        if let Some(tile) = self.graph.downcast::<TileNode>(top) {
+            let children = self.graph.hut_list_input(top, "children");
+            let fracs = if tile.fracs.len() == children.len() { tile.fracs.clone() } else { vec![1.0; children.len()] };
+            let rects: Vec<_> = crate::hut::pane_rects(tile.axis, fracs.into_iter(), (area.2, area.3))
+                .into_iter()
+                .map(|(x, y, w, h)| (x + area.0, y + area.1, w, h))
+                .collect();
+            for (&child, rect) in children.iter().zip(rects) {
+                let leaf = self.graph.focused_leaf(child);
+                if let Some(console) = self.graph.downcast::<ConsoleNode>(leaf)
+                    && console.hut.main_windows().iter().any(|e| e.matches(root))
+                {
+                    return Some(rect);
+                }
+            }
+            return None;
+        }
+        None
+    }
+
+    /// This top-level entry's active pane's own physical-pixel offset
+    /// from `area`'s origin — mirrors `TileHut::absolute_pane_rects`'s
+    /// per-pane offset for the focused pane, generalized to "no Tile at
+    /// all" (just `area`'s own origin unchanged).
+    pub fn active_pane_offset(&self, top: NodeId, area: (i32, i32, i32, i32)) -> (f64, f64) {
+        let Some(tile) = self.graph.downcast::<TileNode>(top) else {
+            return (area.0 as f64, area.1 as f64);
+        };
+        let children = self.graph.hut_list_input(top, "children");
+        if children.len() < 2 {
+            return (area.0 as f64, area.1 as f64);
+        }
+        let fracs = if tile.fracs.len() == children.len() { tile.fracs.clone() } else { vec![1.0; children.len()] };
+        let rects = crate::hut::pane_rects(tile.axis, fracs.into_iter(), (area.2, area.3));
+        let (x, y, _, _) = rects[(*tile.active).min(rects.len().saturating_sub(1))];
+        ((area.0 + x) as f64, (area.1 + y) as f64)
+    }
+
     pub fn graph(&self) -> &Graph<RenderEnv> {
         &self.graph
     }
@@ -280,6 +440,13 @@ impl GraphStack {
             .into_iter()
             .filter_map(|id| self.graph.downcast::<ConsoleNode>(id))
             .map(|n| &n.hut)
+    }
+
+    pub fn all_huts_mut(&mut self) -> impl Iterator<Item = &mut ConsoleHut> {
+        self.graph
+            .nodes_mut()
+            .filter_map(|n| n.as_any_mut().downcast_mut::<ConsoleNode>())
+            .map(|n| &mut n.hut)
     }
 
     /// One `ConsoleHut` per top-level entry across every output —
@@ -404,7 +571,8 @@ impl GraphStack {
         // no-op") and `active`/`fracs` below accordingly.
         let wrapped_id = match kind {
             WrapKind::Tab => {
-                let mut tab = TabNode { active: Signal::new(1) };
+                let mut tab = TabNode::new();
+                *tab.active = 1;
                 Redrawable::attach_redraw_handle(&mut tab, self.redraw.clone());
                 let wrapped_id = self.graph.add_node(Box::new(tab));
                 self.graph
@@ -674,7 +842,6 @@ mod tests {
 
     use super::*;
     use crate::console_hut::ConsoleHut;
-    use crate::space_element::synthetic_output;
 
     /// Real `LoopHandle` (from a real, never-run `EventLoop`) — mirrors
     /// `stack.rs`'s own test helper exactly.
@@ -686,8 +853,7 @@ mod tests {
     fn new_stack() -> GraphStack {
         let (hut, events) = ConsoleHut::spawn(std::iter::empty(), 1.0).unwrap();
         let (ping, _source) = smithay::reexports::calloop::ping::make_ping().unwrap();
-        let output = synthetic_output("test-output", (800, 600), 1.0);
-        GraphStack::new(hut, events, output, loop_handle(), Vec::new(), RedrawHandle::new(ping)).unwrap()
+        GraphStack::new(hut, events, loop_handle(), Vec::new(), RedrawHandle::new(ping)).unwrap()
     }
 
     #[test]

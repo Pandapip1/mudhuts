@@ -10,8 +10,13 @@
 //! `render.rs`'s Tile-Hut compositing), so there's no "active tab" to
 //! show a strip for in the first place. A Tab-Hut with only 1 child
 //! doesn't get a strip either (nothing to switch between) — though in
-//! practice this never happens, since [`Hut::collapse_if_singleton`]
-//! unwraps it immediately.
+//! practice this never happens, since `GraphStack::remove_exited`'s
+//! collapse rule unwraps it immediately.
+//!
+//! Migration step 4: rewritten against the typed graph
+//! (`docs/rfcs/typed-graph-hut.md`) — operates on `NodeId`/`Graph<
+//! RenderEnv>` instead of `&Hut`/`&mut Hut`. `TabNode`'s own `label_cache`/
+//! `tab_ids`/`bg_tracker` fields play exactly the role `TabbedHut`'s did.
 
 use smithay::backend::renderer::Renderer;
 use smithay::backend::renderer::element::Id;
@@ -22,8 +27,9 @@ use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Physical, Point, Rectangle, Size, Transform};
 
 use crate::chrome::{to_color32f, window_title};
+use crate::graph::{Graph, NodeId};
+use crate::graph_nodes::{ConsoleNode, RenderEnv, TabNode};
 use crate::render::{ChangeTracker, LabelCache, OutputRenderElements};
-use crate::hut::Hut;
 use crate::space_element::HutSpaceRenderElement;
 use crate::theme::Theme;
 
@@ -47,8 +53,12 @@ pub struct TabRect {
 /// view: the active Main Window's title if it's showing one, else
 /// "Terminal". Same fallback chain `chrome::window_title` already uses
 /// for a single ConsoleHut's own Main-Window tabs, one level down.
-fn child_label(village: &Hut) -> String {
-    let hut = village.focused_hut();
+fn child_label(graph: &Graph<RenderEnv>, child: NodeId) -> String {
+    let leaf = graph.focused_leaf(child);
+    let Some(console) = graph.downcast::<ConsoleNode>(leaf) else {
+        return "Terminal".to_string();
+    };
+    let hut = &console.hut;
     if !*hut.showing_terminal
         && hut.main_window_count() > 0
         && let Some(window) = hut.active_window()
@@ -70,15 +80,17 @@ fn tab_h(cell_h: i32, scale: f64) -> i32 {
 
 /// One Tab-Hut level's tab rects, at physical-pixel row `y` — shared
 /// between rendering and click hit-testing (see this module's doc), so
-/// the two can never disagree about where a tab actually is.
-fn level_layout(children: &[Hut], y: i32, cell_w: usize, cell_h: i32, scale: f64) -> Vec<TabRect> {
+/// the two can never disagree about where a tab actually is. Takes
+/// already-resolved `labels` (not the children themselves) so callers
+/// needing just the layout don't have to hold a `&Graph` borrow through
+/// this call too.
+fn level_layout(labels: &[String], y: i32, cell_w: usize, cell_h: i32, scale: f64) -> Vec<TabRect> {
     let h = tab_h(cell_h, scale);
     let padding = crate::render::scaled(TAB_PADDING, scale);
     let gap = crate::render::scaled(TAB_GAP, scale);
     let mut rects = Vec::new();
     let mut x = crate::render::scaled(LEFT_MARGIN, scale);
-    for (i, child) in children.iter().enumerate() {
-        let label = child_label(child);
+    for (i, label) in labels.iter().enumerate() {
         let label_w = (label.chars().count().max(1) * cell_w) as i32;
         let tab_w = label_w + padding * 2;
         rects.push(TabRect {
@@ -91,17 +103,20 @@ fn level_layout(children: &[Hut], y: i32, cell_w: usize, cell_h: i32, scale: f64
 }
 
 /// Total height of the Hut-level tab-strip stack along the active
-/// path from `village` down — `0` if `village` isn't a Tab-Hut with
+/// path from `village` down — `0` if `village` isn't a Tab node with
 /// 2+ children (nothing to stack). Used by `render.rs` to know where
 /// `chrome.rs`'s own strip (and, when not tiled/tabbed at all, the
 /// terminal/window content itself) should start.
-pub fn stack_height(village: &Hut, cell_h: i32, scale: f64) -> i32 {
-    match village {
-        Hut::Tab(tab) if tab.children.len() >= 2 => {
-            tab_h(cell_h, scale) + stack_height(&tab.children[*tab.active], cell_h, scale)
-        }
-        _ => 0,
+pub fn stack_height(graph: &Graph<RenderEnv>, village: NodeId, cell_h: i32, scale: f64) -> i32 {
+    let Some(tab) = graph.downcast::<TabNode>(village) else {
+        return 0;
+    };
+    let children = graph.hut_list_input(village, "children");
+    if children.len() < 2 {
+        return 0;
     }
+    let next = children[(*tab.active).min(children.len() - 1)];
+    tab_h(cell_h, scale) + stack_height(graph, next, cell_h, scale)
 }
 
 /// Hit-test a click position (physical pixels) against the Hut-level
@@ -111,43 +126,44 @@ pub fn stack_height(village: &Hut, cell_h: i32, scale: f64) -> i32 {
 /// redraw); `false` if the click didn't land on any Hut-level tab —
 /// the tile-pane/ConsoleHut-level click handling should take over instead.
 pub fn handle_click(
-    village: &mut Hut,
+    graph: &mut Graph<RenderEnv>,
+    village: NodeId,
     pos: (i32, i32),
     y: i32,
     cell_w: usize,
     cell_h: i32,
     scale: f64,
 ) -> bool {
-    let Hut::Tab(tab) = village else {
-        return false;
-    };
-    if tab.children.len() < 2 {
+    if graph.downcast::<TabNode>(village).is_none() {
         return false;
     }
+    let children = graph.hut_list_input(village, "children");
+    if children.len() < 2 {
+        return false;
+    }
+    let labels: Vec<String> = children.iter().map(|&c| child_label(graph, c)).collect();
     let point = Point::from(pos);
-    for TabRect { index: i, rect } in level_layout(&tab.children, y, cell_w, cell_h, scale) {
+    for TabRect { index: i, rect } in level_layout(&labels, y, cell_w, cell_h, scale) {
         if rect.contains(point) {
-            *tab.active = i;
+            if let Some(tab) = graph.downcast_mut::<TabNode>(village) {
+                *tab.active = i;
+            }
             return true;
         }
     }
-    handle_click(
-        &mut tab.children[*tab.active],
-        pos,
-        y + tab_h(cell_h, scale),
-        cell_w,
-        cell_h,
-        scale,
-    )
+    let active = graph.downcast::<TabNode>(village).map(|t| *t.active).unwrap_or(0);
+    let next = children[active.min(children.len() - 1)];
+    handle_click(graph, next, pos, y + tab_h(cell_h, scale), cell_w, cell_h, scale)
 }
 
 /// Build the Hut-level tab-strip stack's render elements, recursing
 /// down the active path (see this module's doc) — empty if `village`
-/// isn't a Tab-Hut with 2+ children. Returns the elements plus the Y
+/// isn't a Tab node with 2+ children. Returns the elements plus the Y
 /// where whatever's next (a deeper level, or `chrome.rs`'s own strip)
 /// should start.
 pub fn build(
-    village: &mut Hut,
+    graph: &mut Graph<RenderEnv>,
+    village: NodeId,
     renderer: &mut GlesRenderer,
     y: i32,
     cell_w: usize,
@@ -155,90 +171,103 @@ pub fn build(
     scale: f64,
     theme: &Theme,
 ) -> (Vec<Element>, i32) {
-    let Hut::Tab(tab) = village else {
+    if graph.downcast::<TabNode>(village).is_none() {
         return (Vec::new(), y);
-    };
-    if tab.children.len() < 2 {
+    }
+    let children = graph.hut_list_input(village, "children");
+    if children.len() < 2 {
         return (Vec::new(), y);
     }
 
-    // Grow the per-child label cache/ids/bg-tracker lazily to match
-    // `children` — see `TabbedHut::label_cache`'s doc comment; only
-    // ever grows here (shrinking happens in `Hut::remove_child_hut`,
-    // kept in lockstep with `children` itself).
-    while tab.label_cache.len() < tab.children.len() {
-        tab.label_cache.push(LabelCache::new());
-        tab.tab_ids.push((Id::new(), Id::new()));
-        tab.bg_tracker.push(ChangeTracker::new());
-    }
-
-    let rects = level_layout(&tab.children, y, cell_w, cell_h, scale);
+    let labels: Vec<String> = children.iter().map(|&c| child_label(graph, c)).collect();
+    let rects = level_layout(&labels, y, cell_w, cell_h, scale);
     let padding = crate::render::scaled(TAB_PADDING, scale);
+
     let mut elements = Vec::new();
-    for TabRect { index: i, rect } in rects {
-        let active = tab.active == i;
-        let (fg, bg) = if active {
-            (theme.hut_tab_active_fg, theme.hut_tab_active_bg)
-        } else {
-            (theme.hut_tab_inactive_fg, theme.hut_tab_inactive_bg)
-        };
-        let label = child_label(&tab.children[i]);
+    let mut active_index = 0;
 
-        let key = (label.clone(), active);
-        let texture = if tab.label_cache[i].is_stale(&key) {
-            tab.children[i]
-                .focused_hut_mut()
-                .render_label(renderer, &label, fg, bg)
-                .map(|texture| tab.label_cache[i].store(key, texture))
-        } else {
-            match tab.label_cache[i].cached() {
-                Some(cached) => Ok(cached),
-                None => tab.children[i]
-                    .focused_hut_mut()
-                    .render_label(renderer, &label, fg, bg)
-                    .map(|texture| tab.label_cache[i].store(key, texture)),
-            }
-        };
+    // `with_node_mut`, not a plain `downcast_mut` — this loop needs
+    // simultaneous mutable access to *two* different nodes at once
+    // (`village`'s own `TabNode` for its label cache, and each child's
+    // own `ConsoleNode` to actually render a label onto it) — the same
+    // "temporarily remove, call, put back" mechanism `Graph::
+    // resolve_output`/`with_node_mut` itself is built on.
+    graph.with_node_mut(village, |node, graph| {
+        let tab = node
+            .as_any_mut()
+            .downcast_mut::<TabNode>()
+            .expect("already confirmed to be a TabNode above");
 
-        let (text_id, bg_id) = tab.tab_ids[i].clone();
-        match texture {
-            Ok((texture, snapshot)) => {
-                let text = TextureRenderElement::from_texture_with_damage(
-                    text_id,
-                    renderer.context_id(),
-                    (
-                        (rect.loc.x + padding) as f64,
-                        (rect.loc.y + padding) as f64,
-                    ),
-                    texture,
-                    crate::render::texture_buffer_scale(scale),
-                    Transform::Normal,
-                    None,
-                    None,
-                    None,
-                    None,
-                    snapshot,
-                    Kind::Unspecified,
-                );
-                elements.push(Element::from(text));
-            }
-            Err(err) => tracing::warn!("failed to render Hut tab label {label:?}: {err}"),
+        // Grow the per-child label cache/ids/bg-tracker lazily to match
+        // `children` — see `TabNode::label_cache`'s doc comment; only
+        // ever grows here (shrinking happens wherever a child is
+        // actually removed from the list).
+        while tab.label_cache.len() < children.len() {
+            tab.label_cache.push(LabelCache::new());
+            tab.tab_ids.push((Id::new(), Id::new()));
+            tab.bg_tracker.push(ChangeTracker::new());
         }
+        active_index = *tab.active;
 
-        let bg_commit = tab.bg_tracker[i].commit(active);
-        let background = SolidColorRenderElement::new(bg_id, rect, bg_commit, to_color32f(bg), Kind::Unspecified);
-        elements.push(Element::from(background));
-    }
+        for TabRect { index: i, rect } in &rects {
+            let i = *i;
+            let active = active_index == i;
+            let (fg, bg) = if active {
+                (theme.hut_tab_active_fg, theme.hut_tab_active_bg)
+            } else {
+                (theme.hut_tab_inactive_fg, theme.hut_tab_inactive_bg)
+            };
+            let label = labels[i].clone();
+            let key = (label.clone(), active);
 
-    let (deeper_elements, next_y) = build(
-        &mut tab.children[*tab.active],
-        renderer,
-        y + tab_h(cell_h, scale),
-        cell_w,
-        cell_h,
-        scale,
-        theme,
-    );
+            let child_leaf = graph.focused_leaf(children[i]);
+            let mut render = |graph: &mut Graph<RenderEnv>| {
+                graph
+                    .downcast_mut::<ConsoleNode>(child_leaf)
+                    .ok_or_else(|| "no ConsoleHut for this tab".to_string())
+                    .and_then(|console| console.hut.render_label(renderer, &label, fg, bg))
+            };
+            let texture = if tab.label_cache[i].is_stale(&key) {
+                render(graph).map(|texture| tab.label_cache[i].store(key, texture))
+            } else {
+                match tab.label_cache[i].cached() {
+                    Some(cached) => Ok(cached),
+                    None => render(graph).map(|texture| tab.label_cache[i].store(key, texture)),
+                }
+            };
+
+            let (text_id, bg_id) = tab.tab_ids[i].clone();
+            match texture {
+                Ok((texture, snapshot)) => {
+                    let text = TextureRenderElement::from_texture_with_damage(
+                        text_id,
+                        renderer.context_id(),
+                        ((rect.loc.x + padding) as f64, (rect.loc.y + padding) as f64),
+                        texture,
+                        crate::render::texture_buffer_scale(scale),
+                        Transform::Normal,
+                        None,
+                        None,
+                        None,
+                        None,
+                        snapshot,
+                        Kind::Unspecified,
+                    );
+                    elements.push(Element::from(text));
+                }
+                Err(err) => tracing::warn!("failed to render Hut tab label {label:?}: {err}"),
+            }
+
+            let bg_commit = tab.bg_tracker[i].commit(active);
+            let background =
+                SolidColorRenderElement::new(bg_id, *rect, bg_commit, to_color32f(bg), Kind::Unspecified);
+            elements.push(Element::from(background));
+        }
+    });
+
+    let next = children[active_index.min(children.len() - 1)];
+    let (deeper_elements, next_y) =
+        build(graph, next, renderer, y + tab_h(cell_h, scale), cell_w, cell_h, scale, theme);
     elements.extend(deeper_elements);
     (elements, next_y)
 }

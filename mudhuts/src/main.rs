@@ -18,7 +18,6 @@ mod ownership;
 mod redraw;
 mod render;
 mod space_element;
-mod stack;
 mod state;
 mod switcher;
 mod theme;
@@ -105,7 +104,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let (redraw_ping, redraw_ping_source) = smithay::reexports::calloop::ping::make_ping()?;
     let loop_handle = event_loop.handle();
-    let stack = stack::MruStackHut::new(
+    let stack = graph_stack::GraphStack::new(
         hut,
         term_events,
         loop_handle,

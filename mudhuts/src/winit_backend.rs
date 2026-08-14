@@ -136,6 +136,25 @@ pub fn init_winit(
                     let (_, _, usable_w, usable_h) = state.usable_area();
                     state.stack.resize_all(usable_w, usable_h);
 
+                    // KNOWN GAP: unlike `udev_backend.rs`, this backend has
+                    // no persistent `Rc<RefCell<GlesRenderer>>` to hand
+                    // `GraphStack::set_renderer` at all — `WinitGraphics
+                    // Backend::bind()` only ever hands out a fresh `&mut
+                    // GlesRenderer` transiently, scoped to this one
+                    // closure, with no way to extract a longer-lived
+                    // shared handle from it. `graph.env.renderer` is
+                    // therefore always `None` under this backend, and
+                    // `resolve_frame_content` correctly (if unhelpfully)
+                    // degrades to empty content every time — meaning
+                    // graph-resolved rendering doesn't actually show
+                    // anything under `winit` yet. Not a blocker for the
+                    // real daily-driver backend (`udev_backend.rs`, which
+                    // *does* share a real persistent renderer correctly);
+                    // called here anyway (rather than hardcoding
+                    // `Vec::new()`) so this starts working automatically
+                    // if winit's own renderer-sharing gap is ever closed.
+                    let content = render::resolve_frame_content(state);
+
                     // Scoped so the mutable borrow of `backend` from `bind()`
                     // ends before we need `backend` again below (`submit`,
                     // `window()`) — `render_result` itself borrows only from
@@ -153,6 +172,7 @@ pub fn init_winit(
                                 state,
                                 renderer,
                                 (size.w, size.h),
+                                content,
                             );
 
                             match damage_tracker.render_output(

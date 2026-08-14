@@ -19,9 +19,10 @@ use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
 
+use crate::graph_nodes::ConsoleNode;
+use crate::graph_stack::GraphStack;
 use crate::render::OutputRenderElements;
 use crate::space_element::HutSpaceRenderElement;
-use crate::stack::MruStackHut;
 
 /// Base sizes (scale 1.0) — scaled via `crate::render::scaled` wherever
 /// they're actually used, so the popup stays the same apparent size
@@ -37,7 +38,7 @@ type Element = OutputRenderElements<GlesRenderer, HutSpaceRenderElement>;
 /// `winit_backend.rs`, which pushes these ahead of the normal background
 /// elements — index 0 renders on top), or an empty list if no preview
 /// session is open.
-pub fn build(stack: &MruStackHut, output_size: (i32, i32), renderer: &GlesRenderer, scale: f64) -> Vec<Element> {
+pub fn build(stack: &GraphStack, output_size: (i32, i32), renderer: &GlesRenderer, scale: f64) -> Vec<Element> {
     if !stack.is_previewing() {
         return Vec::new();
     }
@@ -62,17 +63,20 @@ pub fn build(stack: &MruStackHut, output_size: (i32, i32), renderer: &GlesRender
     let preview_index = stack.preview_index();
     let mut elements = Vec::new();
 
-    for (i, entry) in stack.top_level_entries().enumerate() {
+    for (i, &entry) in stack.top_level_entries().enumerate() {
         let x = panel_x + padding + i as i32 * (thumb_w + gap);
         let y = panel_y + padding;
-        let console = entry.focused_hut();
+        let Some(console) = stack.graph().downcast::<ConsoleNode>(stack.graph().focused_leaf(entry)) else {
+            continue;
+        };
+        let console = &console.hut;
 
         // Whatever this entry is actually showing — its terminal, or (for
         // a Main Window instead) `render.rs`'s per-entry cache, falling
         // back to the terminal texture if that cache hasn't been
         // refreshed yet (e.g. this exact frame's offscreen render
         // failed) — see this module's doc comment.
-        let cached = if entry.shows_terminal_effective() {
+        let cached = if stack.shows_terminal_effective(entry) {
             console.cached_texture().map(|texture| (texture, console.element_damage_snapshot()))
         } else {
             crate::render::hut_thumbnail_texture(console.id)

@@ -17,7 +17,6 @@ use smithay::wayland::shell::wlr_layer::{KeyboardInteractivity, Layer as WlrLaye
 
 use crate::State;
 use crate::keybindings::Action;
-use crate::hut::Hut;
 use crate::{chrome, docks, village_chrome};
 
 /// Mime types mudhuts advertises for every selection it sets itself
@@ -298,30 +297,42 @@ impl State {
     fn try_click_chrome(&mut self, pos: Point<f64, Physical>) -> bool {
         let pixel = Point::<i32, Physical>::from((pos.x.round() as i32, pos.y.round() as i32));
 
-        // Rects come from `TileHut::absolute_pane_rects`, the single
-        // computation shared with `render.rs`'s `build_tile_elements` and
-        // `State::active_pane_offset` (composable Hut hierarchy RFC's
-        // Q3) — a click can't land on the wrong pane by disagreeing with
-        // what's actually drawn, whenever a layer-shell surface reserves
-        // part of the output, since there's only one place left to get
-        // that wrong.
+        // Rects come from `hut::pane_rects`, the single computation
+        // shared with `render.rs`'s `content_elements`/`TileNode::
+        // resolve` and `State::active_pane_offset` (composable Hut
+        // hierarchy RFC's Q3) — a click can't land on the wrong pane by
+        // disagreeing with what's actually drawn, whenever a layer-shell
+        // surface reserves part of the output, since there's only one
+        // place left to get that wrong.
         let area = self.usable_area();
-        if let Hut::Tile(tile) = self.stack.focused_top_level_mut()
-            && tile.children.len() >= 2
-        {
-            let rects = tile.absolute_pane_rects(area);
-            let Some(i) = rects.into_iter().position(|(x, y, w, h)| {
-                pixel.x >= x && pixel.x < x + w && pixel.y >= y && pixel.y < y + h
-            }) else {
-                return false;
-            };
-            // Writing through the `Signal` requests its own redraw (see
-            // `redraw::Signal`'s doc comment) — no `request_redraw()`
-            // needed here.
-            *tile.active = i;
-            self.sync_visible_main_window();
-            self.sync_keyboard_focus_to_view();
-            return true;
+        let top = self.stack.focused_top_level();
+        if let Some(tile) = self.stack.graph().downcast::<crate::graph_nodes::TileNode>(top) {
+            let children = self.stack.graph().hut_list_input(top, "children");
+            if children.len() >= 2 {
+                let fracs = if tile.fracs.len() == children.len() {
+                    tile.fracs.clone()
+                } else {
+                    vec![1.0; children.len()]
+                };
+                let axis = tile.axis;
+                let rects = crate::hut::pane_rects(axis, fracs.into_iter(), (area.2, area.3))
+                    .into_iter()
+                    .map(|(x, y, w, h)| (x + area.0, y + area.1, w, h));
+                let Some(i) = rects.enumerate().find_map(|(i, (x, y, w, h))| {
+                    (pixel.x >= x && pixel.x < x + w && pixel.y >= y && pixel.y < y + h).then_some(i)
+                }) else {
+                    return false;
+                };
+                // Writing through the `Signal` requests its own redraw
+                // (see `redraw::Signal`'s doc comment) — no
+                // `request_redraw()` needed here.
+                if let Some(tile) = self.stack.graph_mut().downcast_mut::<crate::graph_nodes::TileNode>(top) {
+                    *tile.active = i;
+                }
+                self.sync_visible_main_window();
+                self.sync_keyboard_focus_to_view();
+                return true;
+            }
         }
 
         let cell_w = self.stack.focused().glyphs.cell_width().max(1);
@@ -329,7 +340,8 @@ impl State {
         let scale = self.output_scale();
 
         if village_chrome::handle_click(
-            self.stack.focused_top_level_mut(),
+            self.stack.graph_mut(),
+            top,
             (pixel.x, pixel.y),
             0,
             cell_w,
@@ -337,14 +349,14 @@ impl State {
             scale,
         ) {
             // Same as the Tile-pane branch above — `handle_click` goes
-            // through `TabbedHut::set_active`, which already requested
-            // the redraw.
+            // through `TabNode::active`, which already requested the
+            // redraw.
             self.sync_visible_main_window();
             self.sync_keyboard_focus_to_view();
             return true;
         }
 
-        let strip_y = village_chrome::stack_height(self.stack.focused_top_level(), cell_h, scale);
+        let strip_y = village_chrome::stack_height(self.stack.graph(), top, cell_h, scale);
         let hit = chrome::tab_layout(self.stack.focused(), strip_y, scale)
             .into_iter()
             .find(|t| t.rect.contains(pixel));

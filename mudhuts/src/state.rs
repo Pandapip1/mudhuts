@@ -40,8 +40,7 @@ use smithay::wayland::viewporter::ViewporterState;
 
 use crate::keybindings::Keymap;
 use crate::space_element::HutSpaceElement;
-use crate::stack::MruStackHut;
-use crate::hut::Hut;
+use crate::graph_stack::GraphStack;
 
 /// Open mudhuts' listening Wayland socket without yet wiring it into an
 /// event loop. Split out from [`State::new`] so callers can learn the
@@ -136,7 +135,7 @@ pub struct State {
     /// `udev.rs` `keyboards` field/pattern exactly.
     pub keyboards: Vec<smithay::reexports::input::Device>,
 
-    pub stack: MruStackHut,
+    pub stack: GraphStack,
     pub keymap: Keymap,
     pub theme: crate::theme::Theme,
     /// The output's current pixel size, tracked here (not just read inside
@@ -356,7 +355,7 @@ impl State {
     pub fn new(
         event_loop: &mut EventLoop<Self>,
         display: Display<Self>,
-        stack: MruStackHut,
+        stack: GraphStack,
         socket: (ListeningSocketSource, OsString),
         redraw_ping: Ping,
     ) -> Result<Self, Box<dyn std::error::Error>> {
@@ -686,7 +685,7 @@ impl State {
     /// should currently be the visible view — `ConsoleHut::showing_terminal`,
     /// but forced true when that ConsoleHut has no Main Windows to toggle to.
     pub fn showing_terminal_effective(&self) -> bool {
-        self.stack.focused_top_level().shows_terminal_effective()
+        self.stack.shows_terminal_effective(self.stack.focused_top_level())
     }
 
     /// Screen-space offset of whichever pane currently has effective
@@ -701,14 +700,7 @@ impl State {
     /// still filled it edge to edge.
     pub fn active_pane_offset(&self) -> (f64, f64) {
         let area = self.usable_area();
-        let Hut::Tile(tile) = self.stack.focused_top_level() else {
-            return (area.0 as f64, area.1 as f64);
-        };
-        if tile.children.len() < 2 {
-            return (area.0 as f64, area.1 as f64);
-        }
-        let (x, y, _, _) = tile.absolute_pane_rects(area)[*tile.active];
-        (x as f64, y as f64)
+        self.stack.active_pane_offset(self.stack.focused_top_level(), area)
     }
 
     /// `root`'s absolute physical-pixel rect right now, if it's a Main
@@ -724,7 +716,7 @@ impl State {
     /// top-level Stack entry is ever actually on screen, matching every
     /// other render/hit-test call site's scope.
     pub fn leaf_absolute_rect(&self, root: &WlSurface) -> Option<(i32, i32, i32, i32)> {
-        self.stack.focused_top_level().leaf_absolute_rect(root, self.usable_area())
+        self.stack.leaf_absolute_rect(self.stack.focused_top_level(), root, self.usable_area())
     }
 
     /// Make the focused ConsoleHut's own `space` match what it should
