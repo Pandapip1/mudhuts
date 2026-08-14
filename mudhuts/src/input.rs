@@ -196,6 +196,16 @@ impl State {
         if output_index != self.stack.focused_output_index() {
             self.stack.set_focused_output(output_index);
             self.sync_focused_output();
+            // `sync_visible_main_window`'s own doc comment: call after
+            // anything that changes which ConsoleHut is focused. Focus-
+            // follows-mouse does exactly that (`self.stack.focused()`
+            // now resolves through the newly-focused output), and the
+            // very next thing this function does is hit-test against
+            // that Hut's `space` (`self.surface_under(pos)` below) — a
+            // backgrounded Hut's `space` can be stale, so skipping this
+            // left the first hit-test after landing on a new monitor
+            // liable to resolve against a stale mapped-window set.
+            self.sync_visible_main_window();
         }
         let pos_physical = self.to_physical(pos);
         // Under winit this is a no-op ping (the host draws the cursor,
