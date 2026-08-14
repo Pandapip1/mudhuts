@@ -85,6 +85,12 @@ impl Default for TabNode {
 }
 
 impl<Env> Node<Env> for TabNode {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
     fn inputs(&self) -> &[InputPort] {
         CHILDREN_INPUT
     }
@@ -159,6 +165,12 @@ impl TileNode {
 }
 
 impl<Env> Node<Env> for TileNode {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
     fn inputs(&self) -> &[InputPort] {
         CHILDREN_INPUT
     }
@@ -335,6 +347,12 @@ impl ConsoleNode {
 }
 
 impl Node<RenderEnv> for ConsoleNode {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
     fn inputs(&self) -> &[InputPort] {
         &[]
     }
@@ -464,6 +482,12 @@ fn terminal_pass_through_target(showing_terminal: bool, terminal: Option<NodeId>
 }
 
 impl<Env> Node<Env> for WaylandClientNode {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
     fn inputs(&self) -> &[InputPort] {
         CLIENT_INPUTS
     }
@@ -512,6 +536,12 @@ const MAIN_WINDOW_INPUTS: &[InputPort] = &[
 pub struct MainWindowNode;
 
 impl<Env> Node<Env> for MainWindowNode {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
     fn inputs(&self) -> &[InputPort] {
         MAIN_WINDOW_INPUTS
     }
@@ -557,6 +587,12 @@ const LAYER_SHELL_INPUTS: &[InputPort] = &[
 pub struct LayerShellNode;
 
 impl<Env> Node<Env> for LayerShellNode {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
     fn inputs(&self) -> &[InputPort] {
         LAYER_SHELL_INPUTS
     }
@@ -620,6 +656,12 @@ impl OutputHut {
 }
 
 impl<Env> Node<Env> for OutputHut {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
     fn inputs(&self) -> &[InputPort] {
         OUTPUT_INPUTS
     }
@@ -647,6 +689,12 @@ mod tests {
     }
     const LEAF_OUTPUTS: &[OutputPort] = &[OutputPort { name: "content", kind: PortKind::Content }];
     impl<Env> Node<Env> for LeafNode {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
         fn inputs(&self) -> &[InputPort] {
             &[]
         }

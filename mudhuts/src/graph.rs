@@ -278,6 +278,23 @@ pub trait Node<Env> {
     /// generically, without knowing its concrete type — needs to reach
     /// this through `dyn Node<Env>`, not a concrete `Redrawable` bound.
     fn attach_redraw_handle(&mut self, _handle: RedrawHandle) {}
+
+    /// Downcast to a concrete node type — needed because `Node`'s own
+    /// interface deliberately stays narrow (the touched/resize/rescale
+    /// methods above cover *generic* tree bookkeeping, but a `ConsoleNode`
+    /// specifically has a large surface of `ConsoleHut`-only operations
+    /// — terminal input, `main_windows_mut()`, `pixel_to_cell`, ... —
+    /// that `GraphStack`'s many callers (`input.rs`, `handlers/*.rs`)
+    /// need direct access to, not a generic `Node` method for each one).
+    /// Not default-implementable, despite the body being identical
+    /// everywhere (`{ self }`) — Rust can't cast a possibly-unsized
+    /// `&Self` to `&dyn Any` in a body shared across every impl without
+    /// a `Self: Sized` bound, which would make the method uncallable
+    /// through `dyn Node<Env>` in the first place, defeating the point.
+    /// Standard pattern (matches e.g. the `downcast-rs` crate's own
+    /// approach): every concrete node type repeats the one-liner.
+    fn as_any(&self) -> &dyn std::any::Any;
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 }
 
 #[derive(Debug)]
@@ -415,6 +432,22 @@ impl<Env> Graph<Env> {
     /// down to).
     pub fn focused_leaf(&self, id: NodeId) -> NodeId {
         *self.focused_path(id).last().unwrap_or(&id)
+    }
+
+    /// Downcast node `id` to a concrete type `T` — a thin wrapper over
+    /// [`Node::as_any`]/`downcast_ref`, for callers (`GraphStack`) that
+    /// know a given id is (or should be) a specific node type, most
+    /// commonly `ConsoleNode` for reaching real `ConsoleHut` state.
+    /// `None` if `id` doesn't exist or isn't actually a `T`.
+    pub fn downcast<T: 'static>(&self, id: NodeId) -> Option<&T> {
+        self.node(id)?.as_any().downcast_ref::<T>()
+    }
+
+    pub fn downcast_mut<T: 'static>(&mut self, id: NodeId) -> Option<&mut T>
+    where
+        Env: 'static,
+    {
+        self.node_mut(id)?.as_any_mut().downcast_mut::<T>()
     }
 
     /// [`Self::focused_leaf`]'s full walk, `id` included — `id` itself,
@@ -582,6 +615,12 @@ mod tests {
     }
     const CONST_OUTPUTS: &[OutputPort] = &[OutputPort { name: "value", kind: PortKind::Control }];
     impl<Env> Node<Env> for ConstNode {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
         fn inputs(&self) -> &[InputPort] {
             &[]
         }
@@ -600,6 +639,12 @@ mod tests {
     const DOUBLE_INPUTS: &[InputPort] = &[InputPort { name: "input", kind: PortKind::Control }];
     const DOUBLE_OUTPUTS: &[OutputPort] = &[OutputPort { name: "output", kind: PortKind::Control }];
     impl<Env> Node<Env> for DoubleNode {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
         fn inputs(&self) -> &[InputPort] {
             DOUBLE_INPUTS
         }
@@ -626,6 +671,12 @@ mod tests {
     const TAB_INPUTS: &[InputPort] = &[InputPort { name: "children", kind: PortKind::HutList }];
     const TAB_OUTPUTS: &[OutputPort] = &[OutputPort { name: "value", kind: PortKind::Control }];
     impl<Env> Node<Env> for TabLikeNode {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
         fn inputs(&self) -> &[InputPort] {
             TAB_INPUTS
         }
@@ -704,6 +755,17 @@ mod tests {
     }
 
     #[test]
+    fn downcast_reaches_the_concrete_node_type() {
+        let mut graph = Graph::new();
+        let a = graph.add_node(Box::new(ConstNode { value: 7.0, resolve_count: Default::default() }));
+        assert_eq!(graph.downcast::<ConstNode>(a).map(|n| n.value), Some(7.0));
+        assert!(graph.downcast::<DoubleNode>(a).is_none(), "wrong type should downcast to None, not panic");
+
+        graph.downcast_mut::<ConstNode>(a).unwrap().value = 9.0;
+        assert_eq!(graph.downcast::<ConstNode>(a).map(|n| n.value), Some(9.0));
+    }
+
+    #[test]
     fn focused_leaf_walks_down_through_nested_focused_children() {
         let mut graph = Graph::new();
         let a = graph.add_node(Box::new(ConstNode { value: 1.0, resolve_count: Default::default() }));
@@ -754,6 +816,12 @@ mod tests {
         struct MainLikeNode;
         const MAIN_INPUTS: &[InputPort] = &[InputPort { name: "main", kind: PortKind::Hut }];
         impl<Env> Node<Env> for MainLikeNode {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+                self
+            }
             fn inputs(&self) -> &[InputPort] {
                 MAIN_INPUTS
             }
@@ -840,6 +908,12 @@ mod tests {
         struct ReadsEnvNode;
         const ENV_OUTPUTS: &[OutputPort] = &[OutputPort { name: "value", kind: PortKind::Control }];
         impl Node<i32> for ReadsEnvNode {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+                self
+            }
             fn inputs(&self) -> &[InputPort] {
                 &[]
             }
