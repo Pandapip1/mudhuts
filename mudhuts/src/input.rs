@@ -273,9 +273,15 @@ impl State {
     /// key events via `set_focus`, and the terminal only gets them via
     /// `showing_terminal_effective()` itself (see `process_input_event`),
     /// so the window needs *no* stale focus lingering while it's hidden,
-    /// and *does* need focus the moment it's shown. Shared by
-    /// `Action::ToggleTerminal` and every chrome click that can change
-    /// which ConsoleHut/tab/pane is now showing (`try_click_chrome`).
+    /// and *does* need focus the moment it's shown. Must be called
+    /// alongside every `sync_visible_main_window()` call that can change
+    /// which ConsoleHut/tab/pane is now showing — `Action::ToggleTerminal`,
+    /// every chrome click (`try_click_chrome`), the instant paths of
+    /// `Action::StackNext`/`StackPrev`/`TabNext`/`TabPrev`/`WrapTab`/
+    /// `WrapTile`, and the `stack-hold` release closure's own
+    /// `commit_preview` — a call site that syncs the window but not this
+    /// used to leave keyboard input going to the old, now-hidden surface
+    /// until some unrelated event happened to repair it.
     fn sync_keyboard_focus_to_view(&mut self) {
         let target = if self.showing_terminal_effective() {
             None
@@ -472,9 +478,19 @@ impl State {
         let InputEvent::Keyboard { event } = event else {
             return;
         };
+        // A single seat only ever has one keyboard, so it can only
+        // forward to one output's own lock surface at a time — the
+        // *focused* output is the natural (and only sensible) choice,
+        // matching every other focus-scoped keyboard path in this file.
+        // Real multi-monitor: `self.lock_surfaces` now holds one entry
+        // per output (see `State::lock_surfaces`'s own doc comment), not
+        // a single shared slot.
         let Some(surface) = self
-            .lock_surface
-            .as_ref()
+            .stack
+            .outputs()
+            .get(self.stack.focused_output_index())
+            .and_then(|slot| self.lock_surfaces.iter().find(|(o, _)| *o == slot.output))
+            .map(|(_, s)| s)
             .filter(|s| s.alive())
             .map(|s| s.wl_surface().clone())
         else {
@@ -560,6 +576,7 @@ impl State {
                 }
                 if instant {
                     self.sync_visible_main_window();
+                    self.sync_keyboard_focus_to_view();
                 }
                 // The newly-focused (or newly-previewed) ConsoleHut gets resized
                 // to the real output size as part of the redraw this
@@ -576,6 +593,7 @@ impl State {
                 if instant {
                     self.stack.prev();
                     self.sync_visible_main_window();
+                    self.sync_keyboard_focus_to_view();
                 } else {
                     self.stack.preview_prev();
                 }
@@ -603,6 +621,7 @@ impl State {
                     self.stack.cycle_innermost(crate::hut::Direction::Next);
                 }
                 self.sync_visible_main_window();
+                self.sync_keyboard_focus_to_view();
             }
             Action::TabPrev => {
                 if self.stack.focused().main_window_count() >= 2 {
@@ -612,6 +631,7 @@ impl State {
                     self.stack.cycle_innermost(crate::hut::Direction::Prev);
                 }
                 self.sync_visible_main_window();
+                self.sync_keyboard_focus_to_view();
             }
             Action::WrapTab => {
                 // `Stack::wrap_tab` already requests its own redraw
@@ -621,12 +641,14 @@ impl State {
                     tracing::error!("failed to spawn a new ConsoleHut for wrap-tab: {err}");
                 }
                 self.sync_visible_main_window();
+                self.sync_keyboard_focus_to_view();
             }
             Action::WrapTile => {
                 if let Err(err) = self.stack.wrap_tile() {
                     tracing::error!("failed to spawn a new ConsoleHut for wrap-tile: {err}");
                 }
                 self.sync_visible_main_window();
+                self.sync_keyboard_focus_to_view();
             }
             Action::CopySelection => {
                 // Deliberately separate from the primary-selection commit
@@ -729,6 +751,7 @@ impl State {
                             // redraw (see `Action::StackNext`'s arm above).
                             data.stack.commit_preview();
                             data.sync_visible_main_window();
+                            data.sync_keyboard_focus_to_view();
                         }
 
                         // Global keybindings always win, regardless of
