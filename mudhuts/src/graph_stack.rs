@@ -267,6 +267,16 @@ impl GraphStack {
         self.outputs.iter().position(|slot| &slot.output == output)
     }
 
+    /// Which output's own subtree contains the `ConsoleHut` with this id
+    /// — needed wherever only a stable Hut id is on hand
+    /// (`grabs.rs`'s `MoveSurfaceGrab`, which captures an id at grab-
+    /// start rather than an output index precisely so it stays correct
+    /// even if focus moves to a different output mid-drag). `None` if
+    /// no Hut with this id exists anywhere (its shell already exited).
+    pub fn output_index_for_hut(&self, hut_id: u64) -> Option<usize> {
+        (0..self.outputs.len()).find(|&i| self.all_huts_for(i).any(|h| h.id == hut_id))
+    }
+
     /// Per the user's resolved multi-monitor policy: focus follows the
     /// mouse across outputs. Called from `input.rs`'s pointer-motion
     /// handling with whichever output's real geometry now contains the
@@ -762,13 +772,23 @@ impl GraphStack {
     /// the end of the *focused output's* own stack, without touching
     /// `current` — mirrors `MruStackHut::spawn_and_insert`.
     pub fn spawn_and_insert(&mut self) -> Result<u64, String> {
+        self.spawn_and_insert_for(self.focused_output)
+    }
+
+    /// [`Self::spawn_and_insert`], targeting a specific output rather
+    /// than always the focused one — needed by `remove_exited`, which
+    /// can need to refill a *background* output that just lost its last
+    /// top-level entry (see its own doc comment for why `spawn_and_insert`
+    /// itself, always pushing to `self.out_mut()`, would refill the
+    /// wrong output there).
+    fn spawn_and_insert_for(&mut self, output_index: usize) -> Result<u64, String> {
         let (hut, events) = ConsoleHut::spawn(self.extra_env.clone(), self.scale)?;
         let id = hut.id;
         self.insert_channel(id, events)?;
         let mut node = ConsoleNode::new(hut);
         Redrawable::attach_redraw_handle(&mut node, self.redraw.clone());
         let node_id = self.graph.add_node(Box::new(node));
-        self.out_mut().huts.push(node_id);
+        self.outputs[output_index].huts.push(node_id);
         Ok(id)
     }
 
@@ -900,8 +920,23 @@ impl GraphStack {
             return Ok(());
         };
 
-        let output_index = self.focused_output;
-        if let Some(top_index) = self.outputs[output_index].huts.iter().position(|&h| h == node_id) {
+        // Search every output's own top-level slots, not just the
+        // focused one — real multi-monitor: `node_id` can be a bare
+        // top-level entry on *any* output. Using `self.focused_output`
+        // unconditionally here missed a background output's own exiting
+        // Hut, so the "bare top-level entry" branch below never ran for
+        // it; it instead fell into the "nested" branch (a no-op, since
+        // nothing actually references it as a child), yet the node was
+        // still deleted from the graph regardless — leaving a dangling
+        // `NodeId` in that output's own `huts`, which panicked the next
+        // time `focused_for`/`focused_mut_for` resolved it there.
+        let found_output = self
+            .outputs
+            .iter()
+            .enumerate()
+            .find_map(|(i, out)| out.huts.iter().position(|&h| h == node_id).map(|top_index| (i, top_index)));
+
+        let touched_output = if let Some((output_index, top_index)) = found_output {
             // A bare top-level entry — drop it outright.
             self.graph.remove_node(node_id);
             let out = &mut self.outputs[output_index];
@@ -914,20 +949,34 @@ impl GraphStack {
             {
                 *preview -= 1;
             }
+            output_index
         } else {
             // Nested inside some top-level entry's own Tab/Tile chain —
             // remove it from whichever node's `children` list references
             // it, collapsing that node back to a bare child if only one
-            // survives (mirrors `Hut::remove_child_hut`).
+            // survives (mirrors `Hut::remove_child_hut`). Doesn't change
+            // any output's own top-level `huts` list, so there's no
+            // specific *other* output to re-clamp below — the focused
+            // one is as good a default as any (matches the old
+            // unconditional behavior for this branch).
             self.remove_child(node_id);
             self.graph.remove_node(node_id);
-        }
+            self.focused_output
+        };
 
-        if self.out().is_empty() {
-            self.spawn_and_insert()?;
+        // `touched_output`, not unconditionally the focused one — the
+        // "bare top-level entry" branch above can empty out a
+        // *background* output, and `spawn_and_insert` (which only ever
+        // pushes to the *focused* output) would otherwise both fail to
+        // refill the output that actually went empty (leaving it with a
+        // `huts.len() == 0`, which the very next line's `self.huts[self.current]`-
+        // style indexing elsewhere in this module assumes never happens)
+        // and spawn an extra, unwanted Hut on the focused one instead.
+        if self.outputs[touched_output].is_empty() {
+            self.spawn_and_insert_for(touched_output)?;
         }
-        let max_index = self.out().len().saturating_sub(1);
-        let out = self.out_mut();
+        let out = &mut self.outputs[touched_output];
+        let max_index = out.len().saturating_sub(1);
         out.current = out.current.min(max_index);
         if let Some(preview) = &mut out.preview {
             *preview = (*preview).min(max_index);
@@ -944,11 +993,10 @@ impl GraphStack {
     fn remove_child(&mut self, target: NodeId) {
         for parent in self.all_node_ids() {
             let mut children = self.graph.hut_list_input(parent, "children");
-            let before = children.len();
-            children.retain(|&c| c != target);
-            if children.len() == before {
+            let Some(removed_index) = children.iter().position(|&c| c == target) else {
                 continue;
-            }
+            };
+            children.remove(removed_index);
             if children.len() == 1 {
                 // Collapse: whatever pointed at `parent` should now
                 // point at `children[0]` directly instead — same
@@ -959,7 +1007,46 @@ impl GraphStack {
                 self.repoint(parent, survivor);
                 self.graph.remove_node(parent);
             } else {
+                // `parent` survives with a shorter `children` list —
+                // clamp its own `active` index to match, and shrink
+                // whatever parallel per-child arrays it carries at the
+                // same `removed_index`. Without the `active` clamp, a
+                // removal of anything but the *last* child left `active`
+                // pointing past the end of the shrunk list whenever it
+                // had been pointing at (or past) the removed slot:
+                // `TabNode`/`TileNode::focused_child` degrade gracefully
+                // (`.get()`), but `Graph::focused_path` then stops at
+                // `parent` itself instead of reaching a real leaf, and
+                // the next `GraphStack::focused()`/`focused_mut()` (etc.)
+                // call panics trying to downcast that non-`ConsoleNode`
+                // "leaf" — see this codebase's standing no-panics rule.
+                // Without the parallel-array shrink, `TabNode`'s own doc
+                // comment on `label_cache`/`tab_ids`/`bg_tracker`
+                // ("shrinking happens wherever a child is actually
+                // removed from the list") went unfulfilled: every index
+                // after the removed one silently referred to the wrong
+                // child's cached label/`Id`/background from then on,
+                // and the arrays only ever grew, never shrank, across a
+                // long session of repeated tab open/close.
+                let max_index = children.len().saturating_sub(1);
                 let _ = self.graph.set_hut_list(parent, "children", children);
+                if let Some(tab) = self.graph.downcast_mut::<TabNode>(parent) {
+                    if removed_index < tab.label_cache.len() {
+                        tab.label_cache.remove(removed_index);
+                    }
+                    if removed_index < tab.tab_ids.len() {
+                        tab.tab_ids.remove(removed_index);
+                    }
+                    if removed_index < tab.bg_tracker.len() {
+                        tab.bg_tracker.remove(removed_index);
+                    }
+                    *tab.active = (*tab.active).min(max_index);
+                } else if let Some(tile) = self.graph.downcast_mut::<TileNode>(parent) {
+                    if removed_index < tile.fracs.len() {
+                        tile.fracs.remove(removed_index);
+                    }
+                    *tile.active = (*tile.active).min(max_index);
+                }
             }
             return;
         }
@@ -1188,6 +1275,75 @@ mod tests {
             stack.graph().downcast::<ConsoleNode>(top).is_some(),
             "collapsed back down to a bare ConsoleNode instead of a 1-child Tab node"
         );
+    }
+
+    #[test]
+    fn remove_exited_finds_a_bare_top_level_entry_on_a_non_focused_output() {
+        // Regression case: `remove_exited` used to only ever search the
+        // *focused* output's own top-level slots for the exiting node,
+        // so a background output's own exiting Hut fell through to the
+        // "nested" branch (a no-op there) while the node was still
+        // deleted from the graph regardless — leaving a dangling
+        // `NodeId` in that output's `huts` that panicked the next time
+        // it was resolved.
+        let mut stack = new_stack();
+        stack.add_output(crate::space_element::synthetic_output("b", (800, 600), 1.0), Point::from((1920, 0))).unwrap();
+        assert_eq!(stack.focused_output_index(), 0, "focus stays on output 0");
+        let background_id = stack.focused_for(1).id;
+
+        stack.remove_exited(background_id).unwrap();
+
+        assert_eq!(stack.len_for(1), 1, "output 1 should have been refilled, never left with zero entries");
+        assert_ne!(stack.focused_for(1).id, background_id, "the exited Hut is really gone");
+        assert_eq!(stack.len_for(0), 1, "output 0 (unrelated) is untouched");
+    }
+
+    #[test]
+    fn remove_child_clamps_active_and_shrinks_tab_node_caches() {
+        // Regression case: closing a non-last tabbed pane used to leave
+        // `TabNode::active` pointing past the end of the shrunk
+        // `children` list (eventually panicking via `focused()`'s
+        // `ConsoleNode` downcast `.expect()`), and its parallel
+        // `label_cache`/`tab_ids`/`bg_tracker` arrays never shrank at
+        // all, silently misattributing a removed tab's cached chrome to
+        // whichever child slid into its old index.
+        let mut stack = new_stack();
+        let b_id = stack.spawn_and_insert().unwrap();
+        stack.spawn_and_insert().unwrap();
+        // `wrap_tab` only ever builds a flat 2-child node — assemble a
+        // flat 3-child `TabNode` directly instead, out of the 3
+        // top-level entries `new_stack`/`spawn_and_insert` just built.
+        let node_ids: Vec<NodeId> = stack.outputs[0].huts.drain(..).collect();
+        assert_eq!(node_ids.len(), 3);
+
+        let mut tab = TabNode::new();
+        *tab.active = 2; // pointing at the last child
+        Redrawable::attach_redraw_handle(&mut tab, stack.redraw.clone());
+        let tab_id = stack.graph.add_node(Box::new(tab));
+        stack.graph.set_hut_list(tab_id, "children", node_ids.clone()).unwrap();
+        stack.outputs[0].huts.push(tab_id);
+        stack.outputs[0].current = 0;
+
+        // Grow the per-child caches to 3 entries, the same way a real
+        // render pass would (village_chrome.rs's own grow loop).
+        stack.graph.with_node_mut(tab_id, |node, _graph| {
+            let tab = node.as_any_mut().downcast_mut::<TabNode>().unwrap();
+            while tab.label_cache.len() < 3 {
+                tab.label_cache.push(crate::render::LabelCache::new());
+                tab.tab_ids.push((smithay::backend::renderer::element::Id::new(), smithay::backend::renderer::element::Id::new()));
+                tab.bg_tracker.push(crate::render::ChangeTracker::new());
+            }
+        });
+
+        stack.remove_exited(b_id).unwrap(); // removes the middle child
+
+        let children = stack.graph.hut_list_input(tab_id, "children");
+        assert_eq!(children, vec![node_ids[0], node_ids[2]], "the middle child (b) is gone, the rest kept its order");
+        let tab = stack.graph.downcast::<TabNode>(tab_id).unwrap();
+        assert_eq!(*tab.active, 1, "clamped from 2 down to the new last valid index");
+        assert_eq!(tab.label_cache.len(), 2, "shrunk in step with children");
+        assert_eq!(tab.tab_ids.len(), 2);
+        assert_eq!(tab.bg_tracker.len(), 2);
     }
 
     #[test]
