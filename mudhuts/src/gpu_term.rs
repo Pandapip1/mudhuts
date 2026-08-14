@@ -33,6 +33,72 @@ use mudhuts_term::render::CellInfo;
 
 const ATLAS_SIZE: u32 = 1024;
 
+/// A raw GL object (program/buffer/framebuffer) queued for deletion once a
+/// renderer is next available — see [`queue_gl_delete`]'s doc comment for
+/// why this indirection exists instead of deleting directly from `Drop`.
+enum PendingGlDelete {
+    Program(ffi::types::GLuint),
+    Buffer(ffi::types::GLuint),
+    Framebuffer(ffi::types::GLuint),
+    Texture(ffi::types::GLuint),
+}
+
+thread_local! {
+    static PENDING_GL_DELETES: RefCell<Vec<PendingGlDelete>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Queue a raw GL object for deletion — called from `Drop` impls below,
+/// which have no way to reach a `&mut GlesRenderer`/`&Gles2` (a `Drop::drop`
+/// takes no extra arguments, and a ConsoleHut can be torn down from
+/// contexts with no renderer in scope at all, e.g. `State::handle_term_event`
+/// reacting to a shell exit, or an Alt-Tab discard in `input.rs` — neither
+/// runs anywhere near a render pass). Mirrors the pattern Smithay's own
+/// `GlesTexture` uses for exactly the same reason (see
+/// `GlesTextureInternal`'s `Drop` impl in
+/// `.../backend/renderer/gles/texture.rs`: it sends the id through a
+/// `destruction_callback_sender` channel rather than deleting inline) —
+/// the only difference is Smithay's queue is internal to `GlesRenderer`
+/// and drained automatically on every bind, while this one is drained
+/// explicitly by [`drain_pending_gl_deletes`], called once at the top of
+/// `render::build_frame_elements` (the one place both backends already
+/// hand a live `&mut GlesRenderer` through every frame).
+///
+/// Before this queue existed, every `GlyphAtlas`/`GpuTermRenderer`/
+/// `LabelRenderer` — one full set per ConsoleHut, recreated for every new
+/// terminal — leaked its shader program, VBO(s), framebuffer, and (for
+/// `GlyphAtlas` specifically) its full `ATLAS_SIZE`×`ATLAS_SIZE` texture
+/// (1024×1024 single-channel = exactly 1MB) for the rest of the
+/// compositor's lifetime: opening and closing a terminal repeatedly grew
+/// driver-side GL/GPU memory without bound, never reclaimed until mudhuts
+/// itself exited.
+fn queue_gl_delete(item: PendingGlDelete) {
+    PENDING_GL_DELETES.with(|queue| queue.borrow_mut().push(item));
+}
+
+/// Actually delete whatever [`queue_gl_delete`] has queued up since the
+/// last call — see that function's doc comment. Safe/cheap to call every
+/// frame even when nothing's queued (the common case): an empty `Vec`
+/// check with no `with_context` call at all.
+pub fn drain_pending_gl_deletes(renderer: &mut GlesRenderer) {
+    let pending = PENDING_GL_DELETES.with(|queue| std::mem::take(&mut *queue.borrow_mut()));
+    if pending.is_empty() {
+        return;
+    }
+    let result = renderer.with_context(|gl| unsafe {
+        for item in pending {
+            match item {
+                PendingGlDelete::Program(id) => gl.DeleteProgram(id),
+                PendingGlDelete::Buffer(id) => gl.DeleteBuffers(1, &id),
+                PendingGlDelete::Framebuffer(id) => gl.DeleteFramebuffers(1, &id),
+                PendingGlDelete::Texture(id) => gl.DeleteTextures(1, &id),
+            }
+        }
+    });
+    if let Err(err) = result {
+        tracing::warn!("failed to drain pending GL object deletions: {err}");
+    }
+}
+
 /// The glyph atlas is looked up once per on-screen cell every redraw, so its
 /// hash cost is on the hot path. `HashMap`'s default hasher (SipHash) is
 /// built for DoS resistance against attacker-controlled keys, which this
@@ -269,6 +335,17 @@ pub struct GlyphAtlas {
     packer: ShelfPacker,
     glyphs: HashMap<(char, bool), AtlasEntry, FxBuildHasher>,
     white: AtlasEntry,
+}
+
+impl Drop for GlyphAtlas {
+    fn drop(&mut self) {
+        // See `queue_gl_delete`'s doc comment — this is the one that used
+        // to leak a full 1MB `ATLAS_SIZE`×`ATLAS_SIZE` texture per
+        // ConsoleHut.
+        queue_gl_delete(PendingGlDelete::Program(self.program));
+        queue_gl_delete(PendingGlDelete::Buffer(self.quad_vbo));
+        queue_gl_delete(PendingGlDelete::Texture(self.atlas_tex));
+    }
 }
 
 impl GlyphAtlas {
@@ -606,6 +683,17 @@ pub struct GpuTermRenderer {
     tex_size: (i32, i32),
 }
 
+impl Drop for GpuTermRenderer {
+    fn drop(&mut self) {
+        // `color_texture` self-cleans (a `GlesTexture` frees its own GL
+        // texture via Smithay's own destruction-callback queue when
+        // dropped) — only the two raw ids need queuing here. See
+        // `queue_gl_delete`'s doc comment.
+        queue_gl_delete(PendingGlDelete::Buffer(self.instance_vbo));
+        queue_gl_delete(PendingGlDelete::Framebuffer(self.fbo));
+    }
+}
+
 impl GpuTermRenderer {
     /// Creates its own atlas. Most callers want [`Self::with_atlas`]
     /// instead, sharing one with the same ConsoleHut's [`LabelRenderer`] (if any)
@@ -787,6 +875,18 @@ pub struct LabelRenderer {
     instance_vbo: ffi::types::GLuint,
     instance_capacity: usize,
     fbo: ffi::types::GLuint,
+}
+
+impl Drop for LabelRenderer {
+    fn drop(&mut self) {
+        // Its own `instance_vbo`/`fbo`, separate from `GpuTermRenderer`'s —
+        // see that impl's matching `Drop`. `atlas` is an `Rc` clone of the
+        // same `GlyphAtlas` `GpuTermRenderer` holds; its own `Drop` only
+        // runs once the last clone (whichever of the two structs for this
+        // ConsoleHut drops last) goes away.
+        queue_gl_delete(PendingGlDelete::Buffer(self.instance_vbo));
+        queue_gl_delete(PendingGlDelete::Framebuffer(self.fbo));
+    }
 }
 
 impl LabelRenderer {

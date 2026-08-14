@@ -523,6 +523,14 @@ pub fn build_frame_elements(
     renderer: &mut GlesRenderer,
     size: (i32, i32),
 ) -> Vec<OutputRenderElements<GlesRenderer, HutSpaceRenderElement>> {
+    // First, always — regardless of what else this frame does (even a
+    // locked session below still has a live renderer here): reclaim
+    // whatever GL objects a ConsoleHut closed since the last frame queued
+    // for deletion. See `gpu_term::queue_gl_delete`'s doc comment for why
+    // this can't happen at the point a ConsoleHut is actually dropped
+    // instead (no renderer in scope there).
+    crate::gpu_term::drain_pending_gl_deletes(renderer);
+
     // Checked before every other branch below (switcher, Hut chrome,
     // terminal/window content): a locked session must render *nothing*
     // else, not even layered underneath a lock surface — see
