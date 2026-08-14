@@ -7,6 +7,7 @@ mod gpu_term;
 mod grabs;
 mod graph;
 mod graph_nodes;
+mod graph_stack;
 mod handlers;
 mod console_hut;
 mod input;
