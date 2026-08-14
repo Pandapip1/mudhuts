@@ -321,6 +321,12 @@ pub struct State {
     /// all. No entry for a given output means "locked, but nothing to
     /// show there yet" — `render.rs`'s `build_frame_elements` still
     /// blanks that output's screen either way.
+    ///
+    /// Purged by real `Output` identity in `udev_backend.rs`'s
+    /// `connector_disconnected` when a monitor is unplugged — nothing
+    /// about `GraphStack::remove_output` itself reaches into `State`, so
+    /// that's the one place responsible for keeping this from
+    /// accumulating stale entries for since-disconnected outputs.
     pub lock_surfaces: Vec<(Output, LockSurface)>,
     /// Held between accepting a lock request and actually confirming it —
     /// see `handlers/session_lock.rs`'s `lock` doc comment for why that

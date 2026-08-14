@@ -899,6 +899,7 @@ fn connector_connected(
             Ok(drm_output) => drm_output,
             Err(err) => {
                 tracing::warn!("failed to initialize DRM output for {output_name}: {err}");
+                state.display_handle.remove_global::<State>(global);
                 return;
             }
         }
@@ -946,6 +947,7 @@ fn connector_connected(
                 Ok(index) => index,
                 Err(err) => {
                     tracing::warn!("failed to add output slot for {output_name}: {err}");
+                    state.display_handle.remove_global::<State>(global);
                     return;
                 }
             }
@@ -1033,6 +1035,11 @@ fn connector_disconnected(
         // discarded entirely, with nothing anywhere ever calling
         // `DisplayHandle::remove_global`).
         state.display_handle.remove_global::<State>(surface.global);
+        // Purge any lock surface keyed to this now-gone `Output` — see
+        // `State::lock_surfaces`'s doc comment: nothing else hooks into
+        // output removal to drop it, so a monitor unplugged mid-lock
+        // otherwise left a stale, un-purgeable entry behind forever.
+        state.lock_surfaces.retain(|(o, _)| o != &surface.output);
         // Refuses to actually remove the last remaining slot (see
         // `GraphStack::remove_output`'s doc comment) — the disconnected
         // connector's `OutputSlot` is left in place with its now-stale
@@ -1406,7 +1413,11 @@ fn build_cursor_elements(
         state.cursor_status = CursorImageStatus::default_named();
     }
 
-    let scale = state.output_scale();
+    // This crtc's own output, not `state.output_scale()` (the focused
+    // one) — `output_position` a few lines below already resolves
+    // per-output via `output_index`; the cursor's own size/hotspot/
+    // render scale need to match.
+    let scale = state.output_scale_for(output_index);
     // The buffer-scale integer every xcursor-theme frame is picked/
     // uploaded at below — same rounding as `render::texture_buffer_scale`
     // (a real fractional host scale loses sub-pixel precision here, same
