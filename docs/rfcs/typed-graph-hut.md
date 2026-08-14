@@ -353,6 +353,51 @@ future interface's own design, not on `graph.rs`'s core API — tracked
 here so it isn't lost, not implemented now (no management interface
 exists yet to constrain).
 
+## Two real walls hit while pushing into steps 4 and 7 (2026-08-14)
+
+Attempted both after the user's explicit "do them both" instruction.
+Made real progress on step 4's node-content side (see the migration
+plan's step 4 entries below) before hitting a genuine design gap, and
+concluded step 7 needs a real product decision before more code is the
+right next step. Recorded here rather than guessed past.
+
+**Step 4 — `ContentPiece::Window` isn't a faithful replacement for
+`space_render_elements` yet.** `content_elements`'s current Main-Window
+branch renders through a real `Space<HutSpaceElement>` via
+`space_render_elements`, which correctly composites a window's full
+surface tree *and* its tracked popups. A single `Window` + position (what
+`ContentPiece::Window` currently is) can only be turned into render
+elements via `render_elements_from_surface_tree`, which walks subsurfaces
+but has no relationship to `PopupManager` at all — swapping to it would
+silently stop rendering popups (context menus, tooltips, autocomplete
+dropdowns), a real, user-visible regression, not a cosmetic gap. A
+faithful fix means either giving `MainWindowNode`/`WaylandClientNode` a
+real owned `Space<HutSpaceElement>` each (mirroring `ConsoleHut::space`'s
+existing role) rather than a bare `Window`, or some other mechanism that
+preserves popup compositing — not yet decided, and not something to
+guess at silently. Everything up to the content-piece list itself
+(`ContentPiece::Texture`'s path — Console/Terminal, Tile) *is* real and
+complete; this gap is specifically the Window-content path.
+
+**Step 7 — real multi-monitor needs a product decision, not just more
+code.** Concretely scoping the work surfaced questions no amount of
+further coding resolves on its own: splitting `state.output`/`state.
+stack` into one-per-output state also means deciding **input focus
+policy across outputs** — does keyboard focus follow the mouse when it
+crosses onto a different output's content, or stay pinned to whichever
+output was last clicked? Does Alt+Tab cycle within the current output's
+own stack only, or globally across every output's entries? Is a window
+ever allowed to span/move between outputs, or does moving it to a
+different output's Hut subtree need to be an explicit user action (a
+keybind, a drag past an edge)? These are genuine UX decisions, not
+implementation details — every real desktop compositor answers them
+differently (i3 vs. GNOME vs. macOS all disagree), and picking one
+unilaterally while unsupervised would bake in a real behavioral choice
+the user hasn't actually made. The *mechanical* per-output split (`state.
+outputs: Vec<...>`, per-output `usable_area`, the udev backend already
+mostly ready per the Multi-Monitor section above) is real, scoped work —
+it's the policy questions blocking a start, not the engineering.
+
 ## Explicitly out of scope
 
 - Retyping `Control` beyond a bare `f64` until a second real control
