@@ -381,22 +381,97 @@ complete; this gap is specifically the Window-content path.
 
 **Step 7 — real multi-monitor needs a product decision, not just more
 code.** Concretely scoping the work surfaced questions no amount of
-further coding resolves on its own: splitting `state.output`/`state.
-stack` into one-per-output state also means deciding **input focus
-policy across outputs** — does keyboard focus follow the mouse when it
-crosses onto a different output's content, or stay pinned to whichever
-output was last clicked? Does Alt+Tab cycle within the current output's
-own stack only, or globally across every output's entries? Is a window
-ever allowed to span/move between outputs, or does moving it to a
-different output's Hut subtree need to be an explicit user action (a
-keybind, a drag past an edge)? These are genuine UX decisions, not
-implementation details — every real desktop compositor answers them
-differently (i3 vs. GNOME vs. macOS all disagree), and picking one
-unilaterally while unsupervised would bake in a real behavioral choice
-the user hasn't actually made. The *mechanical* per-output split (`state.
-outputs: Vec<...>`, per-output `usable_area`, the udev backend already
-mostly ready per the Multi-Monitor section above) is real, scoped work —
-it's the policy questions blocking a start, not the engineering.
+further coding resolves on its own — **resolved by the user, 2026-08-14**:
+- **Focus follows the mouse across outputs** — keyboard focus tracks
+  whichever output the pointer is currently over, not pinned to
+  whichever output was last clicked.
+- **Alt+Tab cycles within the current output's own stack only** — not
+  globally across every output's entries.
+- **Windows moving between outputs is deferred** — "once you add
+  support for it, but that isn't important yet." No cross-output window
+  migration mechanism needs building now; a window stays on whichever
+  output's Hut subtree it was created under.
+
+The *mechanical* per-output split (`state.outputs: Vec<...>`, per-output
+`usable_area`, the udev backend already mostly ready per the
+Multi-Monitor section above) is real, scoped work, now unblocked —
+concrete architecture below, from actually reading `state.rs` in full
+rather than estimating from a grep count.
+
+### Concrete scope, now that policy is resolved
+
+`grep -rc "state\.stack\|state\.output\b"` across the workspace: **106
+occurrences across 12 files** — `input.rs` alone has 41, `state.rs` and
+`render.rs` 16 each, the rest (`udev_backend.rs`, `winit_backend.rs`,
+`handlers/xdg_shell.rs`, `handlers/shell.rs`, `docks.rs`,
+`handlers/layer_shell.rs`, `handlers/capture.rs`, `main.rs`,
+`handlers/compositor.rs`) smaller but real. Most of that is
+mechanically safe to change (Rust's borrow checker catches a
+`stack()`/`stack_mut()` mismatch as a compile error, so this part is
+genuinely self-verifying, not "hope it's right") — but three things
+found while reading `state.rs` aren't mechanical at all:
+
+1. **`real_output_geometry()`'s own doc comment**: "always at `(0, 0)`
+   (mudhuts is single-output and both backends unconditionally
+   `map_output` there)." Real side-by-side monitors need real distinct
+   positions in one shared compositor space — this one assumption is
+   load-bearing through `usable_area()`/`usable_area_logical()`/
+   `surface_under()`/everything downstream of them, which all currently
+   treat "the output's own rect" as if it starts the compositor's global
+   origin.
+2. **`pointer_location: Point<f64, Logical>`** is a single global point
+   with no output attached at all — focus-follows-mouse needs a real
+   "which output's rect currently contains this point" lookup, which
+   needs (1) solved first to even ask the question.
+3. **`MruStackHut`, `Output`, and `pointer`/keyboard focus state are
+   currently three separate single instances on `State`** (`stack`,
+   `output`, `pointer_location`/`seat`) that all need to become
+   per-output *together* — splitting just one without the others
+   produces an inconsistent half-migration (e.g. a real 2nd `Output`
+   with no 2nd `MruStackHut` to show on it).
+
+Proposed shape once someone builds this:
+
+```rust
+struct OutputSlot {
+    output: Output,
+    stack: MruStackHut,
+    /// This output's own position in one shared global compositor
+    /// space — replaces the hardcoded `(0, 0)` `real_output_geometry`
+    /// currently assumes. Side-by-side layout (left-to-right, in
+    /// connector-scan order) is the simplest real default; nothing
+    /// about the `OutputSlot` shape itself forces that policy.
+    position: Point<i32, Logical>,
+}
+
+// On State: outputs: Vec<OutputSlot>, focused_output: usize (index into
+// outputs — the one the pointer is currently over, per the resolved
+// focus-follows-mouse policy; updated on every pointer motion event by
+// a new "which output's rect contains pointer_location" lookup).
+// state.stack()/state.stack_mut()/state.output() become accessor
+// methods routing through outputs[focused_output] — mechanically
+// replacing every existing `state.stack`/`state.output` field access
+// (Alt+Tab already automatically becomes "per current output" for
+// free, once `stack_mut()` routes to the right one — no separate
+// per-output-Alt+Tab logic needed beyond this).
+```
+
+Window migration between outputs (explicitly deferred by the user) means
+a window's owning Hut subtree only ever gets created under whichever
+`OutputSlot` was focused at creation time — no cross-`OutputSlot` move
+operation needs to exist yet.
+
+Deliberately not started this session: with policy resolved, the
+remaining blocker is pure volume/care, not an unresolved question — but
+executing a 106-call-site, 12-file change safely (plus real per-output
+`Output::create_global`/DRM connector-to-`OutputSlot` wiring in
+`udev_backend.rs`, plus the pointer-to-output lookup, plus keeping
+`winit_backend.rs`'s genuinely-single-output path correct throughout)
+is realistically multi-session work in its own right, not a should-fit-
+in-the-same-sitting extension of the graph rearchitecture above. Safer
+to land as its own clearly-scoped effort, verified incrementally the
+same way steps 1-4 were, than to rush a wide, load-bearing rewrite in
+one unreviewed pass this late in an already long session.
 
 ## Explicitly out of scope
 
