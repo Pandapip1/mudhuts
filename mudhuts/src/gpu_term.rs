@@ -351,7 +351,7 @@ pub struct GlyphAtlas {
 impl Drop for GlyphAtlas {
     fn drop(&mut self) {
         // See `queue_gl_delete`'s doc comment — this is the one that used
-        // to leak a full 1MB `ATLAS_SIZE`×`ATLAS_SIZE` texture per
+        // to leak a full 4MB `ATLAS_SIZE`×`ATLAS_SIZE` texture per
         // ConsoleHut.
         queue_gl_delete(PendingGlDelete::Program(self.program));
         queue_gl_delete(PendingGlDelete::Buffer(self.quad_vbo));
