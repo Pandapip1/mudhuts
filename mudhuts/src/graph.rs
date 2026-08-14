@@ -122,19 +122,47 @@ pub struct OutputPort {
     pub kind: PortKind,
 }
 
-/// A node's rendered frame content — a real texture plus a damage
-/// snapshot once migration step 3's Console/Terminal leaf produces one
-/// (the same shape `ConsoleHut::redraw`/`element_damage_snapshot`
-/// already return), `None` for a node with nothing to show yet (a purely
-/// structural node like `TabNode`/`TileNode` that never actually holds
-/// pixels itself — its own `content` output resolves by delegating to
-/// whichever child is active, not by producing anything here directly)
-/// or before a real renderer has ever run.
-#[derive(Clone, Default)]
-pub struct RenderedContent {
-    pub texture: Option<smithay::backend::renderer::gles::GlesTexture>,
-    pub damage: Option<smithay::backend::renderer::utils::DamageSnapshot<i32, smithay::utils::Buffer>>,
+/// One already-rendered, already-positioned piece of a frame's content.
+/// A node's `content` output is a *list* of these
+/// ([`RenderedContent`] = `Vec<ContentPiece>`), never one flattened,
+/// pre-composited texture — matching how the pre-graph render pipeline
+/// already treats a Tile-Hut's panes, or a Main Window's Floating
+/// Windows/Alerts, as *separate* render elements each with their own
+/// damage tracking. Collapsing them into a single composited texture
+/// (the way `composite_normal_content` does for the comparatively rare,
+/// lower-priority Alt-Tab-thumbnail path — see that function's own doc
+/// comment) would force a full GPU recomposite every frame *any one*
+/// piece changes, a real performance regression on the main render path
+/// every frame goes through, not an acceptable tradeoff there the way
+/// it is for a popup only redrawn while open.
+///
+/// Positions are physical-pixel-absolute, matching this codebase's
+/// established real-output-absolute-coordinates convention throughout
+/// `render.rs` (see that module's own doc comments on why that has to
+/// stay true all the way to the GPU).
+#[derive(Clone)]
+pub enum ContentPiece {
+    /// A GPU-rendered texture (a Console/Terminal's own content, or —
+    /// once migration step 4 builds it — a Tile-Hut pane's border
+    /// highlight) at a physical-pixel-absolute position.
+    Texture {
+        texture: smithay::backend::renderer::gles::GlesTexture,
+        damage: smithay::backend::renderer::utils::DamageSnapshot<i32, smithay::utils::Buffer>,
+        position: (f64, f64),
+    },
+    /// A real client `Window`'s own surface(s) — composited by
+    /// Smithay's own `space_render_elements`/`AsRenderElements`
+    /// machinery, not rendered by this compositor itself. A Main
+    /// Window, Floating Window, Alert, or layer-shell client.
+    Window {
+        window: smithay::desktop::Window,
+        position: smithay::utils::Point<i32, smithay::utils::Logical>,
+    },
 }
+
+/// A node's rendered frame content this call — empty for a node with
+/// nothing to show yet, or before a real renderer has ever run.
+pub type RenderedContent = Vec<ContentPiece>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeId(u64);

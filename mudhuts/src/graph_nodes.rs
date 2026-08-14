@@ -1,32 +1,45 @@
 //! Real Hut node types built on the graph core (`graph.rs`) — migration
-//! step 2 of `docs/rfcs/typed-graph-hut.md`: Tab-Hut and Tile-Hut
-//! expressed as [`crate::graph::Node`] impls. Proven equivalent to
-//! `hut.rs`'s existing `TabbedHut`/`TileHut` selection/cycling behavior
-//! by literally sharing the same [`crate::hut::wrapping_step`] helper,
-//! not a separately-reimplemented copy of it — so a future regression in
-//! one can't silently diverge from the other without a test failure
-//! (see this module's own tests below).
+//! steps 2, 3, 5, and 6 of `docs/rfcs/typed-graph-hut.md`:
+//! `TabNode`/`TileNode` (Tab/Tile), `ConsoleNode`/`WaylandClientNode`
+//! (Console/Terminal + the real content-flow port), `MainWindowNode`,
+//! `LayerShellNode`, and `OutputHut`. `TabNode`/`TileNode`'s cycling is
+//! proven equivalent to `hut.rs`'s existing `TabbedHut`/`TileHut`
+//! cycling by literally sharing [`crate::hut::wrapping_step`], not a
+//! separately-reimplemented copy of it.
 //!
 //! Still not wired into `main.rs`'s real render/input call paths
 //! (migration step 4) — these are real, usable node types, just not live
-//! yet. `resolve`'s `content` output stays a [`RenderedContent`]
-//! placeholder until migration step 3 gives it something real to
-//! produce (a Console/Terminal leaf node) — what *is* real and tested
-//! here is the graph wiring itself: which child is active, how cycling
-//! moves that index, and that every child actually gets traversed for a
-//! Tile-Hut's "show every pane" case.
+//! yet.
+//!
+//! ## What's unit-tested here, and what can't be
+//!
+//! `ConsoleNode` (needs a real `&mut GlesRenderer`, exactly like
+//! `ConsoleHut::redraw` itself, never unit-tested either) and
+//! `WaylandClientNode` (needs a real `Window`, which needs a real live
+//! `WlSurface`/client connection to construct at all) can't be exercised
+//! by a plain unit test at all — Smithay's own API gives no way to
+//! construct a fake `GlesTexture` or `Window` without a live GL/Wayland
+//! context. Where that's blocked a *decision* the node's own `resolve`
+//! makes (e.g. `WaylandClientNode`'s terminal-toggle choice) is pulled
+//! out into its own pure function and tested directly instead (see
+//! `terminal_pass_through_target`) — real logic coverage without
+//! needing the untestable parts. Every purely structural node
+//! (`TabNode`/`TileNode`/`MainWindowNode`/`LayerShellNode`/`OutputHut`)
+//! stays fully unit-tested, since none of them need a live context to
+//! construct or resolve.
 
-// Migration step 2 (see this module's doc comment): nothing in
-// `main.rs`/`render.rs`/`input.rs` constructs these node types yet — the
-// module's own unit tests already exercise the whole API (see below).
-// Remove once migration step 4 cuts the real call paths over to the
-// graph.
+// Nothing in `main.rs`/`render.rs`/`input.rs` constructs these node
+// types yet — the module's own unit tests already exercise everything
+// that can be (see above). Remove once migration step 4 cuts the real
+// call paths over to the graph.
 #![allow(dead_code)]
 
 use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::desktop::Window;
+use smithay::utils::Point;
 
 use crate::console_hut::ConsoleHut;
-use crate::graph::{Graph, InputPort, Node, NodeId, OutputPort, PortKind, PortValue, RenderedContent};
+use crate::graph::{ContentPiece, Graph, InputPort, Node, NodeId, OutputPort, PortKind, PortValue, RenderedContent};
 use crate::hut::{Axis, Direction, wrapping_step};
 use crate::redraw::{Redrawable, RedrawHandle, Signal};
 
@@ -93,23 +106,22 @@ impl Redrawable for TabNode {
 }
 
 /// Graph-native Tile-Hut: shows every child at once, side by side along
-/// `axis` — same semantics as [`crate::hut::TileHut`]. `fracs` parallels
-/// `children`'s length the same way `TabbedHut::label_cache`/`tab_ids`/
+/// `axis` — same semantics as [`crate::hut::TileHut`]. `fracs`/`size`
+/// parallel `children` the same way `TabbedHut::label_cache`/`tab_ids`/
 /// `bg_tracker` already parallel *its* `children` today (kept in sync by
-/// whatever manipulates the list — real per-pane arrangement math
-/// (`hut::pane_rects`) plugs in once there's real content to position,
-/// migration step 3+; for now `resolve` just proves every child is
-/// actually reachable/traversed, which is the part of this node's
-/// behavior that's real today).
+/// whatever manipulates the list); `size` is this node's own current
+/// pixel size, set by whatever propagates a resize down the tree
+/// (mirroring `Hut::resize_to_pixels`'s existing top-down cascade).
 pub struct TileNode {
     pub axis: Axis,
     pub active: Signal<usize>,
     pub fracs: Vec<f64>,
+    pub size: (i32, i32),
 }
 
 impl TileNode {
     pub fn new(axis: Axis) -> Self {
-        Self { axis, active: Signal::new(0), fracs: Vec::new() }
+        Self { axis, active: Signal::new(0), fracs: Vec::new(), size: (0, 0) }
     }
 
     /// Same wraparound rule as [`TabNode::cycle`], applied to which pane
@@ -133,17 +145,62 @@ impl<Env> Node<Env> for TileNode {
         CONTENT_OUTPUT
     }
     fn resolve(&mut self, graph: &mut Graph<Env>, self_id: NodeId, _port: &'static str) -> PortValue {
-        // Every pane is visible at once (unlike TabNode) — every child
-        // gets resolved, not just `active`, even though there's nowhere
-        // real to composite the results into yet (see this module's doc
-        // comment). Discarding the per-child results here rather than
-        // returning them is deliberately temporary: migration step 3+
-        // gives `resolve` a real renderer to actually composite them
-        // with, the same way `render.rs::build_tile_elements` does today.
-        for &child in &graph.hut_list_input(self_id, "children") {
-            graph.resolve_output(child, "content");
+        // Every pane is visible at once (unlike TabNode) — every child's
+        // pieces are collected and translated to that pane's own offset
+        // within this Tile's local frame, exactly the position
+        // `hut::TileHut::absolute_pane_rects` already computes for the
+        // enum tree (same `hut::pane_rects` call, same axis/fracs/size
+        // inputs) — real per-child pixel positions, kept in the same
+        // "local frame, translated by the caller" convention
+        // `ConsoleNode`'s own doc comment establishes, not yet the real
+        // output's absolute position (that final translation happens
+        // once, at the top of the tree).
+        let children = graph.hut_list_input(self_id, "children");
+        // `self.fracs` is a caller-maintained parallel array (see this
+        // struct's doc comment) — if it's ever out of sync with
+        // `children`'s current length (a caller updated one and forgot
+        // the other), falling back to even fracs here means the real
+        // failure mode is "this pane's share of the tile is wrong until
+        // whatever forgot to update `fracs` is fixed," not "every pane
+        // past the mismatch silently vanishes" (a `zip` against a
+        // shorter `rects` would drop them entirely, an easy-to-miss bug
+        // since nothing panics or logs).
+        let fracs = if self.fracs.len() == children.len() {
+            self.fracs.clone()
+        } else {
+            vec![1.0; children.len()]
+        };
+        let rects = crate::hut::pane_rects(self.axis, fracs.into_iter(), self.size);
+        let mut pieces = Vec::new();
+        for (&child, (px, py, _, _)) in children.iter().zip(rects) {
+            let Some(PortValue::Content(child_pieces)) = graph.resolve_output(child, "content") else {
+                continue;
+            };
+            for piece in child_pieces {
+                pieces.push(translate_piece(piece, px, py));
+            }
         }
-        PortValue::Content(RenderedContent::default())
+        PortValue::Content(pieces)
+    }
+}
+
+/// Shift a [`ContentPiece`]'s position by a pane offset (physical
+/// pixels, matching `hut::pane_rects`'s own units) — used by
+/// [`TileNode::resolve`] to place each child's content at its own pane's
+/// origin within the tile's local frame. `Window`-kind pieces aren't
+/// translated (left at their own reported position): a Tile-Hut pane
+/// only ever shows its child's *terminal* in v1 scope (see `hut.rs`'s
+/// own module doc on why a Main Window never appears in a tile pane
+/// today), so a `Window` piece reaching here would already be outside
+/// that scope — passed through unchanged rather than guessing at a
+/// translation with no established meaning yet, matching this
+/// codebase's convention of degrading rather than guessing.
+fn translate_piece(piece: ContentPiece, dx: i32, dy: i32) -> ContentPiece {
+    match piece {
+        ContentPiece::Texture { texture, damage, position: (x, y) } => {
+            ContentPiece::Texture { texture, damage, position: (x + dx as f64, y + dy as f64) }
+        }
+        window @ ContentPiece::Window { .. } => window,
     }
 }
 
@@ -188,9 +245,17 @@ impl<'a> Node<RenderEnv<'a>> for ConsoleNode {
         LEAF_OUTPUTS
     }
     fn resolve(&mut self, graph: &mut Graph<RenderEnv<'a>>, _self_id: NodeId, _port: &'static str) -> PortValue {
-        let texture = self.hut.redraw(graph.env.renderer);
+        // Local origin (0, 0) — same convention `TileNode`'s pane
+        // translation and `hut::TileHut::absolute_pane_rects` already
+        // use: a node's own `content` output is in its *own* local
+        // frame, translated by whatever composes it further up the tree
+        // (ultimately the real output's `usable_area()` origin, applied
+        // once at the very top, not baked in here).
+        let Some(texture) = self.hut.redraw(graph.env.renderer) else {
+            return PortValue::Content(Vec::new());
+        };
         let damage = self.hut.element_damage_snapshot();
-        PortValue::Content(RenderedContent { texture, damage: Some(damage) })
+        PortValue::Content(vec![ContentPiece::Texture { texture, damage, position: (0.0, 0.0) }])
     }
 }
 
@@ -210,32 +275,34 @@ const CLIENT_INPUTS: &[InputPort] = &[InputPort { name: "terminal", kind: PortKi
 /// currently showing, re-resolved fresh through the graph every call
 /// (via `Graph::resolve_output`, which is itself memoized per frame —
 /// see that method's doc comment — so this costs nothing extra within
-/// one frame), never a stale cached copy.
-///
-/// Real client-surface rendering (compositing the actual `Window`'s own
-/// buffer via `Space<HutSpaceElement>`, today's `main_window.rs`'s and
-/// `ConsoleHut::sync_main_window_space`'s role) is deliberately not
-/// built here yet — it's entangled with migration step 4's larger
-/// cutover of the real render pipeline (`render.rs::content_elements`'s
-/// existing Main-Window branch is the thing that would actually need
-/// reworking, not something separable ahead of that step). What's real
-/// and tested here is the pass-through mechanism itself: which content
-/// this node reports depends on live upstream graph state through a
-/// real link, not a cached flag copied at construction time.
+/// one frame), never a stale cached copy. Otherwise, it's a single
+/// `ContentPiece::Window` wrapping its own real `window` at local origin
+/// `(0, 0)` — `space_render_elements`/`AsRenderElements` (called by
+/// whatever eventually consumes a resolved `ContentPiece::Window`, not
+/// by this node itself) already expand a `Window` into its full render-
+/// element tree, including subsurfaces/popups, so this node doesn't need
+/// to enumerate any of that itself — same "local frame, translated by
+/// the caller" convention as `ConsoleNode`/`TileNode`.
 pub struct WaylandClientNode {
+    pub window: Window,
     pub showing_terminal: Signal<bool>,
 }
 
 impl WaylandClientNode {
-    pub fn new() -> Self {
-        Self { showing_terminal: Signal::new(false) }
+    pub fn new(window: Window) -> Self {
+        Self { window, showing_terminal: Signal::new(false) }
     }
 }
 
-impl Default for WaylandClientNode {
-    fn default() -> Self {
-        Self::new()
-    }
+/// Whether resolving a Wayland-client Hut's `content` output should pass
+/// through to its linked terminal this call, and which node to resolve
+/// if so — pulled out as a pure function so the toggle/link-presence
+/// decision itself stays unit-testable independent of
+/// `WaylandClientNode` needing a real `Window` to even construct (see
+/// this module's doc comment on why nothing GPU/protocol-shaped can be
+/// unit-tested past that point).
+fn terminal_pass_through_target(showing_terminal: bool, terminal: Option<NodeId>) -> Option<NodeId> {
+    if showing_terminal { terminal } else { None }
 }
 
 impl<Env> Node<Env> for WaylandClientNode {
@@ -246,15 +313,13 @@ impl<Env> Node<Env> for WaylandClientNode {
         LEAF_OUTPUTS
     }
     fn resolve(&mut self, graph: &mut Graph<Env>, self_id: NodeId, _port: &'static str) -> PortValue {
-        if *self.showing_terminal
-            && let Some(terminal) = graph.hut_input(self_id, "terminal")
-            && let Some(value) = graph.resolve_output(terminal, "content")
+        let terminal = graph.hut_input(self_id, "terminal");
+        if let Some(target) = terminal_pass_through_target(*self.showing_terminal, terminal)
+            && let Some(value) = graph.resolve_output(target, "content")
         {
             return value;
         }
-        // Own client-surface content isn't wired up yet — see this
-        // struct's doc comment.
-        PortValue::Content(RenderedContent::default())
+        PortValue::Content(vec![ContentPiece::Window { window: self.window.clone(), position: Point::from((0, 0)) }])
     }
 }
 
@@ -484,53 +549,31 @@ mod tests {
         assert!(b_resolved.get(), "every pane should be resolved, not just one");
     }
 
-    #[test]
-    fn wayland_client_node_passes_through_to_its_linked_terminal_when_toggled() {
-        let mut graph = Graph::new();
-        let (terminal, terminal_resolved) = leaf(&mut graph);
-        let mut client = WaylandClientNode::new();
-        *client.showing_terminal = true;
-        let client_id = graph.add_node(Box::new(client));
-        graph.link_hut(client_id, "terminal", terminal).unwrap();
+    // `WaylandClientNode` itself needs a real `Window` to even
+    // construct (a live `WlSurface`/client connection, unavailable to a
+    // unit test — see this module's doc comment), so its toggle/pass-
+    // through *decision* is tested directly against
+    // `terminal_pass_through_target` instead of through a constructed
+    // node — the same logic `Node::resolve` calls, just reachable
+    // without needing a real `Window` to exercise it.
 
-        graph.begin_frame();
-        graph.resolve_output(client_id, "content");
-        assert!(
-            terminal_resolved.get(),
-            "toggled to terminal view, the client node should pass through to its linked terminal"
-        );
+    #[test]
+    fn terminal_pass_through_target_passes_through_when_toggled_and_linked() {
+        let mut graph = Graph::new();
+        let (terminal, _) = leaf(&mut graph);
+        assert_eq!(terminal_pass_through_target(true, Some(terminal)), Some(terminal));
     }
 
     #[test]
-    fn wayland_client_node_does_not_pass_through_when_not_toggled() {
+    fn terminal_pass_through_target_does_not_pass_through_when_not_toggled() {
         let mut graph = Graph::new();
-        let (terminal, terminal_resolved) = leaf(&mut graph);
-        // `showing_terminal` defaults to `false` — see `WaylandClientNode::new`.
-        let client_id = graph.add_node(Box::new(WaylandClientNode::new()));
-        graph.link_hut(client_id, "terminal", terminal).unwrap();
-
-        graph.begin_frame();
-        graph.resolve_output(client_id, "content");
-        assert!(
-            !terminal_resolved.get(),
-            "not toggled to terminal view, the client node shouldn't touch its linked terminal at all"
-        );
+        let (terminal, _) = leaf(&mut graph);
+        assert_eq!(terminal_pass_through_target(false, Some(terminal)), None);
     }
 
     #[test]
-    fn wayland_client_node_toggled_but_unlinked_falls_back_to_placeholder_content() {
-        let mut graph = Graph::new();
-        let mut client = WaylandClientNode::new();
-        *client.showing_terminal = true;
-        let client_id = graph.add_node(Box::new(client));
-        // No `link_hut` call at all — e.g. an autostarted app with no
-        // owning terminal (see `ownership.rs`'s module doc).
-
-        graph.begin_frame();
-        assert!(
-            matches!(graph.resolve_output(client_id, "content"), Some(PortValue::Content(_))),
-            "an unlinked terminal input shouldn't panic or fail resolution, just fall back"
-        );
+    fn terminal_pass_through_target_toggled_but_unlinked_is_none() {
+        assert_eq!(terminal_pass_through_target(true, None), None);
     }
 
     #[test]
