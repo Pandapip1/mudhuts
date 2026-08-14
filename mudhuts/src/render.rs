@@ -358,7 +358,26 @@ fn with_normal_content_damage<T>(output_index: usize, f: impl FnOnce(&mut Damage
 /// own doc comment) rather than every call, the same way the real output
 /// and `ConsoleHut::space_output` already avoid rebuilding themselves every
 /// frame.
-struct NormalContentTarget {
+/// One persistent offscreen composite target — the shape shared by
+/// [`composite_normal_content`]'s single per-output slot (keyed by output
+/// index — only ever the *focused* entry's content) and
+/// [`refresh_hut_content_thumbnail`]'s per-Hut cache (keyed by
+/// `ConsoleHut::id`, so a *backgrounded* entry showing a Main Window can
+/// have its own last-known content too — `composite_normal_content`'s own
+/// slot gets re-rendered into every frame regardless of which Hut is
+/// focused, so cloning its texture handle into a per-entry cache would
+/// alias rather than snapshot). Both build one via
+/// [`ensure_content_target`], which owns the shared "stale? rebuild :
+/// reuse" logic — kept in one place so a future change to invalidation
+/// can't silently apply to only one of the two callers.
+///
+/// Real output resolution, not thumbnail-sized, in both cases: the
+/// `space_render_elements`/`content_elements` output both callers render
+/// uses real-output-*absolute* coordinates, so a smaller canvas would
+/// just show a cropped corner, not a scaled-down view — `switcher.rs` is
+/// what scales the result down for display, the same way it already does
+/// for `ConsoleHut::cached_texture`'s terminal texture.
+struct ContentTarget {
     // Never read directly, but load-bearing: `OutputDamageTracker::from_output`
     // (`.../backend/renderer/damage/mod.rs`) stores only a *weak* handle to
     // the `Output` it's given (`output.downgrade()`), on the assumption
@@ -375,31 +394,46 @@ struct NormalContentTarget {
     scale: f64,
 }
 
-/// One entry's own persistent copy of [`NormalContentTarget`]'s idea —
-/// same shape, same staleness-check pattern — but keyed by
-/// `ConsoleHut::id` instead of being a single unkeyed slot, so a
-/// *backgrounded* top-level Stack entry that's showing a Main Window can
-/// have its own last-known content cached too (`NormalContentTarget`
-/// itself only ever holds the *focused* entry's content — see
-/// `refresh_hut_content_thumbnail`'s doc comment for why this can't just
-/// clone that one instead). Real output resolution, not thumbnail-sized —
-/// same reason `composite_normal_content`'s own doc comment gives:
-/// `space_render_elements`' output uses real-output-absolute coordinates,
-/// so a smaller canvas would just show a cropped corner, not a scaled-
-/// down view. `switcher.rs` is the one that scales it down for display,
-/// the same way it already does for `ConsoleHut::cached_texture`'s
-/// terminal texture.
-struct HutContentTarget {
-    #[allow(dead_code)]
-    output: Output,
-    texture: GlesTexture,
-    tracker: OutputDamageTracker,
+/// Get (or, if stale/missing, rebuild) `key`'s entry in `targets` —
+/// [`ContentTarget`]'s own doc comment on why this is factored out rather
+/// than duplicated per caller. "Stale" mirrors both callers' identical
+/// old inline check: any existing entry whose `size`/`scale` no longer
+/// match. `label` names the synthetic output (`synthetic_output`'s own
+/// `name` parameter) and is folded into the log message on a build
+/// failure, so warnings stay distinguishable between callers despite the
+/// shared code path. `None` (logged, not panicked) if allocating the
+/// fresh offscreen buffer fails — matches every other offscreen-render
+/// call site's fallibility handling in this file.
+fn ensure_content_target<'a, K: Eq + std::hash::Hash + Copy>(
+    targets: &'a mut HashMap<K, ContentTarget>,
+    key: K,
+    label: &'static str,
+    renderer: &mut GlesRenderer,
     size: (i32, i32),
     scale: f64,
+) -> Option<&'a mut ContentTarget> {
+    let stale = !matches!(targets.get(&key), Some(t) if t.size == size && t.scale == scale);
+    if stale {
+        // Real `scale`, not `1.0` — see `synthetic_output`'s doc comment:
+        // both callers hand their output straight to
+        // `OutputDamageTracker::render_output` rather than a `Space`, so
+        // this scale is what turns each element's own baked-in integer
+        // buffer scale back into its correct on-screen size. Getting this
+        // wrong silently shrinks (or grows) everything composited through
+        // it on any real, non-1.0-scale output.
+        let output = synthetic_output(label, size, scale);
+        let buffer_size: smithay::utils::Size<i32, Buffer> = size.into();
+        let texture = Offscreen::<GlesTexture>::create_buffer(renderer, Fourcc::Argb8888, buffer_size)
+            .inspect_err(|err| tracing::warn!("failed to create offscreen buffer for {label}: {err}"))
+            .ok()?;
+        let tracker = OutputDamageTracker::from_output(&output);
+        targets.insert(key, ContentTarget { output, texture, tracker, size, scale });
+    }
+    targets.get_mut(&key)
 }
 
 thread_local! {
-    static HUT_CONTENT: RefCell<HashMap<u64, HutContentTarget>> = RefCell::new(HashMap::new());
+    static HUT_CONTENT: RefCell<HashMap<u64, ContentTarget>> = RefCell::new(HashMap::new());
 }
 
 thread_local! {
@@ -409,7 +443,7 @@ thread_local! {
     /// entry's `Id` (`ConsoleHut::thumbnail_id`) is stable across frames, the
     /// outer per-element damage tracker would see "commit 0 now, commit 0
     /// last time" after the first frame and stop repainting it — must keep
-    /// advancing across calls, not be rebuilt alongside [`HutContentTarget`]
+    /// advancing across calls, not be rebuilt alongside [`ContentTarget`]
     /// on a staleness reset.
     static HUT_CONTENT_DAMAGE: RefCell<HashMap<u64, DamageBag<i32, Buffer>>> = RefCell::new(HashMap::new());
 }
@@ -425,7 +459,7 @@ thread_local! {
 /// — a backgrounded entry's `space` isn't otherwise kept in sync with its
 /// Main Window at all (see this function's call site's doc comment) — then
 /// renders it the same way `content_elements`'s own Main-Window branch
-/// does, into this entry's own persistent [`HutContentTarget`] rather than
+/// does, into this entry's own persistent [`ContentTarget`] rather than
 /// the single shared one `composite_normal_content` uses: that one gets
 /// re-rendered into on every frame regardless of which Hut is focused, so
 /// cloning its texture handle into a per-entry cache would alias — every
@@ -449,23 +483,13 @@ fn refresh_hut_content_thumbnail(
             return;
         }
     };
-    let buffer_size: smithay::utils::Size<i32, Buffer> = size.into();
     let id = hut.id;
 
     HUT_CONTENT.with(|cell| {
         let mut cache = cell.borrow_mut();
-        let stale = !matches!(cache.get(&id), Some(t) if t.size == size && t.scale == scale);
-        if stale {
-            let output = synthetic_output("hut-content-thumbnail", size, scale);
-            let Ok(texture) = Offscreen::<GlesTexture>::create_buffer(renderer, Fourcc::Argb8888, buffer_size)
-                .inspect_err(|err| tracing::warn!("failed to create offscreen buffer for a Hut thumbnail: {err}"))
-            else {
-                return;
-            };
-            let tracker = OutputDamageTracker::from_output(&output);
-            cache.insert(id, HutContentTarget { output, texture, tracker, size, scale });
-        }
-        let Some(target) = cache.get_mut(&id) else { return };
+        let Some(target) = ensure_content_target(&mut cache, id, "hut-content-thumbnail", renderer, size, scale) else {
+            return;
+        };
 
         let Ok(mut bound) = renderer
             .bind(&mut target.texture)
@@ -667,34 +691,17 @@ fn composite_normal_content(
     }
     let scale = state.output_scale_for(output_index);
     let elements = content_elements(state, renderer, content, output_index);
-    let buffer_size: smithay::utils::Size<i32, Buffer> = size.into();
 
     // Keyed by output index, not a single unkeyed slot — see
     // `normal_content_id`'s own doc comment for why real multi-monitor
     // needs this (mirrors `HUT_CONTENT`'s identical per-key shape).
     thread_local! {
-        static TARGETS: RefCell<HashMap<usize, NormalContentTarget>> = RefCell::new(HashMap::new());
+        static TARGETS: RefCell<HashMap<usize, ContentTarget>> = RefCell::new(HashMap::new());
     }
 
     let (texture, snapshot) = TARGETS.with(|cell| {
         let mut targets = cell.borrow_mut();
-        let stale = !matches!(targets.get(&output_index), Some(t) if t.size == size && t.scale == scale);
-        if stale {
-            // Real scale, not `1.0` — see `synthetic_output`'s doc comment:
-            // this is the one caller that hands its output straight to
-            // `OutputDamageTracker::render_output` rather than a `Space`,
-            // so this scale is what turns each element's own baked-in
-            // integer buffer scale back into its correct on-screen size.
-            // Getting this wrong silently shrinks (or grows) everything
-            // composited through it on any real, non-1.0-scale output.
-            let output = synthetic_output("normal-content", size, scale);
-            let texture = Offscreen::<GlesTexture>::create_buffer(renderer, Fourcc::Argb8888, buffer_size)
-                .inspect_err(|err| tracing::warn!("failed to create offscreen buffer for normal content: {err}"))
-                .ok()?;
-            let tracker = OutputDamageTracker::from_output(&output);
-            targets.insert(output_index, NormalContentTarget { output, texture, tracker, size, scale });
-        }
-        let target = targets.get_mut(&output_index).expect("just ensured Some above");
+        let target = ensure_content_target(&mut targets, output_index, "normal-content", renderer, size, scale)?;
 
         let mut bound = renderer
             .bind(&mut target.texture)
