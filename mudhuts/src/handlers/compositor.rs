@@ -34,6 +34,13 @@ impl CompositorHandler for State {
     fn commit(&mut self, surface: &WlSurface) {
         self.request_redraw();
         on_commit_buffer_handler::<Self>(surface);
+        // `find_window_by_surface` walks every ConsoleHut across every
+        // output — called on *every* wl_surface.commit from *every*
+        // client, so the common case (no subsurfaces, `root == surface`)
+        // reuses one lookup for both purposes below instead of paying it
+        // twice per commit.
+        let mut window_for_surface = None;
+        let mut resolved_for_surface = false;
         if !is_sync_subsurface(surface) {
             let mut root = surface.clone();
             while let Some(parent) = get_parent(&root) {
@@ -42,12 +49,21 @@ impl CompositorHandler for State {
             // Looked up across every ConsoleHut, not just the focused one's
             // own `space` — a background ConsoleHut's window still needs
             // its commit bookkeeping even while it isn't the visible one.
-            if let Some(window) = self.find_window_by_surface(&root) {
+            let window_for_root = self.find_window_by_surface(&root);
+            if let Some(window) = &window_for_root {
                 window.on_commit();
+            }
+            if &root == surface {
+                window_for_surface = window_for_root;
+                resolved_for_surface = true;
             }
         }
 
-        let window = self.find_window_by_surface(surface);
+        let window = if resolved_for_surface {
+            window_for_surface
+        } else {
+            self.find_window_by_surface(surface)
+        };
         xdg_shell::handle_commit(&mut self.popups, window, surface);
         layer_shell::handle_commit(self, surface);
     }
