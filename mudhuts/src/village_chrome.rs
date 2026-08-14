@@ -21,12 +21,11 @@ use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Physical, Point, Rectangle, Size, Transform};
 
-use mudhuts_term::palette::Rgb;
-
 use crate::chrome::{to_color32f, window_title};
 use crate::render::{ChangeTracker, LabelCache, OutputRenderElements};
 use crate::hut::Hut;
 use crate::space_element::HutSpaceRenderElement;
+use crate::theme::Theme;
 
 /// Base sizes (scale 1.0) — scaled via `crate::render::scaled` wherever
 /// they're actually used, matching `chrome.rs`'s own constants.
@@ -34,11 +33,6 @@ const TAB_PADDING: i32 = 12;
 const TAB_GAP: i32 = 4;
 const LEFT_MARGIN: i32 = 16;
 const MAX_TITLE_CHARS: usize = 24;
-
-const FG_ACTIVE: Rgb = [255, 255, 255];
-const BG_ACTIVE: Rgb = [140, 90, 191];
-const FG_INACTIVE: Rgb = [190, 190, 190];
-const BG_INACTIVE: Rgb = [40, 30, 50];
 
 type Element = OutputRenderElements<GlesRenderer, HutSpaceRenderElement>;
 
@@ -159,6 +153,7 @@ pub fn build(
     cell_w: usize,
     cell_h: i32,
     scale: f64,
+    theme: &Theme,
 ) -> (Vec<Element>, i32) {
     let Hut::Tab(tab) = village else {
         return (Vec::new(), y);
@@ -183,9 +178,9 @@ pub fn build(
     for TabRect { index: i, rect } in rects {
         let active = tab.active == i;
         let (fg, bg) = if active {
-            (FG_ACTIVE, BG_ACTIVE)
+            (theme.hut_tab_active_fg, theme.hut_tab_active_bg)
         } else {
-            (FG_INACTIVE, BG_INACTIVE)
+            (theme.hut_tab_inactive_fg, theme.hut_tab_inactive_bg)
         };
         let label = child_label(&tab.children[i]);
 
@@ -242,6 +237,7 @@ pub fn build(
         cell_w,
         cell_h,
         scale,
+        theme,
     );
     elements.extend(deeper_elements);
     (elements, next_y)

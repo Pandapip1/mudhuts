@@ -20,6 +20,7 @@ use mudhuts_term::palette::Rgb;
 use crate::console_hut::ConsoleHut;
 use crate::render::OutputRenderElements;
 use crate::space_element::HutSpaceRenderElement;
+use crate::theme::Theme;
 
 /// Base sizes (scale 1.0) — scaled via `crate::render::scaled` wherever
 /// they're actually used, so this chrome stays the same apparent size
@@ -28,11 +29,6 @@ const TAB_PADDING: i32 = 12;
 const TAB_GAP: i32 = 4;
 const LEFT_MARGIN: i32 = 16;
 const MAX_TITLE_CHARS: usize = 24;
-
-const FG_ACTIVE: Rgb = [255, 255, 255];
-const BG_ACTIVE: Rgb = [64, 115, 191];
-const FG_INACTIVE: Rgb = [190, 190, 190];
-const BG_INACTIVE: Rgb = [30, 30, 30];
 
 type Element = OutputRenderElements<GlesRenderer, HutSpaceRenderElement>;
 
@@ -149,7 +145,7 @@ pub fn tab_layout(hut: &ConsoleHut, y: i32, scale: f64) -> Vec<TabRect> {
 /// Build the tab strip's render elements in front-to-back order, starting
 /// at physical-pixel row `y`, or an empty list if the focused ConsoleHut has no
 /// Main Windows.
-pub fn build(hut: &mut ConsoleHut, renderer: &mut GlesRenderer, y: i32, scale: f64) -> Vec<Element> {
+pub fn build(hut: &mut ConsoleHut, renderer: &mut GlesRenderer, y: i32, scale: f64, theme: &Theme) -> Vec<Element> {
     let rects = tab_layout(hut, y, scale);
     if rects.is_empty() {
         return Vec::new();
@@ -181,9 +177,9 @@ pub fn build(hut: &mut ConsoleHut, renderer: &mut GlesRenderer, y: i32, scale: f
         };
         let active = i == active_index;
         let (fg, bg) = if active {
-            (FG_ACTIVE, BG_ACTIVE)
+            (theme.tab_active_fg, theme.tab_active_bg)
         } else {
-            (FG_INACTIVE, BG_INACTIVE)
+            (theme.tab_inactive_fg, theme.tab_inactive_bg)
         };
 
         // Only actually re-renders (real GPU work: glyph-atlas lookups

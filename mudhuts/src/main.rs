@@ -1,4 +1,5 @@
 mod chrome;
+mod config;
 mod cursor;
 mod docks;
 mod gpu_term;
@@ -16,6 +17,7 @@ mod space_element;
 mod stack;
 mod state;
 mod switcher;
+mod theme;
 mod udev_backend;
 mod hut;
 mod village_chrome;

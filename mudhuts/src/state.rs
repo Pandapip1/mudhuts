@@ -138,6 +138,7 @@ pub struct State {
 
     pub stack: MruStackHut,
     pub keymap: Keymap,
+    pub theme: crate::theme::Theme,
     /// The output's current pixel size, tracked here (not just read inside
     /// `winit_backend.rs`'s redraw handler) so newly-focused Huts can be
     /// resized immediately on switch rather than showing a stale grid
@@ -430,6 +431,7 @@ impl State {
             keyboards: Vec::new(),
             stack,
             keymap: Keymap::load(),
+            theme: crate::theme::Theme::load(),
             output_size: (0, 0),
             text_selecting: false,
             text_selection_dragged: false,

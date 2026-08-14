@@ -18,6 +18,7 @@ use smithay::output::Output;
 use smithay::utils::{Buffer, Rectangle, Scale, Transform};
 
 use crate::State;
+use crate::chrome::to_color32f;
 use crate::console_hut::ConsoleHut;
 use crate::hut::Hut;
 use crate::space_element::{CompositedTexture, HutSpaceElement, HutSpaceRenderElement, synthetic_output};
@@ -728,21 +729,28 @@ pub fn build_frame_elements(
         // children; `next_y` is unchanged (0) in that case.
         let cell_w = state.stack.focused().glyphs.cell_width().max(1);
         let cell_h = state.stack.focused().glyphs.cell_height().max(1) as i32;
-        let (village_tab_elements, next_y) =
-            village_chrome::build(state.stack.focused_top_level_mut(), renderer, 0, cell_w, cell_h, scale);
+        let (village_tab_elements, next_y) = village_chrome::build(
+            state.stack.focused_top_level_mut(),
+            renderer,
+            0,
+            cell_w,
+            cell_h,
+            scale,
+            &state.theme,
+        );
         elements.extend(village_tab_elements);
 
         // Tab-strip chrome (Phase 4) — pushed below any Hut-level strips
         // above it, still on top of the terminal/window content and still
         // below the Alt-Tab popup above. Empty when the focused ConsoleHut has no
         // Main Windows.
-        elements.extend(chrome::build(state.stack.focused_mut(), renderer, next_y, scale));
+        elements.extend(chrome::build(state.stack.focused_mut(), renderer, next_y, scale, &state.theme));
 
         // Docked Floating Window handles (Phase 5) — same z-order slot as the tab
         // strip, only shown alongside the Main Window they belong to (never
         // while the terminal itself is the visible view).
         if !show_terminal {
-            elements.extend(docks::build(state.stack.focused_mut(), renderer, size, scale));
+            elements.extend(docks::build(state.stack.focused_mut(), renderer, size, scale, &state.theme));
         }
     }
 
@@ -852,7 +860,7 @@ fn build_tile_elements(
     if let Some(&(x, y, w, h)) = rects.get(active) {
         const BASE_BORDER: i32 = 3;
         let border = scaled(BASE_BORDER, scale).max(1);
-        let color = [0.3, 0.6, 1.0, 1.0];
+        let color = to_color32f(state.theme.tile_border);
         let strips = [
             (x, y, w, border),                // top
             (x, y + h - border, w, border),   // bottom

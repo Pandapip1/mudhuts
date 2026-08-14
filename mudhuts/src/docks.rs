@@ -62,9 +62,6 @@ const HANDLE_GAP: i32 = 4;
 const EDGE_MARGIN: i32 = 40;
 const MAX_TITLE_CHARS: usize = 18;
 
-const FG: mudhuts_term::palette::Rgb = [220, 220, 220];
-const BG: mudhuts_term::palette::Rgb = [50, 50, 60];
-
 /// How far (in physical pixels — this module's native space, see the
 /// module doc) a drag has to travel from a handle before it detaches
 /// into a floating window, rather than being read as just a click.
@@ -180,7 +177,13 @@ fn truncate(title: &str) -> String {
 
 /// Build the docked-handle chrome's render elements, or an empty list if
 /// there's nothing docked right now.
-pub fn build(hut: &mut ConsoleHut, renderer: &mut GlesRenderer, output_size: (i32, i32), scale: f64) -> Vec<Element> {
+pub fn build(
+    hut: &mut ConsoleHut,
+    renderer: &mut GlesRenderer,
+    output_size: (i32, i32),
+    scale: f64,
+    theme: &crate::theme::Theme,
+) -> Vec<Element> {
     let handles = handle_layout(hut, output_size, scale);
     let text_inset = crate::render::scaled(6, scale);
     let mut elements = Vec::new();
@@ -200,7 +203,7 @@ pub fn build(hut: &mut ConsoleHut, renderer: &mut GlesRenderer, output_size: (i3
             .unwrap_or(true);
 
         let rendered: Option<(Id, GlesTexture, DamageSnapshot<i32, Buffer>)> = if stale {
-            match hut.render_label(renderer, &title, FG, BG) {
+            match hut.render_label(renderer, &title, theme.dock_fg, theme.dock_bg) {
                 Ok(texture) => hut.floating_window_mut(&handle.surface).map(|sub| {
                     let (texture, snapshot) = sub.handle_text_cache.store(title.clone(), texture);
                     (sub.handle_text_id.clone(), texture, snapshot)
@@ -252,7 +255,7 @@ pub fn build(hut: &mut ConsoleHut, renderer: &mut GlesRenderer, output_size: (i3
             bg_id,
             handle.rect,
             CommitCounter::default(),
-            to_color32f(BG),
+            to_color32f(theme.dock_bg),
             Kind::Unspecified,
         );
         elements.push(Element::from(background));

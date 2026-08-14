@@ -9,9 +9,10 @@
 //! window managers treat keybindings.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 use smithay::input::keyboard::{ModifiersState, xkb};
+
+use crate::config::config_path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
@@ -351,16 +352,6 @@ impl Keymap {
 struct ConfigFile {
     #[serde(default)]
     keybindings: HashMap<String, String>,
-}
-
-fn config_path() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("XDG_CONFIG_HOME")
-        && !dir.is_empty()
-    {
-        return Some(PathBuf::from(dir).join("mudhuts/config.toml"));
-    }
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".config/mudhuts/config.toml"))
 }
 
 #[cfg(test)]
