@@ -186,14 +186,35 @@ impl ConsoleHut {
         ),
         String,
     > {
+        Self::spawn_with_command(extra_env, scale, None)
+    }
+
+    /// [`Self::spawn`], running `command` (program + argv) as the PTY's
+    /// own child in place of the default shell — see
+    /// [`mudhuts_term::Terminal::spawn_with_command`]'s doc comment.
+    /// `autostart.rs`'s own caller: each XDG autostart entry gets its own
+    /// dedicated ConsoleHut this way, rather than every entry sharing one
+    /// Hut whose own shell never actually runs the app at all.
+    pub fn spawn_with_command(
+        extra_env: impl IntoIterator<Item = (String, String)>,
+        scale: f64,
+        command: Option<(String, Vec<String>)>,
+    ) -> Result<
+        (
+            ConsoleHut,
+            smithay::reexports::calloop::channel::Channel<TermEvent>,
+        ),
+        String,
+    > {
         let id = next_hut_id();
         let glyphs = GlyphCache::new(scale)?;
         let cell_size = (glyphs.cell_width() as u16, glyphs.cell_height() as u16);
         let extra_env = extra_env
             .into_iter()
             .chain(std::iter::once(("MUDHUTS_HUT_ID".to_string(), id.to_string())));
-        let (terminal, events) = Terminal::spawn(INITIAL_COLS, INITIAL_LINES, cell_size, extra_env)
-            .map_err(|e| e.to_string())?;
+        let (terminal, events) =
+            Terminal::spawn_with_command(INITIAL_COLS, INITIAL_LINES, cell_size, extra_env, command)
+                .map_err(|e| e.to_string())?;
 
         let pixel_size = (
             (INITIAL_COLS * cell_size.0 as usize) as i32,

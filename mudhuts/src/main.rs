@@ -137,7 +137,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // Gated to a real session only — under winit (nested/dev testing)
         // this would spawn a user's entire real desktop autostart set
         // into a throwaway test window every time, which nobody wants.
-        autostart::run(&mut state.stack, &extra_env);
+        autostart::run(&mut state.stack);
         udev_backend::init_udev(&mut event_loop, &mut state, redraw_ping_source)?;
     } else {
         winit_backend::init_winit(&mut event_loop, &mut state, redraw_ping_source)?;

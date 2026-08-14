@@ -115,6 +115,22 @@ impl Terminal {
         cell_size: (u16, u16),
         extra_env: impl IntoIterator<Item = (String, String)>,
     ) -> io::Result<(Terminal, calloop::channel::Channel<TermEvent>)> {
+        Self::spawn_with_command(cols, lines, cell_size, extra_env, None)
+    }
+
+    /// [`Self::spawn`], running `command` (program + argv) as the PTY's own
+    /// child in place of the default shell — `None` for the normal shell.
+    /// See [`crate::autostart`](../mudhuts/src/autostart.rs) (mudhuts'
+    /// own caller): each XDG autostart entry gets its own dedicated
+    /// `Terminal` running its `Exec=` line directly this way, rather than
+    /// a shell that then launches it as an untracked child.
+    pub fn spawn_with_command(
+        cols: usize,
+        lines: usize,
+        cell_size: (u16, u16),
+        extra_env: impl IntoIterator<Item = (String, String)>,
+        command: Option<(String, Vec<String>)>,
+    ) -> io::Result<(Terminal, calloop::channel::Channel<TermEvent>)> {
         tty::setup_env();
 
         let (tx, rx) = calloop::channel::channel();
@@ -125,6 +141,7 @@ impl Terminal {
         let term = Arc::new(FairMutex::new(term));
 
         let pty_options = tty::Options {
+            shell: command.map(|(program, args)| tty::Shell::new(program, args)),
             env: extra_env.into_iter().collect(),
             ..Default::default()
         };

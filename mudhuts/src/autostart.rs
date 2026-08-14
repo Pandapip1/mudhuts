@@ -3,17 +3,48 @@
 //! at startup, after the Wayland socket and event loop already exist (real
 //! clients, no different from anything else launched into this session).
 //!
-//! Every autostarted app lands in one shared, freshly-spawned background
-//! ConsoleHut — never focused, so nothing steals focus from whatever the
-//! user's actually looking at when the session starts — via `MUDHUTS_HUT_ID`
-//! set directly in each spawned process's own environment. See
-//! `ownership.rs`'s module doc for why that alone is enough for
-//! `find_owning_hut` to resolve it correctly, with no shell/PTY
-//! intermediary needed the way a `ConsoleHut`'s own terminal has one: a new
-//! toplevel's `should_show_now` check in `handlers/xdg_shell.rs` only ever
-//! auto-switches when its owning Hut is already the *focused* one, which
-//! this one deliberately never is, so every autostarted window just joins
-//! that Hut's own tab strip in the background.
+//! Every autostarted app gets its own freshly-spawned background
+//! ConsoleHut, running the entry's own `Exec=` line directly as that
+//! Hut's PTY child (`GraphStack::spawn_and_insert_with_command`) in place
+//! of the usual interactive shell — never focused, so nothing steals
+//! focus from whatever the user's actually looking at when the session
+//! starts. `MUDHUTS_HUT_ID` (set automatically by
+//! `ConsoleHut::spawn_with_command` for every Hut, autostart or not) is
+//! what lets `ownership.rs`'s `find_owning_hut` resolve any window the
+//! app opens back to its own Hut, with no separate tagging needed here: a
+//! new toplevel's `should_show_now` check in `handlers/xdg_shell.rs` only
+//! ever auto-switches when its owning Hut is already the *focused* one,
+//! which an autostart Hut deliberately never is, so every autostarted
+//! window just joins its own Hut's tab strip in the background.
+//!
+//! **One Hut per entry, not one shared Hut for all of them** — an earlier
+//! version of this module spawned a single shared background Hut and
+//! launched every app as an untracked `std::process::Command` tagged onto
+//! it via env var alone, with its own terminal never actually running
+//! anything. Two real problems with that, not just style: (1) every
+//! autostarted app's window shared one single point of failure — that one
+//! Hut's own `touched` field (see `ConsoleHut::touched`'s doc comment)
+//! stayed `false` forever, since nobody's meant to type into it, which
+//! made it look exactly like any other disposable, safe-to-discard
+//! console to `GraphStack::next()`'s "replace an untouched entry rather
+//! than grow the stack" rule — the moment the user's own `next()`
+//! navigation happened to land on it and they pressed `next()` again
+//! (indistinguishable, from the user's side, from "just open another
+//! blank console"), it was silently destroyed, taking down *every*
+//! autostarted window at once; (2) a failed/misbehaving autostart app had
+//! no real terminal output to inspect at all. Splitting into one
+//! dedicated, immediately-`touched` Hut per entry (see
+//! `GraphStack::spawn_and_insert_with_command`'s own doc comment) fixes
+//! both: no Hut looks disposable, and each Hut's terminal shows that
+//! app's real stdout/stderr if it ever needs debugging. **Known
+//! interaction**: `State::handle_term_event`'s "last ConsoleHut closed,
+//! exiting" logout check already counts every ConsoleHut anywhere in the
+//! tree, not just visible ones — with N autostart entries running, that
+//! count is never `1` while they're still alive, so Ctrl+D-ing out of
+//! your own last visible shell falls back to whatever top-level entry is
+//! now current (possibly one of these) rather than logging out — a
+//! pre-existing characteristic of that check, not new here, just more
+//! pronounced with more background Huts around.
 //!
 //! Scope: `Type=Application` entries only (`Link`/`Directory` skipped —
 //! nothing to launch). `Hidden=true`, `Type` not `Application`, or an
@@ -35,10 +66,10 @@ use std::path::{Path, PathBuf};
 use crate::graph_stack::GraphStack;
 
 /// Scans both autostart directories and spawns every entry that resolves,
-/// all owned by one new background Hut — a no-op (no Hut created) if
-/// nothing resolves. Logs and skips whatever fails along the way; never
-/// treated as fatal to the rest of startup.
-pub fn run(stack: &mut GraphStack, extra_env: &[(String, String)]) {
+/// each into its own new background Hut (see this module's doc comment) —
+/// a no-op if nothing resolves. Logs and skips whatever fails along the
+/// way; never treated as fatal to the rest of startup.
+pub fn run(stack: &mut GraphStack) {
     let mut seen = HashSet::new();
     let mut argvs = Vec::new();
 
@@ -73,30 +104,12 @@ pub fn run(stack: &mut GraphStack, extra_env: &[(String, String)]) {
         }
     }
 
-    if argvs.is_empty() {
-        return;
-    }
-
-    let hut_id = match stack.spawn_and_insert() {
-        Ok(id) => id,
-        Err(err) => {
-            tracing::error!("failed to create a background Hut for XDG autostart: {err}");
-            return;
-        }
-    };
-
     for argv in argvs {
         let Some((program, args)) = argv.split_first() else {
             continue;
         };
-        let mut command = std::process::Command::new(program);
-        command.args(args);
-        for (key, value) in extra_env {
-            command.env(key, value);
-        }
-        command.env("MUDHUTS_HUT_ID", hut_id.to_string());
-        match command.spawn() {
-            Ok(_child) => tracing::info!("autostarted {program:?}"),
+        match stack.spawn_and_insert_with_command(program.clone(), args.to_vec()) {
+            Ok(_id) => tracing::info!("autostarted {program:?}"),
             Err(err) => tracing::warn!("failed to autostart {program:?}: {err}"),
         }
     }

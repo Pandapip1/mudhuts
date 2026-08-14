@@ -735,6 +735,32 @@ impl GraphStack {
         Ok(id)
     }
 
+    /// [`Self::spawn_and_insert`], running `program`/`args` as the new
+    /// ConsoleHut's own PTY child instead of a shell — `autostart.rs`'s
+    /// own caller, one dedicated Hut per autostart entry. Immediately
+    /// marked `touched` (unlike every other freshly-spawned ConsoleHut):
+    /// `touched` tracks "has a keystroke ever been sent to this
+    /// terminal" (see `ConsoleHut::touched`'s own doc comment), which an
+    /// autostart entry's Hut never gets — nobody's meant to type into it
+    /// — so leaving it `false` would make `advance_forward`'s "discard an
+    /// untouched entry rather than grow the stack" rule silently destroy
+    /// it (and every window it owns) the moment the user's own `next()`
+    /// navigation happened to land on it, exactly the bug this method
+    /// exists to fix. It's running something real, not sitting empty as
+    /// a disposable scratch console, so it isn't disposable the same way.
+    pub fn spawn_and_insert_with_command(&mut self, program: String, args: Vec<String>) -> Result<u64, String> {
+        let (mut hut, events) =
+            ConsoleHut::spawn_with_command(self.extra_env.clone(), self.scale, Some((program, args)))?;
+        hut.mark_touched();
+        let id = hut.id;
+        self.insert_channel(id, events)?;
+        let mut node = ConsoleNode::new(hut);
+        Redrawable::attach_redraw_handle(&mut node, self.redraw.clone());
+        let node_id = self.graph.add_node(Box::new(node));
+        self.out_mut().huts.push(node_id);
+        Ok(id)
+    }
+
     /// Move `pos` forward by one step, applying the discard/spawn rules
     /// — mirrors `MruStackHut::advance_forward` exactly, just against
     /// `NodeId`s/`Graph::node`'s `touched()` instead of `Hut::touched()`.
