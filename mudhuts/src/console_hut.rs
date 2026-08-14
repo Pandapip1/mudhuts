@@ -179,7 +179,7 @@ impl ConsoleHut {
             (INITIAL_LINES * cell_size.1 as usize) as i32,
         );
 
-        let space_output = synthetic_output("console-hut-space", pixel_size);
+        let space_output = synthetic_output("console-hut-space", pixel_size, 1.0);
         let mut space = Space::default();
         space.map_output(&space_output, (0, 0));
 

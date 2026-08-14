@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::sync::OnceLock;
 
 use smithay::backend::allocator::Fourcc;
@@ -203,6 +204,41 @@ fn normal_content_id() -> Id {
     ID.get_or_init(Id::new).clone()
 }
 
+/// Real, persistent damage tracking for [`composite_normal_content`]'s
+/// wrapper element — a module-level singleton for the same "one normal
+/// content slot" reason [`normal_content_id`] is. **Must** be persistent
+/// (not a fresh `DamageBag::default()` built inside `composite_normal_content`
+/// itself, which an earlier version of this function did): a brand new
+/// `DamageBag` has commit counter `0` and zero recorded damage every single
+/// time, and since `normal_content_id()`'s `Id` is stable across frames, the
+/// outer per-element damage tracker (`DrmCompositor`, in particular) records
+/// "last commit seen for this Id was `0`" the first time it's rendered —
+/// every later frame then calls `damage_since(Some(0))` against another
+/// fresh, still-`0`, still-empty snapshot and gets back `Some(empty set)`,
+/// i.e. *zero* damage, not "unknown, treat as fully damaged" (`None`) the
+/// way the removed version's doc comment assumed. That reproduced exactly
+/// the "terminal never repaints except when something else forces a frame
+/// through" regression: this element looked undamaged on every frame after
+/// the first, so a redraw pass driven purely by PTY output (this element's
+/// own content changing) queued nothing, while a frame that got *some*
+/// other reason to redraw (pointer motion moving the cursor sprite, which
+/// carries its own always-changing geometry) still queued a full composite
+/// pass and incidentally showed the now-stale-no-longer content, since
+/// `content_elements`/`hut.redraw` had kept re-rendering the underlying GPU
+/// texture correctly the whole time regardless — only the *reported*
+/// damage on this specific wrapper element was wrong. See
+/// `ConsoleHut::damage_tracker`'s doc comment for the identical trap in a
+/// different guise (`from_static_texture`'s implicit "no damage, ever"),
+/// and this module's own `ChangeTracker`/`LabelCache` doc comments, which
+/// already state the general rule this violated: "a `CommitCounter` that
+/// never advances means 'never damaged again after the first frame'."
+fn with_normal_content_damage<T>(f: impl FnOnce(&mut DamageBag<i32, Buffer>) -> T) -> T {
+    thread_local! {
+        static DAMAGE: RefCell<DamageBag<i32, Buffer>> = RefCell::new(DamageBag::default());
+    }
+    DAMAGE.with(|damage| f(&mut damage.borrow_mut()))
+}
+
 /// Whichever content this tick's focused view actually shows — a
 /// Tile-Hut's panes, the terminal, or the focused Console Hut's own
 /// `space` — built the same way each of `build_frame_elements`'s three
@@ -313,7 +349,14 @@ fn composite_normal_content(
     let scale = state.output_scale();
     let elements = content_elements(state, renderer);
 
-    let offscreen_output = synthetic_output("normal-content", size);
+    // Real scale, not `1.0` — see `synthetic_output`'s doc comment: this is
+    // the one caller that hands its output straight to
+    // `OutputDamageTracker::render_output` rather than a `Space`, so this
+    // scale is what turns each element's own baked-in integer buffer scale
+    // back into its correct on-screen size. Getting this wrong silently
+    // shrinks (or grows) everything composited through it on any real,
+    // non-1.0-scale output.
+    let offscreen_output = synthetic_output("normal-content", size, scale);
     let fourcc = Fourcc::Argb8888;
     let buffer_size: smithay::utils::Size<i32, Buffer> = size.into();
     let mut texture = Offscreen::<GlesTexture>::create_buffer(renderer, fourcc, buffer_size)
@@ -330,20 +373,22 @@ fn composite_normal_content(
         .ok()?;
     drop(target);
 
-    // A fresh `DamageBag` every call (never persisted across frames) —
-    // its `snapshot()` has no prior commit for the outer per-element
-    // damage tracker to recognize, and `DamageSnapshot::damage_since`'s
-    // own doc comment is explicit that means "the whole element geometry
-    // should be considered as damaged." That's exactly right here: this
-    // function only ever runs during an actual demand-driven redraw pass
-    // to begin with (Phase 2.6's damage-avoidance discipline), so by the
-    // time it's called, something real already triggered it.
-    Some(CompositedTexture::new(
-        normal_content_id(),
-        texture,
-        scale,
-        DamageBag::default().snapshot(),
-    ))
+    // A real, persistent damage snapshot — see `with_normal_content_damage`'s
+    // doc comment for why a fresh `DamageBag::default()` built right here
+    // (an earlier version of this function did exactly that) is wrong, not
+    // just redundant. Unconditionally marking the whole buffer damaged on
+    // every call (rather than tracking finer-grained damage) is still
+    // correct, not just simplest: this function only ever runs during an
+    // actual demand-driven redraw pass to begin with (Phase 2.6's
+    // damage-avoidance discipline lives one level up, in whatever decided
+    // to ping `redraw_ping`), so by the time it's called, something real
+    // already triggered it.
+    let snapshot = with_normal_content_damage(|damage| {
+        damage.add([Rectangle::from_size(buffer_size)]);
+        damage.snapshot()
+    });
+
+    Some(CompositedTexture::new(normal_content_id(), texture, scale, snapshot))
 }
 
 /// Everything mudhuts draws while `state.locked` is set (see
@@ -605,7 +650,7 @@ fn build_tile_elements(
     }
 
     let (_, _, area_w, area_h) = area;
-    let pane_output = synthetic_output("tile-hut-space", (area_w, area_h));
+    let pane_output = synthetic_output("tile-hut-space", (area_w, area_h), 1.0);
     let mut pane_space = Space::<HutSpaceElement>::default();
     pane_space.map_output(&pane_output, (0, 0));
     for ((child, _), (x, y, _, _)) in tile.children.iter_mut().zip(rects) {

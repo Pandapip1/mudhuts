@@ -275,14 +275,32 @@ impl AsRenderElements<GlesRenderer> for HutSpaceElement {
 /// `wl_surface.enter`/`leave` being sent for it, which no client can ever
 /// observe since no client can ever bind it.
 ///
-/// Always `Transform::Normal`/scale `1` — a Hut-tree node's own `Space`
-/// composites at whatever `scale: Scale<f64>` `space_render_elements`
-/// itself is called with (an explicit parameter, not derived from the
-/// output), exactly like `render.rs`'s pre-redesign `state.space` call
-/// already did (`space_render_elements(..., output, 1.0)`) — client buffer
-/// scale is handled internally by each `Window`'s own `AsRenderElements`
-/// impl regardless of what this synthetic output reports.
-pub fn synthetic_output(name: &str, size: (i32, i32)) -> Output {
+/// Always `Transform::Normal` — a Hut-tree node's own `Space` composites at
+/// whatever `scale: Scale<f64>` `space_render_elements` itself is called
+/// with (an explicit parameter, not derived from the output), exactly like
+/// `render.rs`'s pre-redesign `state.space` call already did
+/// (`space_render_elements(..., output, 1.0)`) — client buffer scale is
+/// handled internally by each `Window`'s own `AsRenderElements` impl
+/// regardless of what this synthetic output reports.
+///
+/// `scale` matters for exactly one caller:
+/// `render.rs::composite_normal_content`'s `offscreen_output`, which is
+/// handed directly to `OutputDamageTracker::render_output` (not a `Space` —
+/// no `loc.to_physical_precise_round` step in between). That call re-derives
+/// each element's on-screen *size* from its own baked-in integer buffer
+/// scale via `Element::geometry(scale)` (see
+/// `.../backend/renderer/element/texture.rs`'s `physical_size`:
+/// `logical_size().to_physical(scale)`) — the exact inverse of
+/// `texture_buffer_scale`'s rounding. Passing anything other than the real
+/// output scale there silently shrinks (or grows) every element composited
+/// through it — a `1` here for that caller specifically reproduced the "the
+/// terminal renders in a fraction of the screen" regression on any output
+/// whose real scale isn't already `1.0`, since every other caller
+/// (`console_hut.rs`'s initial construction, `build_tile_elements`'s
+/// `pane_output`) already-physical-coordinates its elements directly and
+/// genuinely wants scale `1` so `loc.to_physical_precise_round` is a no-op —
+/// see those call sites' own doc comments.
+pub fn synthetic_output(name: &str, size: (i32, i32), scale: f64) -> Output {
     let output = Output::new(
         name.to_string(),
         PhysicalProperties {
@@ -296,7 +314,7 @@ pub fn synthetic_output(name: &str, size: (i32, i32)) -> Output {
     output.change_current_state(
         Some(Mode { size: size.into(), refresh: 60_000 }),
         Some(Transform::Normal),
-        Some(OutputScale::Integer(1)),
+        Some(OutputScale::Fractional(scale)),
         Some((0, 0).into()),
     );
     output
