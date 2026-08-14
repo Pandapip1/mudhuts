@@ -104,6 +104,19 @@ fn xterm_button(code: u32) -> Option<u32> {
     }
 }
 
+/// Fire-and-forget a brightness/volume media-key command (`Action::Brightness*`/
+/// `Action::Volume*`) — logs a warning rather than failing loudly if the
+/// tool isn't installed (`brightnessctl`/`wpctl`, matching what most
+/// minimal Wayland compositors shell out to already), same "degrade, don't
+/// crash" convention as every other fallible action in this codebase.
+/// `.spawn()`, not `.status()`/`.output()` — never blocks the compositor
+/// waiting for the command to finish.
+fn spawn_media_command(program: &str, args: &[&str]) {
+    if let Err(err) = std::process::Command::new(program).args(args).spawn() {
+        tracing::warn!("failed to run {program} {args:?}: {err}");
+    }
+}
+
 /// Resolve a key press into terminal input bytes, using the live xkb state
 /// for UTF-8 text (never the stateless `keysym_to_utf8`, which can panic on
 /// pathological input — see `xkbcommon::xkb::State::key_get_utf8`).
@@ -598,6 +611,15 @@ impl State {
                     );
                 }
             }
+            Action::BrightnessUp => spawn_media_command("brightnessctl", &["set", "+5%"]),
+            Action::BrightnessDown => spawn_media_command("brightnessctl", &["set", "5%-"]),
+            Action::VolumeUp => {
+                spawn_media_command("wpctl", &["set-volume", "-l", "1", "@DEFAULT_AUDIO_SINK@", "5%+"])
+            }
+            Action::VolumeDown => {
+                spawn_media_command("wpctl", &["set-volume", "@DEFAULT_AUDIO_SINK@", "5%-"])
+            }
+            Action::VolumeMute => spawn_media_command("wpctl", &["set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"]),
         }
     }
 

@@ -41,6 +41,18 @@ pub enum Action {
     /// Bound to `Ctrl+Shift+C` rather than plain `Ctrl+C`, which is already
     /// SIGINT inside the terminal.
     CopySelection,
+    /// Brightness/volume media keys — see `input.rs`'s `handle_action` for
+    /// why these shell out to `brightnessctl`/`wpctl` rather than talking
+    /// to backlight sysfs or a mixer directly: matches what most minimal
+    /// Wayland compositors actually do (sway/hyprland's own documented
+    /// default configs), avoids a new D-Bus/PipeWire-client dependency in
+    /// the main compositor binary just for this, and degrades to "logged,
+    /// does nothing" rather than a crash if the tool isn't installed.
+    BrightnessUp,
+    BrightnessDown,
+    VolumeUp,
+    VolumeDown,
+    VolumeMute,
 }
 
 /// `(config key, default chord, action)` — the single source of truth for
@@ -55,6 +67,15 @@ const DEFAULTS: &[(&str, &str, Action)] = &[
     ("wrap-tile", "Meta+Shift+V", Action::WrapTile),
     ("close-focused", "Meta+Shift+Q", Action::CloseFocused),
     ("copy-selection", "Ctrl+Shift+C", Action::CopySelection),
+    // Bare keysym, no modifier — a real dedicated media key already sends
+    // exactly this XF86 keysym on its own; `parse_chord` handles a
+    // modifier-less spec with no special-casing needed (see its own doc
+    // comment).
+    ("brightness-up", "XF86MonBrightnessUp", Action::BrightnessUp),
+    ("brightness-down", "XF86MonBrightnessDown", Action::BrightnessDown),
+    ("volume-up", "XF86AudioRaiseVolume", Action::VolumeUp),
+    ("volume-down", "XF86AudioLowerVolume", Action::VolumeDown),
+    ("volume-mute", "XF86AudioMute", Action::VolumeMute),
 ];
 
 fn action_by_name(name: &str) -> Option<Action> {
