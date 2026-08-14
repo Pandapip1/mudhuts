@@ -241,9 +241,50 @@ pub(crate) fn nearest_edge_within_threshold(
         (top, Edge::Top),
         (bottom, Edge::Bottom),
     ];
+    // `.abs()`, not the raw signed distance: a window wide/tall enough to
+    // extend past the *opposite* edge makes that opposite edge's distance
+    // a large negative number (e.g. flush against the left edge but wider
+    // than the output makes `right` very negative) — comparing raw signed
+    // values would let that large-magnitude negative "win" over the
+    // genuinely near edge's small positive distance, re-docking to the
+    // wrong side entirely. Distance-from-touching is symmetric: an edge
+    // already overlapped by 5px is just as "near" as one still 5px away.
     candidates
         .into_iter()
-        .filter(|(distance, _)| *distance <= REDOCK_THRESHOLD)
-        .min_by_key(|(distance, _)| *distance)
+        .filter(|(distance, _)| distance.abs() <= REDOCK_THRESHOLD)
+        .min_by_key(|(distance, _)| distance.abs())
         .map(|(_, edge)| edge)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn picks_the_only_edge_within_threshold() {
+        let edge = nearest_edge_within_threshold((1000, 800), Point::from((10, 300)), smithay::utils::Size::from((200, 200)));
+        assert_eq!(edge, Some(Edge::Left));
+    }
+
+    #[test]
+    fn picks_the_closest_of_several_edges_within_threshold() {
+        // Near both the left (x=5) and top (y=15) edges — left should win.
+        let edge = nearest_edge_within_threshold((1000, 800), Point::from((5, 15)), smithay::utils::Size::from((200, 200)));
+        assert_eq!(edge, Some(Edge::Left));
+    }
+
+    #[test]
+    fn none_when_nothing_is_within_threshold() {
+        let edge = nearest_edge_within_threshold((1000, 800), Point::from((400, 300)), smithay::utils::Size::from((200, 200)));
+        assert_eq!(edge, None);
+    }
+
+    #[test]
+    fn oversized_window_flush_against_one_edge_still_picks_that_edge() {
+        // Flush against the left edge, but wide enough to overhang the
+        // right edge by a lot — `right`'s raw signed distance is a large
+        // negative number that must not out-rank `left`'s exact 0.
+        let edge = nearest_edge_within_threshold((1000, 800), Point::from((0, 300)), smithay::utils::Size::from((1400, 200)));
+        assert_eq!(edge, Some(Edge::Left));
+    }
 }
