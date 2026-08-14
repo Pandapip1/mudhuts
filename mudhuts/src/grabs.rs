@@ -77,11 +77,7 @@ impl PointerGrab<State> for MoveSurfaceGrab {
         // back to the full graph-wide search only on a miss, so a
         // stale/unplugged-mid-drag output index can never be mistaken
         // for the Hut itself having exited.
-        let hut = match data.stack.find_mut_for(self.output_index, self.hut_id) {
-            Some(hut) => Some(hut),
-            None => data.stack.find_mut(self.hut_id),
-        };
-        let Some(hut) = hut else {
+        let Some(hut) = data.stack.find_mut_for_hint(self.output_index, self.hut_id) else {
             // The owning Hut exited mid-drag (its shell exited under the
             // dragged window) — nothing left to update.
             return;
@@ -250,6 +246,12 @@ impl PointerGrab<State> for MoveSurfaceGrab {
             return;
         };
         let redock_edge = nearest_edge_within_threshold(data.output_size_logical_for(output_index), location, size);
+        // This Hut's own output's usable area, computed before the
+        // re-resolve below — needed for `sync_main_window_space` a few
+        // lines down, and `data.usable_area_for` needs `&data` as a
+        // whole, which the borrow checker won't allow alongside an
+        // active `&mut data.stack` borrow.
+        let (area_x, area_y, _, _) = data.usable_area_for(output_index);
         // Re-resolved rather than reusing `hut` above — the borrow
         // checker requires it (an immutable borrow of `data.stack` sits
         // between the two), not because the Hut could plausibly have
@@ -266,7 +268,16 @@ impl PointerGrab<State> for MoveSurfaceGrab {
                 None => Dock::Floating(location),
             };
         }
-        data.sync_visible_main_window();
+        // This Hut's own space, not `data.sync_visible_main_window()`
+        // (which only ever rebuilds the *focused* Hut's `space` — see
+        // its own doc comment): real multi-monitor's focus-follows-mouse
+        // can have moved focus to a different output by the time a drag
+        // is released (see `hut_id`'s own doc comment), and calling the
+        // focused-only sync here left this Hut's `space` never remapped
+        // to its new `Dock` state — the window stayed stuck at its old
+        // position/visibility until something else happened to trigger
+        // a sync for this specific Hut.
+        hut.sync_main_window_space((area_x, area_y));
         data.request_redraw();
     }
 }

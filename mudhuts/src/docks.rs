@@ -339,23 +339,28 @@ pub fn advance_drag(state: &mut State, pos: Point<f64, Physical>) {
             return;
         }
         let logical = pos.to_logical(Scale::from(scale)).to_i32_round();
+        // This Hut's own output's usable area — needed for
+        // `sync_main_window_space` below; computed before the mutable
+        // `hut` borrow for the same borrow-checker reason as `unset`'s
+        // own equivalent line in grabs.rs.
+        let (area_x, area_y, _, _) = state.usable_area_for(output_index);
         // Fast path first (see `output_index`'s doc comment) — falls
         // back to the full graph-wide search only on a miss.
-        let hut = match state.stack.find_mut_for(output_index, hut_id) {
-            Some(hut) => Some(hut),
-            None => state.stack.find_mut(hut_id),
-        };
-        let Some(hut) = hut else {
+        let Some(hut) = state.stack.find_mut_for_hint(output_index, hut_id) else {
             // The owning Hut exited mid-drag — nothing left to update.
             return;
         };
         if let Some(sub) = hut.floating_window_mut(&surface) {
             sub.dock = Dock::Floating(logical);
         }
+        // This Hut's own space, not `state.sync_visible_main_window()`
+        // (focused-output-only — see grabs.rs's `unset` for the same
+        // fix and its fuller reasoning): the drag's owning Hut may not
+        // be the focused one by now.
+        hut.sync_main_window_space((area_x, area_y));
         if let Some(drag) = &mut state.dock_drag {
             drag.detached = true;
         }
-        state.sync_visible_main_window();
         return;
     }
 
@@ -363,11 +368,7 @@ pub fn advance_drag(state: &mut State, pos: Point<f64, Physical>) {
     // (a full graph-wide scan) — this runs on every pointer-motion sample
     // for the rest of the drag, same hot-loop reasoning as the
     // `find_mut_for` fast path above.
-    let hut = match state.stack.find_mut_for(output_index, hut_id) {
-        Some(hut) => Some(hut),
-        None => state.stack.find_mut(hut_id),
-    };
-    let Some(hut) = hut else {
+    let Some(hut) = state.stack.find_mut_for_hint(output_index, hut_id) else {
         return;
     };
     if let Some(window) = hut.floating_window_mut(&surface).map(|sub| sub.window.clone()) {
@@ -418,6 +419,7 @@ pub fn finish_drag(state: &mut State) {
         return;
     };
     let redock_edge = nearest_edge_within_threshold(state.output_size_logical_for(output_index), location, size);
+    let (area_x, area_y, _, _) = state.usable_area_for(output_index);
     let Some(hut) = state.stack.find_mut(drag.hut_id) else {
         return;
     };
@@ -427,7 +429,9 @@ pub fn finish_drag(state: &mut State) {
             None => Dock::Floating(location),
         };
     }
-    state.sync_visible_main_window();
+    // This Hut's own space, not `state.sync_visible_main_window()` — see
+    // `advance_drag`/`grabs.rs`'s `unset` for the same fix.
+    hut.sync_main_window_space((area_x, area_y));
     // Via the handle attached in `start_drag`, not `state.request_redraw()`
     // directly — see `crate::redraw`'s module doc.
     if let Some(redraw) = &drag.redraw {

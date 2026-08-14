@@ -603,6 +603,32 @@ impl GraphStack {
         Some(&mut self.graph.downcast_mut::<ConsoleNode>(node_id)?.hut)
     }
 
+    /// [`Self::find_mut_for`], falling back to the full [`Self::find_mut`]
+    /// search on a miss — the actual pattern every hot-loop caller wants
+    /// (`grabs.rs`'s `MoveSurfaceGrab::motion`, `docks.rs`'s
+    /// `advance_drag`, both call sites this consolidates): try the cheap
+    /// per-output hint first, but never mistake a stale/miss-scoped
+    /// `output_index` for the Hut itself having exited. Living here once,
+    /// instead of copy-pasted at each call site, means a future change to
+    /// this fallback policy (a retry limit, logging on fallback, ...)
+    /// only has to happen in one place.
+    pub fn find_mut_for_hint(&mut self, output_index: usize, id: u64) -> Option<&mut ConsoleHut> {
+        // Resolves a plain `NodeId` first (an `&self` search — free to
+        // try the scoped hint, then fall back to the full search, with
+        // no borrow-checker fight at all, unlike attempting the same
+        // fallback directly against `find_mut`/`find_mut_for`'s own
+        // `&mut self` results across `match` arms), then does exactly
+        // one `&mut self` resolution at the very end — so the common
+        // (found-via-hint) case pays for the scoped search exactly once,
+        // matching the cost of the 3 call sites this consolidates.
+        let node_id = self
+            .top_level_entries_for(output_index)
+            .copied()
+            .find_map(|top| self.find_console_node(top, id))
+            .or_else(|| self.all_top_level_entries().copied().find_map(|top| self.find_console_node(top, id)))?;
+        Some(&mut self.graph.downcast_mut::<ConsoleNode>(node_id)?.hut)
+    }
+
     /// Every `ConsoleHut` anywhere in the graph, across every output —
     /// mirrors `MruStackHut::all_huts`.
     pub fn all_huts(&self) -> impl Iterator<Item = &ConsoleHut> {
