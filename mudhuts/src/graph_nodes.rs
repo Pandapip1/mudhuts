@@ -114,6 +114,10 @@ impl<Env> Node<Env> for TabNode {
             graph.with_node_mut(child, |node, graph| node.resize_to_pixels(graph, child, width, height));
         }
     }
+
+    fn attach_redraw_handle(&mut self, handle: RedrawHandle) {
+        Redrawable::attach_redraw_handle(self, handle);
+    }
 }
 
 impl Redrawable for TabNode {
@@ -219,6 +223,10 @@ impl<Env> Node<Env> for TileNode {
         for (child, (_, _, w, h)) in children.into_iter().zip(rects) {
             graph.with_node_mut(child, |node, graph| node.resize_to_pixels(graph, child, w, h));
         }
+    }
+
+    fn attach_redraw_handle(&mut self, handle: RedrawHandle) {
+        Redrawable::attach_redraw_handle(self, handle);
     }
 }
 
@@ -386,6 +394,10 @@ impl Node<RenderEnv> for ConsoleNode {
 
     fn rescale(&mut self, scale: f64) -> Result<(), String> {
         self.hut.rescale(scale)
+    }
+
+    fn attach_redraw_handle(&mut self, handle: RedrawHandle) {
+        Redrawable::attach_redraw_handle(self, handle);
     }
 }
 

@@ -74,6 +74,8 @@
 
 use std::collections::HashMap;
 
+use crate::redraw::RedrawHandle;
+
 /// A value a node computes for one of its own `Content`/`Control`-kind
 /// output ports — see this module's doc comment for why `Hut`/`HutList`
 /// aren't part of this (they're references, not computed values).
@@ -265,6 +267,17 @@ pub trait Node<Env> {
     fn rescale(&mut self, _scale: f64) -> Result<(), String> {
         Ok(())
     }
+
+    /// Wire this node (and, for a compositing node, everything under it)
+    /// up to the shared redraw handle — see `crate::redraw::Redrawable`'s
+    /// own doc comment for why this exists at all. A `Node` trait method
+    /// (not just a separate `Redrawable` impl, which every real node type
+    /// here still also implements, for anything that constructs one
+    /// directly and doesn't need `dyn Node` dispatch) because
+    /// `GraphStack::wrap_tab`/`wrap_tile` build a fresh Tab/Tile node
+    /// generically, without knowing its concrete type — needs to reach
+    /// this through `dyn Node<Env>`, not a concrete `Redrawable` bound.
+    fn attach_redraw_handle(&mut self, _handle: RedrawHandle) {}
 }
 
 #[derive(Debug)]
@@ -400,11 +413,27 @@ impl<Env> Graph<Env> {
     /// recursive walk (see that trait method's own doc comment). Returns
     /// `id` itself if it's already a leaf (or unknown — nothing to walk
     /// down to).
-    pub fn focused_leaf(&self, mut id: NodeId) -> NodeId {
-        while let Some(child) = self.node(id).and_then(|n| n.focused_child(self, id)) {
-            id = child;
+    pub fn focused_leaf(&self, id: NodeId) -> NodeId {
+        *self.focused_path(id).last().unwrap_or(&id)
+    }
+
+    /// [`Self::focused_leaf`]'s full walk, `id` included — `id` itself,
+    /// then each successive [`Node::focused_child`] in turn, ending at
+    /// the leaf. Needed (not just the final leaf alone) by
+    /// `GraphStack::wrap_tab`/`wrap_tile` (`graph_stack.rs`): wrapping
+    /// "in place" means finding whichever node's own `children` list
+    /// currently references the focused leaf — the second-to-last entry
+    /// in this path — and replacing just that one entry, leaving every
+    /// sibling/ancestor untouched. Always has at least one entry (`id`
+    /// itself), even for an unknown id.
+    pub fn focused_path(&self, id: NodeId) -> Vec<NodeId> {
+        let mut path = vec![id];
+        let mut current = id;
+        while let Some(child) = self.node(current).and_then(|n| n.focused_child(self, current)) {
+            path.push(child);
+            current = child;
         }
-        id
+        path
     }
 
     fn port_kind(&self, id: NodeId, name: &'static str, want_output: bool) -> Result<PortKind, GraphError> {
