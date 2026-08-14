@@ -206,6 +206,12 @@ impl State {
             // left the first hit-test after landing on a new monitor
             // liable to resolve against a stale mapped-window set.
             self.sync_visible_main_window();
+            // Paired call `sync_keyboard_focus_to_view`'s own doc comment
+            // requires after anything that changes the focused Hut —
+            // without it, keyboard input kept going to the old output's
+            // now-hidden surface until some unrelated focus change
+            // happened to repair it.
+            self.sync_keyboard_focus_to_view();
         }
         let pos_physical = self.to_physical(pos);
         // Under winit this is a no-op ping (the host draws the cursor,
