@@ -271,9 +271,22 @@ impl Redrawable for TileNode {
 /// `udev_backend.rs`'s own `Inner::renderer` already does (real
 /// precedent in this codebase, not a new pattern) — `RenderEnv` itself
 /// becomes a plain `'static`-compatible, `Clone`-able value.
+///
+/// `renderer` is `Option` (not a bare `Rc<RefCell<GlesRenderer>>`) for a
+/// second, unrelated reason: `main.rs` constructs the stack (and so this
+/// `RenderEnv`) *before* either backend creates a real `GlesRenderer` —
+/// `init_udev`/`init_winit` run after — so there's a real, if brief,
+/// window where no renderer exists yet to put here. Rather than
+/// restructure `main.rs`'s init order around this one field, the slot
+/// starts empty and whichever backend creates the real renderer fills it
+/// in once it exists (`GraphStack::set_renderer`, `graph_stack.rs`).
+/// `ConsoleNode::resolve` degrades to empty content rather than
+/// panicking if it's ever somehow called before that — in practice it
+/// never actually is, since nothing renders before a backend exists to
+/// drive rendering in the first place.
 #[derive(Clone)]
 pub struct RenderEnv {
-    pub renderer: Rc<RefCell<GlesRenderer>>,
+    pub renderer: Rc<RefCell<Option<GlesRenderer>>>,
 }
 
 const LEAF_OUTPUTS: &[OutputPort] = &[OutputPort { name: "content", kind: PortKind::Content }];
@@ -336,8 +349,11 @@ impl Node<RenderEnv> for ConsoleNode {
         // (ultimately the real output's `usable_area()` origin, applied
         // once at the very top, not baked in here).
         if *self.hut.showing_terminal || self.hut.main_window_count() == 0 {
-            let mut renderer = graph.env.renderer.borrow_mut();
-            let Some(texture) = self.hut.redraw(&mut renderer) else {
+            let mut guard = graph.env.renderer.borrow_mut();
+            let Some(renderer) = guard.as_mut() else {
+                return PortValue::Content(Vec::new());
+            };
+            let Some(texture) = self.hut.redraw(renderer) else {
                 return PortValue::Content(Vec::new());
             };
             let damage = self.hut.element_damage_snapshot();
