@@ -128,7 +128,11 @@ impl TileHut {
     }
 }
 
-fn wrapping_step(len: usize, active: usize, dir: Direction) -> usize {
+/// `pub(crate)`, not private — reused by `graph_nodes::TabNode::cycle`
+/// (migration step 2 of `docs/rfcs/typed-graph-hut.md`) so the graph-
+/// native Tab-Hut's own cycling is provably the same wraparound logic as
+/// this enum's, not just a structurally-similar reimplementation.
+pub(crate) fn wrapping_step(len: usize, active: usize, dir: Direction) -> usize {
     match dir {
         Direction::Next => (active + 1) % len,
         Direction::Prev => (active + len - 1) % len,

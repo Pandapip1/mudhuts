@@ -6,6 +6,7 @@ mod docks;
 mod gpu_term;
 mod grabs;
 mod graph;
+mod graph_nodes;
 mod handlers;
 mod console_hut;
 mod input;
