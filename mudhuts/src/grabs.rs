@@ -41,6 +41,16 @@ pub struct MoveSurfaceGrab {
     /// Whether this is a Floating Window (checks edge-proximity to re-dock on
     /// release) vs. an Alert (always ends up floating).
     pub floating_window: bool,
+    /// The `ConsoleHut` that actually owns the window being dragged —
+    /// captured once at grab-start time (`handlers/xdg_shell.rs::move_request`),
+    /// not re-resolved via `data.stack.focused_mut()` on every callback:
+    /// real multi-monitor's focus-follows-mouse can move input focus to
+    /// a different output mid-drag (the pointer crossing onto another
+    /// monitor while the button is still held), and writing the dragged
+    /// window's position into *that* Hut's `space` instead of its real
+    /// owner's would silently migrate it into an unrelated Hut's window
+    /// set while the actual owner's own data model went stale.
+    pub hut_id: u64,
 }
 
 impl PointerGrab<State> for MoveSurfaceGrab {
@@ -56,7 +66,12 @@ impl PointerGrab<State> for MoveSurfaceGrab {
 
         let delta = event.location - self.start_data.location;
         let new_location = self.initial_window_location.to_f64() + delta;
-        data.stack.focused_mut().space.map_element(
+        let Some(hut) = data.stack.find_mut(self.hut_id) else {
+            // The owning Hut exited mid-drag (its shell exited under the
+            // dragged window) — nothing left to update.
+            return;
+        };
+        hut.space.map_element(
             crate::space_element::HutSpaceElement::Window(self.window.clone()),
             new_location.to_i32_round(),
             true,
@@ -185,17 +200,22 @@ impl PointerGrab<State> for MoveSurfaceGrab {
     /// would snap the window right back to wherever it was before the
     /// drag.
     fn unset(&mut self, data: &mut State) {
-        let Some(location) = data
-            .stack
-            .focused()
-            .space
-            .element_location(&crate::space_element::HutSpaceElement::Window(self.window.clone()))
+        // The dragged window's real owning Hut, not `data.stack.focused()`
+        // — see [`MoveSurfaceGrab::hut_id`]'s own doc comment: the
+        // pointer may have crossed onto a different output mid-drag.
+        let Some(hut) = data.stack.find_mut(self.hut_id) else {
+            // The owning Hut exited mid-drag — nothing left to persist.
+            data.request_redraw();
+            return;
+        };
+        let Some(location) =
+            hut.space.element_location(&crate::space_element::HutSpaceElement::Window(self.window.clone()))
         else {
             return;
         };
 
         if !self.floating_window {
-            if let Some(alert) = data.stack.focused_mut().alert_mut(&self.surface) {
+            if let Some(alert) = hut.alert_mut(&self.surface) {
                 alert.position = location;
             }
             data.request_redraw();
@@ -203,14 +223,20 @@ impl PointerGrab<State> for MoveSurfaceGrab {
         }
 
         let size = self.window.geometry().size;
-        // `location`/`size` are genuinely Logical (from the focused
-        // Console Hut's own `space`) — compared against the output's
-        // Logical size, not
-        // `data.output_size` (physical), to keep both sides of the
-        // distance check in the same space (see
-        // `State::output_size_logical`'s doc comment).
-        let redock_edge = nearest_edge_within_threshold(data.output_size_logical(), location, size);
-        if let Some(sub) = data.stack.focused_mut().floating_window_mut(&self.surface) {
+        // `location`/`size` are genuinely Logical (from the owning
+        // Console Hut's own `space`) — compared against *that Hut's own
+        // output's* Logical size, not `data.output_size_logical()`
+        // (which is the *focused* output, possibly a different one by
+        // now — see this method's own doc comment), to keep the
+        // distance check meaningful for the output the window is
+        // actually being dropped on.
+        let Some(output_index) = data.stack.output_index_for_hut(self.hut_id) else {
+            data.request_redraw();
+            return;
+        };
+        let redock_edge = nearest_edge_within_threshold(data.output_size_logical_for(output_index), location, size);
+        let hut = data.stack.find_mut(self.hut_id).expect("just resolved above");
+        if let Some(sub) = hut.floating_window_mut(&self.surface) {
             sub.dock = match redock_edge {
                 Some(edge) => Dock::Docked(edge),
                 None => Dock::Floating(location),

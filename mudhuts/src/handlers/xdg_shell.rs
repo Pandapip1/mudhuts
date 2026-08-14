@@ -172,6 +172,15 @@ impl XdgShellHandler for State {
         if !is_floating_window && !is_alert {
             return;
         }
+        // The *currently focused* Hut really does own this window right
+        // now — a client only ever issues `xdg_toplevel.move` in
+        // response to real user interaction with its own (necessarily
+        // visible/focused) title bar. Captured once, here, and carried
+        // in the grab: real multi-monitor's focus-follows-mouse means
+        // `self.stack.focused()` can point at a completely different
+        // output's Hut by the time `motion`/`unset` run later, if the
+        // pointer crosses onto another monitor mid-drag.
+        let hut_id = self.stack.focused().id;
 
         let Some(window) = self.find_window_by_surface(&wl_surface) else {
             return;
@@ -191,6 +200,7 @@ impl XdgShellHandler for State {
             initial_window_location,
             surface: wl_surface,
             floating_window: is_floating_window,
+            hut_id,
         };
 
         pointer.set_grab(self, grab, serial, Focus::Clear);

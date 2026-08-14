@@ -309,12 +309,19 @@ pub struct State {
     /// against it for the lock's entire lifetime, not just until the
     /// first frame confirms it.
     pub accepted_lock: Option<ExtSessionLockV1>,
-    /// This output's lock surface, if the locking client has mapped one —
-    /// single-output throughout (like everything else here), so a plain
-    /// `Option` suffices rather than a per-output map. `None` means
-    /// "locked, but nothing to show yet" — `render.rs`'s
-    /// `build_frame_elements` still blanks the screen either way.
-    pub lock_surface: Option<LockSurface>,
+    /// Every output's own lock surface the locking client has mapped so
+    /// far, keyed by real `Output` identity rather than output index (an
+    /// index can shift out from under a stored value on hotplug — see
+    /// `GraphStack::remove_output`'s own index-shift). A conforming
+    /// locker calls `get_lock_surface` once per output it knows about
+    /// (see this module's doc's Lifecycle section), so real multi-
+    /// monitor needs one entry per output, not a single shared slot — a
+    /// plain `Option` here meant every output but the last-locked one
+    /// showed a blank rectangle with no interactive unlock prompt at
+    /// all. No entry for a given output means "locked, but nothing to
+    /// show there yet" — `render.rs`'s `build_frame_elements` still
+    /// blanks that output's screen either way.
+    pub lock_surfaces: Vec<(Output, LockSurface)>,
     /// Held between accepting a lock request and actually confirming it —
     /// see `handlers/session_lock.rs`'s `lock` doc comment for why that
     /// confirmation can't happen synchronously, and `udev_backend.rs`'s
@@ -345,6 +352,20 @@ pub struct State {
     /// `winit_backend.rs`) rather than continuously, so an idle compositor
     /// does no per-frame work at all.
     redraw_ping: Ping,
+}
+
+/// Shared body of [`State::real_output_geometry`]/[`State::real_output_geometry_for`]
+/// — the transform-and-scale-divide math itself doesn't care which
+/// `Output` it's given.
+fn real_output_geometry_for_output(output: &Output) -> Option<Rectangle<i32, Logical>> {
+    let mode = output.current_mode()?;
+    let size = output
+        .current_transform()
+        .transform_size(mode.size)
+        .to_f64()
+        .to_logical(output.current_scale().fractional_scale())
+        .to_i32_ceil();
+    Some(Rectangle::new((0, 0).into(), size))
 }
 
 impl State {
@@ -457,7 +478,7 @@ impl State {
             session_lock_state,
             locked: false,
             accepted_lock: None,
-            lock_surface: None,
+            lock_surfaces: Vec::new(),
             pending_lock: None,
             lock_backdrop_id: Id::new(),
             authority_token,
@@ -638,23 +659,26 @@ impl State {
             .unwrap_or((0, 0))
     }
 
-    /// [`Self::output`]'s geometry — always at `(0, 0)` (mudhuts is
-    /// single-output and both backends unconditionally `map_output` there),
-    /// so this is really just "the current mode's size, transformed and
-    /// scale-divided" — the exact math `Space::output_geometry` itself uses
-    /// (`.../desktop/space/mod.rs`'s `output_geometry`, confirmed against
-    /// the pinned Smithay checkout), reproduced here now that `output` is
-    /// decoupled from any particular `Space`.
+    /// [`Self::output`]'s (the *focused* output's) geometry — always at
+    /// `(0, 0)` (each output maps at its own local origin, independent
+    /// of `OutputSlot::position`'s shared-compositor-space offset — see
+    /// that field's own doc comment), so this is really just "the
+    /// current mode's size, transformed and scale-divided" — the exact
+    /// math `Space::output_geometry` itself uses (`.../desktop/space/mod.rs`'s
+    /// `output_geometry`, confirmed against the pinned Smithay checkout),
+    /// reproduced here now that `output` is decoupled from any
+    /// particular `Space`.
     pub fn real_output_geometry(&self) -> Option<Rectangle<i32, Logical>> {
         let output = self.output.as_ref()?;
-        let mode = output.current_mode()?;
-        let size = output
-            .current_transform()
-            .transform_size(mode.size)
-            .to_f64()
-            .to_logical(output.current_scale().fractional_scale())
-            .to_i32_ceil();
-        Some(Rectangle::new((0, 0).into(), size))
+        real_output_geometry_for_output(output)
+    }
+
+    /// [`Self::real_output_geometry`], for a specific output rather than
+    /// implicitly the focused one — same real-multi-monitor need as
+    /// [`Self::usable_area_for`].
+    pub fn real_output_geometry_for(&self, output_index: usize) -> Option<Rectangle<i32, Logical>> {
+        let output = &self.stack.outputs().get(output_index)?.output;
+        real_output_geometry_for_output(output)
     }
 
     /// The rectangle (physical pixels, output-relative) that ConsoleHut/Main-
@@ -762,6 +786,19 @@ impl State {
     /// mapped yet, same reasoning as `usable_area_logical`.
     pub fn output_size_logical(&self) -> (i32, i32) {
         match self.real_output_geometry() {
+            Some(geo) => (geo.size.w, geo.size.h),
+            None => self.output_size,
+        }
+    }
+
+    /// [`Self::output_size_logical`], for a specific output — needed
+    /// wherever a genuinely-Logical size has to be compared against
+    /// something scoped to a *particular* output rather than whichever
+    /// one currently has input focus (`grabs.rs`'s `MoveSurfaceGrab::unset`,
+    /// which persists a drag against the window's real owning output,
+    /// not necessarily the focused one by the time the drag ends).
+    pub fn output_size_logical_for(&self, output_index: usize) -> (i32, i32) {
+        match self.real_output_geometry_for(output_index) {
             Some(geo) => (geo.size.w, geo.size.h),
             None => self.output_size,
         }
