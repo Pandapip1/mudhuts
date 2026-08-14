@@ -357,12 +357,19 @@ impl State {
         // Looked up across every ConsoleHut (not just the focused one's own
         // `space`, which only ever holds whichever single Main Window is
         // currently visible) — a popup's parent window doesn't have to be
-        // the visible one.
-        if self.find_window_by_surface(&root).is_none() {
+        // the visible one. `output_index_for_window_surface` returning
+        // `None` already covers "no Hut owns a window matching this
+        // surface" (the same condition `find_window_by_surface`'s own
+        // presence check would test) — one scan instead of two.
+        //
+        // Also this root window's own output, not `self.real_output_geometry()`/
+        // `self.output_scale()` (the focused output) — a popup's parent
+        // window doesn't have to be on the focused monitor, and a
+        // backgrounded monitor can have a different size/scale entirely.
+        let Some(output_index) = self.output_index_for_window_surface(&root) else {
             return;
         };
-
-        let Some(output_geo) = self.real_output_geometry() else {
+        let Some(output_geo) = self.real_output_geometry_for(output_index) else {
             return;
         };
 
@@ -393,7 +400,7 @@ impl State {
         let mut target = match self.leaf_absolute_rect(&root) {
             Some((_, _, w, h)) => {
                 let physical = Rectangle::<i32, Physical>::new(Point::from((0, 0)), Size::from((w, h)));
-                physical.to_f64().to_logical(Scale::from(self.output_scale())).to_i32_round()
+                physical.to_f64().to_logical(Scale::from(self.output_scale_for(output_index))).to_i32_round()
             }
             None => output_geo,
         };

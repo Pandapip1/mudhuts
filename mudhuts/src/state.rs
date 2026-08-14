@@ -920,6 +920,25 @@ impl State {
         })
     }
 
+    /// Which output the `ConsoleHut` owning `surface`'s window lives on —
+    /// for `unconstrain_popup`, whose parent window doesn't have to be
+    /// the focused Hut's (a popup can be opened from a backgrounded
+    /// monitor's own window), so its output-sized/-scaled fallback needs
+    /// that specific output, not `self.output`. `None` if no Hut owns a
+    /// window matching `surface` (mirrors [`Self::find_window_by_surface`]'s
+    /// own "not found" case).
+    pub fn output_index_for_window_surface(&self, surface: &WlSurface) -> Option<usize> {
+        let hut_id = self.stack.all_huts().find_map(|h| {
+            let owns = h.main_windows().iter().any(|entry| {
+                entry.matches(surface)
+                    || entry.floating_windows.iter().any(|s| s.matches(surface))
+                    || entry.alerts.iter().any(|a| a.matches(surface))
+            });
+            owns.then_some(h.id)
+        })?;
+        self.stack.output_index_for_hut(hut_id)
+    }
+
     /// Topmost surface under `pos`, for pointer motion/click routing —
     /// checked in the same front-to-back z-order `render.rs`'s
     /// `build_frame_elements` actually draws: a `wlr-layer-shell` Top or
