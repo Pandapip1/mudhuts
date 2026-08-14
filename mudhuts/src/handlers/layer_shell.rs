@@ -114,6 +114,29 @@ impl WlrLayerShellHandler for State {
 /// one yet. A no-op if `surface` isn't a layer surface at all. Called
 /// from `handlers/compositor.rs`'s `commit()`.
 pub fn handle_commit(state: &mut State, surface: &WlSurface) {
+    // Called unconditionally from `handlers/compositor.rs`'s `commit()`
+    // on *every* surface commit compositor-wide — terminal buffer
+    // updates, xdg-toplevel commits, cursor-surface commits, all of it —
+    // not just layer-shell ones. Cheap up-front bail (no allocation, no
+    // per-output `LayerMap` mutex locking) for the overwhelming majority
+    // of calls where `surface` isn't a layer surface at all: only a real
+    // layer surface ever has `LayerSurfaceData` in its `data_map` (set up
+    // by Smithay's own layer-shell wiring when `new_layer_surface` maps
+    // it), so checking for that first avoids the full per-output scan
+    // below entirely for every other kind of commit.
+    let initial_configure_sent = with_states(surface, |states| {
+        states
+            .data_map
+            .get::<LayerSurfaceData>()
+            .map(|data| match data.lock() {
+                Ok(guard) => guard.initial_configure_sent,
+                Err(_) => true,
+            })
+    });
+    let Some(initial_configure_sent) = initial_configure_sent else {
+        return;
+    };
+
     // Search every real output's own layer map, not just the focused one
     // (`state.output`) — `new_layer_surface` honors a client's explicit
     // `wl_output` choice, so a status bar bound to a backgrounded monitor
@@ -127,17 +150,6 @@ pub fn handle_commit(state: &mut State, surface: &WlSurface) {
     }) else {
         return;
     };
-
-    let initial_configure_sent = with_states(surface, |states| {
-        states
-            .data_map
-            .get::<LayerSurfaceData>()
-            .map(|data| match data.lock() {
-                Ok(guard) => guard.initial_configure_sent,
-                Err(_) => true,
-            })
-            .unwrap_or(true)
-    });
 
     let mut map = layer_map_for_output(&output);
     // Arranging can change the exclusive zone, which everything sizing
