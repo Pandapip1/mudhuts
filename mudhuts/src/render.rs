@@ -13,6 +13,7 @@ use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::utils::{CommitCounter, DamageBag, DamageSnapshot};
 use smithay::backend::renderer::{ImportAll, ImportMem, RendererSuper};
 use smithay::desktop::space::{Space, SpaceRenderElements, space_render_elements};
+use smithay::output::Output;
 use smithay::utils::{Buffer, Rectangle, Scale, Transform};
 
 use crate::State;
@@ -239,6 +240,55 @@ fn with_normal_content_damage<T>(f: impl FnOnce(&mut DamageBag<i32, Buffer>) -> 
     DAMAGE.with(|damage| f(&mut damage.borrow_mut()))
 }
 
+/// [`composite_normal_content`]'s offscreen render target — the synthetic
+/// output, the GL texture it renders into, and the `OutputDamageTracker`
+/// tracking damage across calls, kept alive between frames instead of
+/// rebuilt from scratch every single one (an earlier version of this
+/// function did exactly that). Profiling a live session (`perf record` on
+/// the real `mudhuts --tty` process) after fixing the two correctness bugs
+/// this same redesign introduced (see this file's `git log`) turned up a
+/// second, independent problem from the same source: rebuilding the
+/// `Output` every call meant re-running its `tracing::info!("Creating new
+/// Output")` span — Debug-formatting a whole `PhysicalProperties` struct —
+/// on every frame (`core::fmt::write`/`String::write_str` showed up as a
+/// meaningful chunk of self-time), and rebuilding the GL texture every call
+/// meant a real texture alloc/free (with its own sync-fence teardown) every
+/// frame too (`delete_textures`, `TextureSync::wait_for_upload`,
+/// `eglDestroySync`, `drmSyncobjDestroy` all showed up).
+///
+/// Worse than either of those alone: a **fresh `OutputDamageTracker` every
+/// call** defeats incremental damage tracking entirely for this whole
+/// offscreen step, regardless of the per-element damage fed into it —
+/// `OutputDamageTracker::render_output` only skips redrawing a region it
+/// already believes is correct, and a tracker with no history believes
+/// nothing yet. That's why `render_output` itself dominated the profile
+/// (~30% of samples, real GPU draw calls underneath it): every element
+/// `content_elements` returns was being fully redrawn into this buffer on
+/// every single frame, not just the frames where something in it actually
+/// changed.
+///
+/// Rebuilt only when `size`/`scale` genuinely change (output resize/
+/// rescale — rare, effectively never at runtime per `State::output_scale`'s
+/// own doc comment) rather than every call, the same way the real output
+/// and `ConsoleHut::space_output` already avoid rebuilding themselves every
+/// frame.
+struct NormalContentTarget {
+    // Never read directly, but load-bearing: `OutputDamageTracker::from_output`
+    // (`.../backend/renderer/damage/mod.rs`) stores only a *weak* handle to
+    // the `Output` it's given (`output.downgrade()`), on the assumption
+    // that whoever built the tracker keeps the real `Output` alive
+    // elsewhere for as long as the tracker itself lives. This field is that
+    // "elsewhere" — dropping it (or never storing it here to begin with)
+    // would silently degrade every future `render_output` call once the
+    // weak handle stops upgrading.
+    #[allow(dead_code)]
+    output: Output,
+    texture: GlesTexture,
+    tracker: OutputDamageTracker,
+    size: (i32, i32),
+    scale: f64,
+}
+
 /// Whichever content this tick's focused view actually shows — a
 /// Tile-Hut's panes, the terminal, or the focused Console Hut's own
 /// `space` — built the same way each of `build_frame_elements`'s three
@@ -348,45 +398,60 @@ fn composite_normal_content(
     }
     let scale = state.output_scale();
     let elements = content_elements(state, renderer);
-
-    // Real scale, not `1.0` — see `synthetic_output`'s doc comment: this is
-    // the one caller that hands its output straight to
-    // `OutputDamageTracker::render_output` rather than a `Space`, so this
-    // scale is what turns each element's own baked-in integer buffer scale
-    // back into its correct on-screen size. Getting this wrong silently
-    // shrinks (or grows) everything composited through it on any real,
-    // non-1.0-scale output.
-    let offscreen_output = synthetic_output("normal-content", size, scale);
-    let fourcc = Fourcc::Argb8888;
     let buffer_size: smithay::utils::Size<i32, Buffer> = size.into();
-    let mut texture = Offscreen::<GlesTexture>::create_buffer(renderer, fourcc, buffer_size)
-        .inspect_err(|err| tracing::warn!("failed to create offscreen buffer for normal content: {err}"))
-        .ok()?;
-    let mut target = renderer
-        .bind(&mut texture)
-        .inspect_err(|err| tracing::warn!("failed to bind offscreen buffer for normal content: {err}"))
-        .ok()?;
-    let mut tracker = OutputDamageTracker::from_output(&offscreen_output);
-    tracker
-        .render_output(renderer, &mut target, 0, &elements, [0.0, 0.0, 0.0, 0.0])
-        .inspect_err(|err| tracing::warn!("failed to render normal content offscreen: {err}"))
-        .ok()?;
-    drop(target);
 
-    // A real, persistent damage snapshot — see `with_normal_content_damage`'s
-    // doc comment for why a fresh `DamageBag::default()` built right here
-    // (an earlier version of this function did exactly that) is wrong, not
-    // just redundant. Unconditionally marking the whole buffer damaged on
-    // every call (rather than tracking finer-grained damage) is still
-    // correct, not just simplest: this function only ever runs during an
-    // actual demand-driven redraw pass to begin with (Phase 2.6's
-    // damage-avoidance discipline lives one level up, in whatever decided
-    // to ping `redraw_ping`), so by the time it's called, something real
-    // already triggered it.
-    let snapshot = with_normal_content_damage(|damage| {
-        damage.add([Rectangle::from_size(buffer_size)]);
-        damage.snapshot()
-    });
+    thread_local! {
+        static TARGET: RefCell<Option<NormalContentTarget>> = const { RefCell::new(None) };
+    }
+
+    let (texture, snapshot) = TARGET.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let stale = !matches!(slot.as_ref(), Some(t) if t.size == size && t.scale == scale);
+        if stale {
+            // Real scale, not `1.0` — see `synthetic_output`'s doc comment:
+            // this is the one caller that hands its output straight to
+            // `OutputDamageTracker::render_output` rather than a `Space`,
+            // so this scale is what turns each element's own baked-in
+            // integer buffer scale back into its correct on-screen size.
+            // Getting this wrong silently shrinks (or grows) everything
+            // composited through it on any real, non-1.0-scale output.
+            let output = synthetic_output("normal-content", size, scale);
+            let texture = Offscreen::<GlesTexture>::create_buffer(renderer, Fourcc::Argb8888, buffer_size)
+                .inspect_err(|err| tracing::warn!("failed to create offscreen buffer for normal content: {err}"))
+                .ok()?;
+            let tracker = OutputDamageTracker::from_output(&output);
+            *slot = Some(NormalContentTarget { output, texture, tracker, size, scale });
+        }
+        let target = slot.as_mut().expect("just ensured Some above");
+
+        let mut bound = renderer
+            .bind(&mut target.texture)
+            .inspect_err(|err| tracing::warn!("failed to bind offscreen buffer for normal content: {err}"))
+            .ok()?;
+        target
+            .tracker
+            .render_output(renderer, &mut bound, 0, &elements, [0.0, 0.0, 0.0, 0.0])
+            .inspect_err(|err| tracing::warn!("failed to render normal content offscreen: {err}"))
+            .ok()?;
+        drop(bound);
+
+        // A real, persistent damage snapshot — see `with_normal_content_damage`'s
+        // doc comment for why a fresh `DamageBag::default()` built right
+        // here (an earlier version of this function did exactly that) is
+        // wrong, not just redundant. Unconditionally marking the whole
+        // buffer damaged on every call (rather than tracking finer-grained
+        // damage) is still correct, not just simplest: this function only
+        // ever runs during an actual demand-driven redraw pass to begin
+        // with (Phase 2.6's damage-avoidance discipline lives one level
+        // up, in whatever decided to ping `redraw_ping`), so by the time
+        // it's called, something real already triggered it.
+        let snapshot = with_normal_content_damage(|damage| {
+            damage.add([Rectangle::from_size(buffer_size)]);
+            damage.snapshot()
+        });
+
+        Some((target.texture.clone(), snapshot))
+    })?;
 
     Some(CompositedTexture::new(normal_content_id(), texture, scale, snapshot))
 }
@@ -650,7 +715,21 @@ fn build_tile_elements(
     }
 
     let (_, _, area_w, area_h) = area;
-    let pane_output = synthetic_output("tile-hut-space", (area_w, area_h), 1.0);
+    // Cached rather than rebuilt every call — same reasoning as
+    // `NormalContentTarget`'s doc comment (a fresh `Output` every frame
+    // means a real allocation plus a Debug-formatted `tracing::info!` span
+    // on every single Tile-Hut frame); this one has no GL texture or damage
+    // tracker riding on it, just the `Output` itself.
+    thread_local! {
+        static PANE_OUTPUT: RefCell<Option<(Output, (i32, i32))>> = const { RefCell::new(None) };
+    }
+    let pane_output = PANE_OUTPUT.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if !matches!(slot.as_ref(), Some((_, size)) if *size == (area_w, area_h)) {
+            *slot = Some((synthetic_output("tile-hut-space", (area_w, area_h), 1.0), (area_w, area_h)));
+        }
+        slot.as_ref().expect("just ensured Some above").0.clone()
+    });
     let mut pane_space = Space::<HutSpaceElement>::default();
     pane_space.map_output(&pane_output, (0, 0));
     for ((child, _), (x, y, _, _)) in tile.children.iter_mut().zip(rects) {
