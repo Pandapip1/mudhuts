@@ -263,7 +263,7 @@ pub(crate) struct Inner {
     /// these) — without this, every single render pass would re-upload
     /// the same pixel data to a fresh GPU texture even when the cursor's
     /// visible frame hasn't changed since the last one.
-    pointer_image_cache: Vec<(xcursor::parser::Image, MemoryRenderBuffer)>,
+    pointer_image_cache: Vec<((CursorIcon, usize), MemoryRenderBuffer)>,
     /// Connectors currently classified as leasable (see the module doc's
     /// DRM-leasing section) together with the CRTC `rescan_connectors`
     /// found for them. Never gets a desktop `Output`/`SurfaceData` entry
@@ -1352,7 +1352,7 @@ fn build_cursor_elements(
     renderer: &mut GlesRenderer,
     pointer_images: &mut HashMap<CursorIcon, Cursor>,
     pointer_element: &mut PointerElement,
-    pointer_image_cache: &mut Vec<(xcursor::parser::Image, MemoryRenderBuffer)>,
+    pointer_image_cache: &mut Vec<((CursorIcon, usize), MemoryRenderBuffer)>,
     output_index: usize,
 ) -> Vec<Elements> {
     // A client's cursor surface can be destroyed without the client ever
@@ -1392,10 +1392,22 @@ fn build_cursor_elements(
         CursorImageStatus::Named(icon) => {
             let pointer_image = pointer_images.entry(*icon).or_insert_with(|| Cursor::load(*icon));
             match pointer_image.frame(scale_int as u32, state.start_time.elapsed()) {
-                Some(image) => {
+                Some((frame_index, image)) => {
+                    // Cache key is `(icon, frame_index)` — a cheap
+                    // identity, not `Image`'s own `PartialEq`, which
+                    // includes the raw pixel buffer
+                    // (`pixels_rgba`/`pixels_argb`) and did a byte-for-
+                    // byte comparison against every cached entry on
+                    // essentially every redraw while a named cursor was
+                    // showing (pointer motion alone triggers one). Safe
+                    // because `Cursor::icons` (`cursor.rs`) is a fixed
+                    // list built once at `Cursor::load` time and never
+                    // mutated afterward, so a given `(icon, frame_index)`
+                    // always names the same frame for this session.
+                    let key = (*icon, frame_index);
                     let buffer = pointer_image_cache
                         .iter()
-                        .find(|(cached, _)| cached == image)
+                        .find(|(cached, _)| *cached == key)
                         .map(|(_, buffer)| buffer.clone())
                         .unwrap_or_else(|| {
                             let buffer = MemoryRenderBuffer::from_slice(
@@ -1406,7 +1418,7 @@ fn build_cursor_elements(
                                 Transform::Normal,
                                 None,
                             );
-                            pointer_image_cache.push((image.clone(), buffer.clone()));
+                            pointer_image_cache.push((key, buffer.clone()));
                             buffer
                         });
                     pointer_element.set_buffer(buffer);

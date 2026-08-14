@@ -124,41 +124,48 @@ impl Cursor {
         Self { icons, size }
     }
 
-    /// The frame to show at `time` for the given output `scale`, or
-    /// `None` if this `Cursor` has no icons at all — shouldn't happen
-    /// (`load` always ensures at least the fallback is present), but
-    /// stays skip-and-log-safe rather than assuming that invariant.
-    pub fn frame(&self, scale: u32, time: Duration) -> Option<&Image> {
+    /// The frame to show at `time` for the given output `scale` — its
+    /// index within this `Cursor`'s own fixed `icons` list alongside the
+    /// image itself, so callers can cheaply cache render buffers keyed by
+    /// `(icon, index)` instead of comparing full `Image`s (which include
+    /// their raw pixel buffers — see `udev_backend.rs`'s
+    /// `pointer_image_cache`). `None` if this `Cursor` has no icons at
+    /// all — shouldn't happen (`load` always ensures at least the
+    /// fallback is present), but stays skip-and-log-safe rather than
+    /// assuming that invariant.
+    pub fn frame(&self, scale: u32, time: Duration) -> Option<(usize, &Image)> {
         frame(time.as_millis() as u32, self.size * scale, &self.icons)
     }
 }
 
-fn nearest_images(size: u32, images: &[Image]) -> Vec<&Image> {
-    let Some(nearest) = images
+fn nearest_images(size: u32, images: &[Image]) -> Vec<(usize, &Image)> {
+    let Some((_, nearest)) = images
         .iter()
-        .min_by_key(|image| (size as i32 - image.size as i32).abs())
+        .enumerate()
+        .min_by_key(|(_, image)| (size as i32 - image.size as i32).abs())
     else {
         return Vec::new();
     };
     images
         .iter()
-        .filter(|image| image.width == nearest.width && image.height == nearest.height)
+        .enumerate()
+        .filter(|(_, image)| image.width == nearest.width && image.height == nearest.height)
         .collect()
 }
 
-fn frame(mut millis: u32, size: u32, images: &[Image]) -> Option<&Image> {
+fn frame(mut millis: u32, size: u32, images: &[Image]) -> Option<(usize, &Image)> {
     let candidates = nearest_images(size, images);
     if candidates.is_empty() {
         return None;
     }
-    let total: u32 = candidates.iter().map(|image| image.delay).sum();
+    let total: u32 = candidates.iter().map(|(_, image)| image.delay).sum();
     if total == 0 {
         return candidates.first().copied();
     }
     millis %= total;
-    for image in &candidates {
+    for &(idx, image) in &candidates {
         if millis < image.delay {
-            return Some(image);
+            return Some((idx, image));
         }
         millis -= image.delay;
     }
