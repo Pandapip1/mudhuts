@@ -1,40 +1,31 @@
-//! `org.freedesktop.impl.portal.ScreenCast` — **the D-Bus session/method
-//! surface is real**: `CreateSession` and `SelectSources` genuinely track
-//! per-session state, and every session exports a working
-//! `org.freedesktop.impl.portal.Session` object at its `session_handle`
-//! path, so `Session.Close()` and the `Closed` signal behave correctly
-//! and sessions don't leak.
+//! `org.freedesktop.impl.portal.ScreenCast` — the D-Bus session/method
+//! surface: `CreateSession` and `SelectSources` track per-session state,
+//! every session exports a working `org.freedesktop.impl.portal.Session`
+//! object at its `session_handle` path (so `Session.Close()` and the
+//! `Closed` signal behave correctly and sessions don't leak), and
+//! `Start` spawns a real `pipewire_stream` producer, waits for it to
+//! reach PipeWire's `Paused` state, and returns its node id in the
+//! `streams` result — the actual video frames arrive over that PipeWire
+//! node from then on, fed by `pipewire_stream::run`'s `process` callback
+//! pulling from `wayland.rs`'s continuous capture session.
 //!
-//! **`Start` is where this is honestly incomplete.** Real screen-sharing
-//! clients (browsers, video call apps) expect the actual video frames
-//! delivered over a PipeWire stream — `Start`'s success reply is supposed
-//! to hand back a PipeWire node id the caller then connects to. Producing
-//! one for real means running a PipeWire stream/loop in this process (the
-//! `pipewire` crate), which needs libpipewire's development headers and
-//! pkg-config files at build time. Those aren't present in this repo's
-//! Nix flake devShell (`flake.nix`'s `buildInputs`/`nativeBuildInputs`
-//! have no `pipewire`/`pipewire.dev`) — adding them is a one-line flake
-//! change, but the brief for this pass was explicit that the flake is a
-//! shared file to flag rather than edit unilaterally, so it's flagged
-//! here and in the top-level report instead.
-//!
-//! Rather than fabricate a node id that would produce a stream with no
-//! actual frames behind it (indistinguishable, from the caller's side,
-//! from "it's about to start" — exactly the kind of silent-failure this
-//! project's conventions call out), `Start` fails outright (portal
-//! response code `2`, "other error") after logging why. Every caller gets
-//! a real, immediate, honest error instead of a screen share that looks
-//! like it started and never shows anything. Wiring up the PipeWire
-//! producer once the dependency is available is a self-contained follow-up
-//! — `CreateSession`/`SelectSources`/the `Session` object don't need to
-//! change at all for it.
+//! Scope carried over from `screenshot.rs`: single monitor source only
+//! (no per-window capture, no picker), fixed resolution for the whole
+//! session (mudhuts doesn't support resizing a stream mid-flight), no
+//! cursor compositing (`available_cursor_modes` only ever advertises
+//! `HIDDEN`).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
+use tokio::sync::{mpsc, oneshot};
 use zbus::interface;
 use zbus::object_server::SignalEmitter;
-use zbus::zvariant::{OwnedObjectPath, OwnedValue};
+use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
+
+use crate::pipewire_stream::{self, PwCast};
+use crate::wayland;
 
 mod response {
     pub const SUCCESS: u32 = 0;
@@ -52,16 +43,17 @@ mod cursor_mode {
 }
 
 /// Per-session bookkeeping, keyed by the session's own object path (the
-/// `session_handle` the frontend chose in `CreateSession`). Recorded for
-/// real even though `Start` can't act on it yet, so that landing PipeWire
-/// support later is just teaching `Start` to read this map — no session
-/// lifecycle rework needed.
+/// `session_handle` the frontend chose in `CreateSession`). `cast` is
+/// `Some` only between a successful `Start` and the session closing —
+/// `SessionImpl::close` (and a repeat `Start`, though that's rejected
+/// rather than restarted) is what tears it down.
 #[derive(Default)]
 struct SessionState {
     #[allow(dead_code)]
     source_types: u32,
     #[allow(dead_code)]
     cursor_mode: u32,
+    cast: Option<PwCast>,
 }
 
 type Sessions = Arc<Mutex<HashMap<OwnedObjectPath, SessionState>>>;
@@ -76,17 +68,12 @@ fn lock(sessions: &Sessions) -> MutexGuard<'_, HashMap<OwnedObjectPath, SessionS
 
 pub struct ScreenCastBackend {
     sessions: Sessions,
+    jobs: mpsc::UnboundedSender<wayland::Job>,
 }
 
 impl ScreenCastBackend {
-    pub fn new() -> Self {
-        Self { sessions: Arc::new(Mutex::new(HashMap::new())) }
-    }
-}
-
-impl Default for ScreenCastBackend {
-    fn default() -> Self {
-        Self::new()
+    pub fn new(jobs: mpsc::UnboundedSender<wayland::Job>) -> Self {
+        Self { sessions: Arc::new(Mutex::new(HashMap::new())), jobs }
     }
 }
 
@@ -127,6 +114,7 @@ impl ScreenCastBackend {
         let session_object = SessionImpl {
             path: session_handle.clone(),
             sessions: self.sessions.clone(),
+            jobs: self.jobs.clone(),
         };
         if let Err(err) = object_server.at(session_handle.clone(), session_object).await {
             tracing::warn!("mudhuts-portal: failed to export the Session object at {session_handle}: {err}");
@@ -168,16 +156,93 @@ impl ScreenCastBackend {
         _parent_window: String,
         _options: HashMap<String, OwnedValue>,
     ) -> zbus::fdo::Result<(u32, HashMap<String, OwnedValue>)> {
-        if !lock(&self.sessions).contains_key(&session_handle) {
-            tracing::warn!("mudhuts-portal: Start for an unknown session {session_handle}");
-            return Ok((response::OTHER_ERROR, HashMap::new()));
+        match lock(&self.sessions).get(&session_handle) {
+            None => {
+                tracing::warn!("mudhuts-portal: Start for an unknown session {session_handle}");
+                return Ok((response::OTHER_ERROR, HashMap::new()));
+            }
+            Some(session) if session.cast.is_some() => {
+                tracing::warn!("mudhuts-portal: Start called twice for session {session_handle}");
+                return Ok((response::OTHER_ERROR, HashMap::new()));
+            }
+            Some(_) => {}
         }
 
-        tracing::warn!(
-            "mudhuts-portal: ScreenCast.Start refused for session {session_handle} — no PipeWire frame \
-             delivery is wired up in this build (see screencast.rs's module doc for exactly why)"
-        );
-        Ok((response::OTHER_ERROR, HashMap::new()))
+        let (size_tx, size_rx) = oneshot::channel();
+        if self.jobs.send(wayland::Job::StartCapture(size_tx)).is_err() {
+            tracing::error!("mudhuts-portal: the Wayland capture thread is gone, can't start a screencast");
+            return Ok((response::OTHER_ERROR, HashMap::new()));
+        }
+        let (width, height) = match size_rx.await {
+            Ok(Ok(size)) => size,
+            Ok(Err(err)) => {
+                tracing::warn!("mudhuts-portal: failed to start screencast capture: {err}");
+                return Ok((response::OTHER_ERROR, HashMap::new()));
+            }
+            Err(_) => {
+                tracing::error!("mudhuts-portal: the Wayland capture thread dropped the reply channel");
+                return Ok((response::OTHER_ERROR, HashMap::new()));
+            }
+        };
+
+        let (cast, node_id_rx) = pipewire_stream::start(width, height, self.jobs.clone());
+
+        let node_id = match tokio::time::timeout(Duration::from_secs(5), node_id_rx).await {
+            Ok(Ok(Ok(id))) => id,
+            Ok(Ok(Err(err))) => {
+                tracing::warn!("mudhuts-portal: screencast PipeWire stream failed to start: {err}");
+                cast.stop();
+                let _ = self.jobs.send(wayland::Job::StopCapture);
+                return Ok((response::OTHER_ERROR, HashMap::new()));
+            }
+            Ok(Err(_)) => {
+                tracing::warn!("mudhuts-portal: screencast PipeWire thread dropped the node id channel");
+                let _ = self.jobs.send(wayland::Job::StopCapture);
+                return Ok((response::OTHER_ERROR, HashMap::new()));
+            }
+            Err(_) => {
+                tracing::warn!("mudhuts-portal: timed out waiting for the screencast PipeWire stream to start");
+                cast.stop();
+                let _ = self.jobs.send(wayland::Job::StopCapture);
+                return Ok((response::OTHER_ERROR, HashMap::new()));
+            }
+        };
+
+        {
+            let mut sessions = lock(&self.sessions);
+            match sessions.get_mut(&session_handle) {
+                Some(session) => session.cast = Some(cast),
+                None => {
+                    // The session closed while Start was in flight.
+                    cast.stop();
+                    let _ = self.jobs.send(wayland::Job::StopCapture);
+                    return Ok((response::OTHER_ERROR, HashMap::new()));
+                }
+            }
+        }
+
+        let size_value: OwnedValue = match Value::from((width as i32, height as i32)).try_into() {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::error!("mudhuts-portal: failed to encode the screencast stream size: {err}");
+                return Ok((response::OTHER_ERROR, HashMap::new()));
+            }
+        };
+        let mut stream_props: HashMap<String, OwnedValue> = HashMap::new();
+        stream_props.insert("source_type".to_string(), OwnedValue::from(source_type::MONITOR));
+        stream_props.insert("size".to_string(), size_value);
+        let streams: Vec<(u32, HashMap<String, OwnedValue>)> = vec![(node_id, stream_props)];
+
+        let streams_value: OwnedValue = match Value::from(streams).try_into() {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::error!("mudhuts-portal: failed to encode the screencast streams result: {err}");
+                return Ok((response::OTHER_ERROR, HashMap::new()));
+            }
+        };
+        let mut results = HashMap::new();
+        results.insert("streams".to_string(), streams_value);
+        Ok((response::SUCCESS, results))
     }
 }
 
@@ -187,6 +252,7 @@ impl ScreenCastBackend {
 struct SessionImpl {
     path: OwnedObjectPath,
     sessions: Sessions,
+    jobs: mpsc::UnboundedSender<wayland::Job>,
 }
 
 #[interface(name = "org.freedesktop.impl.portal.Session")]
@@ -201,7 +267,12 @@ impl SessionImpl {
         #[zbus(object_server)] object_server: &zbus::ObjectServer,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
-        lock(&self.sessions).remove(&self.path);
+        if let Some(session) = lock(&self.sessions).remove(&self.path)
+            && let Some(cast) = session.cast
+        {
+            cast.stop();
+            let _ = self.jobs.send(wayland::Job::StopCapture);
+        }
         if let Err(err) = Self::closed(&emitter).await {
             tracing::warn!("mudhuts-portal: failed to emit Session.Closed for {}: {err}", self.path);
         }

@@ -42,12 +42,20 @@ pub struct CapturedImage {
     pub rgba: Vec<u8>,
 }
 
-/// Work submitted from the async D-Bus side to the Wayland thread. Only
-/// one kind of job exists so far (Screenshot); ScreenCast doesn't need
-/// one yet since it never gets far enough to touch Wayland at all — see
-/// `screencast.rs`'s module doc.
+/// Work submitted from the async D-Bus side to the Wayland thread.
+/// `Screenshot` is one-shot; the `*Capture` jobs manage a single
+/// long-lived [`CastSession`] for `screencast.rs`'s continuous PipeWire
+/// producer — `StartCapture` creates it (returning the fixed
+/// width/height frames will come in at), `CaptureFrame` pulls the next
+/// frame from it (called once per `pipewire_stream`'s `process`
+/// callback), and `StopCapture` tears it down. At most one capture
+/// session exists at a time, matching mudhuts being single-output and
+/// this backend only ever handling one active ScreenCast session.
 pub enum Job {
     Screenshot(oneshot::Sender<Result<CapturedImage, String>>),
+    StartCapture(oneshot::Sender<Result<(u32, u32), String>>),
+    CaptureFrame(oneshot::Sender<Result<CapturedImage, String>>),
+    StopCapture,
 }
 
 /// Everything the Wayland thread binds once at startup and reuses for
@@ -59,6 +67,29 @@ struct AppState {
     shm: Option<wl_shm::WlShm>,
     source_manager: Option<ExtOutputImageCaptureSourceManagerV1>,
     capture_manager: Option<ExtImageCopyCaptureManagerV1>,
+    /// The one live continuous-capture session, if `StartCapture` has run
+    /// and `StopCapture` hasn't yet — see [`Job`]'s doc.
+    cast: Option<CastSession>,
+}
+
+/// A long-lived `ext_image_copy_capture_session_v1` plus the one SHM
+/// buffer every frame captures into. Reusing the same session and buffer
+/// across many `CaptureFrame` jobs (rather than the create-session/
+/// create-buffer/destroy-everything dance `capture_once` does per shot)
+/// is what makes per-frame capture cheap enough to drive a video stream:
+/// only a per-frame `create_frame`/`capture` round trip is needed, no
+/// buffer reallocation. Safe to keep reading `mmap` after each capture
+/// completes since `memmap2::Mmap::map` is a `MAP_SHARED` mapping — it
+/// reflects whatever the compositor most recently wrote into the
+/// underlying file, no remap needed between frames.
+struct CastSession {
+    source: ExtImageCaptureSourceV1,
+    session: ExtImageCopyCaptureSessionV1,
+    width: u32,
+    height: u32,
+    format: wl_shm::Format,
+    buffer: wl_buffer::WlBuffer,
+    mmap: memmap2::Mmap,
 }
 
 #[derive(Default)]
@@ -168,8 +199,18 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// hanging on a channel nothing will ever answer.
 fn drain_with_error(mut jobs: mpsc::UnboundedReceiver<Job>, err: String) {
     while let Some(job) = jobs.blocking_recv() {
-        let Job::Screenshot(reply) = job;
-        let _ = reply.send(Err(err.clone()));
+        match job {
+            Job::Screenshot(reply) => {
+                let _ = reply.send(Err(err.clone()));
+            }
+            Job::StartCapture(reply) => {
+                let _ = reply.send(Err(err.clone()));
+            }
+            Job::CaptureFrame(reply) => {
+                let _ = reply.send(Err(err.clone()));
+            }
+            Job::StopCapture => {}
+        }
     }
 }
 
@@ -204,6 +245,7 @@ pub fn run(jobs: mpsc::UnboundedReceiver<Job>) {
         shm: bind_optional(&globals, &qh, "wl_shm"),
         source_manager: bind_optional(&globals, &qh, "ext_output_image_capture_source_manager_v1"),
         capture_manager: bind_optional(&globals, &qh, "ext_image_copy_capture_manager_v1"),
+        cast: None,
     };
 
     if let Err(err) = event_queue.roundtrip(&mut state) {
@@ -221,6 +263,27 @@ pub fn run(jobs: mpsc::UnboundedReceiver<Job>) {
                     tracing::warn!("mudhuts-portal: screenshot capture failed: {err}");
                 }
                 let _ = reply.send(result);
+            }
+            Job::StartCapture(reply) => {
+                let result = start_capture(&mut state, &mut event_queue, &qh);
+                if let Err(ref err) = result {
+                    tracing::warn!("mudhuts-portal: failed to start a capture session: {err}");
+                }
+                let _ = reply.send(result);
+            }
+            Job::CaptureFrame(reply) => {
+                let result = capture_next_frame(&mut state, &mut event_queue, &qh);
+                if let Err(ref err) = result {
+                    tracing::warn!("mudhuts-portal: failed to capture a frame: {err}");
+                }
+                let _ = reply.send(result);
+            }
+            Job::StopCapture => {
+                if let Some(cast) = state.cast.take() {
+                    cast.buffer.destroy();
+                    cast.session.destroy();
+                    cast.source.destroy();
+                }
             }
         }
     }
@@ -345,6 +408,130 @@ fn capture_once(
     session.destroy();
     source.destroy();
 
+    Ok(CapturedImage { width, height, rgba })
+}
+
+/// Creates the long-lived session + SHM buffer a stream of `CaptureFrame`
+/// jobs will reuse — everything `capture_once` does up through buffer
+/// allocation, minus the per-shot frame capture and minus tearing any of
+/// it down afterward. Returns the fixed `(width, height)` every
+/// subsequent frame will come in at. Fails if a session is already
+/// active — `screencast.rs` never starts a second one without stopping
+/// the first (mudhuts is single-output, so there's nothing a second
+/// session could target differently anyway).
+fn start_capture(
+    state: &mut AppState,
+    event_queue: &mut EventQueue<AppState>,
+    qh: &QueueHandle<AppState>,
+) -> Result<(u32, u32), String> {
+    if state.cast.is_some() {
+        return Err("a capture session is already active".to_string());
+    }
+
+    let output = state.output.clone().ok_or("no wl_output available")?;
+    let source_manager = state
+        .source_manager
+        .clone()
+        .ok_or("ext_output_image_capture_source_manager_v1 not available — is this running under mudhuts?")?;
+    let capture_manager = state
+        .capture_manager
+        .clone()
+        .ok_or("ext_image_copy_capture_manager_v1 not available — is this running under mudhuts?")?;
+    let shm = state.shm.clone().ok_or("wl_shm not available")?;
+
+    let source = source_manager.create_source(&output, qh, ());
+    let session_data = Arc::new(Mutex::new(SessionCapture::default()));
+    let session = capture_manager.create_session(
+        &source,
+        ext_image_copy_capture_manager_v1::Options::empty(),
+        qh,
+        session_data.clone(),
+    );
+
+    loop {
+        event_queue
+            .blocking_dispatch(state)
+            .map_err(|err| format!("Wayland dispatch error while awaiting capture constraints: {err}"))?;
+        let s = lock(&session_data);
+        if s.stopped {
+            return Err("capture session stopped before buffer constraints arrived".to_string());
+        }
+        if s.done {
+            break;
+        }
+    }
+
+    let (width, height, format) = {
+        let s = lock(&session_data);
+        let format = s
+            .shm_format
+            .ok_or("compositor advertised no SHM format for this capture session")?;
+        if s.width == 0 || s.height == 0 {
+            return Err("compositor advertised a zero-sized capture buffer".to_string());
+        }
+        (s.width, s.height, format)
+    };
+
+    let stride = width * 4;
+    let size = (stride as u64) * (height as u64);
+
+    let file = tempfile::tempfile().map_err(|err| format!("failed to create an SHM backing file: {err}"))?;
+    file.set_len(size)
+        .map_err(|err| format!("failed to size the SHM backing file: {err}"))?;
+    let pool = shm.create_pool(file.as_fd(), size as i32, qh, ());
+    let buffer = pool.create_buffer(0, width as i32, height as i32, stride as i32, format, qh, ());
+    pool.destroy();
+
+    // Safety: same reasoning as `capture_once` — this is a plain,
+    // fully-sized regular file this process owns exclusively, mapped
+    // `MAP_SHARED` so it keeps reflecting whatever the compositor writes
+    // into it on every subsequent capture.
+    let mmap = unsafe { memmap2::Mmap::map(&file) }
+        .map_err(|err| format!("failed to map the SHM buffer for readback: {err}"))?;
+
+    state.cast = Some(CastSession { source, session, width, height, format, buffer, mmap });
+    Ok((width, height))
+}
+
+/// Captures exactly one more frame on the session `start_capture`
+/// created — the steady-state operation `pipewire_stream`'s `process`
+/// callback drives once per PipeWire graph cycle. Reuses the same SHM
+/// buffer every time; safe because each call fully waits for `Ready`
+/// (compositor done writing) before reading it, and the previous frame
+/// object is destroyed before the caller could plausibly still be
+/// reading stale data from it.
+fn capture_next_frame(
+    state: &mut AppState,
+    event_queue: &mut EventQueue<AppState>,
+    qh: &QueueHandle<AppState>,
+) -> Result<CapturedImage, String> {
+    let (session, buffer, width, height, format) = {
+        let cast = state.cast.as_ref().ok_or("no active capture session")?;
+        (cast.session.clone(), cast.buffer.clone(), cast.width, cast.height, cast.format)
+    };
+
+    let frame_data = Arc::new(Mutex::new(FrameCapture::default()));
+    let frame = session.create_frame(qh, frame_data.clone());
+    frame.attach_buffer(&buffer);
+    frame.damage_buffer(0, 0, width as i32, height as i32);
+    frame.capture();
+
+    loop {
+        event_queue
+            .blocking_dispatch(state)
+            .map_err(|err| format!("Wayland dispatch error while awaiting the captured frame: {err}"))?;
+        let f = lock(&frame_data);
+        if let Some(reason) = &f.failed {
+            return Err(reason.clone());
+        }
+        if f.ready {
+            break;
+        }
+    }
+    frame.destroy();
+
+    let cast = state.cast.as_ref().ok_or("capture session disappeared mid-frame")?;
+    let rgba = convert_to_rgba(&cast.mmap, width, height, width * 4, format)?;
     Ok(CapturedImage { width, height, rgba })
 }
 

@@ -26,6 +26,7 @@
           fontconfig
           freetype
           pixman
+          pipewire
         ];
       in
       {
@@ -39,6 +40,14 @@
             rust-analyzer
             clippy
             rustfmt
+            # `libspa-sys`'s build script (part of `mudhuts-portal`'s
+            # `pipewire` dependency) uses `bindgen` to generate FFI
+            # bindings from PipeWire/SPA's C headers — this is nixpkgs'
+            # standard hook for that, setting up `LIBCLANG_PATH` and
+            # `BINDGEN_EXTRA_CLANG_ARGS` (glibc's own include path) so
+            # clang can find both libclang itself and the standard C
+            # headers it needs to parse the wrapper header.
+            rustPlatform.bindgenHook
           ];
 
           buildInputs = with pkgs; [
@@ -56,6 +65,7 @@
             fontconfig
             freetype
             pixman
+            pipewire
           ];
 
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibs;

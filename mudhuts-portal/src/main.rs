@@ -13,11 +13,10 @@
 //! - **Screenshot** (`screenshot.rs`) — complete for the scope of this
 //!   pass: whole-output only, no interactive picker, via
 //!   `ext-image-copy-capture-v1`.
-//! - **ScreenCast** (`screencast.rs`) — the D-Bus session lifecycle
-//!   (`CreateSession`/`SelectSources`, plus a real `Session` object) is
-//!   genuinely implemented, but `Start` always fails: no PipeWire frame
-//!   delivery is wired up (see `screencast.rs`'s module doc for exactly
-//!   why, and what's needed to finish it).
+//! - **ScreenCast** (`screencast.rs`) — complete: `Start` spawns a real
+//!   `pipewire_stream` producer (single monitor source, fixed
+//!   resolution, no cursor compositing) and returns its PipeWire node
+//!   id, matching the interface's contract.
 //!
 //! **FileChooser and every other portal interface are deliberately not
 //! implemented here.** See `mudhuts-portals.conf` and `mudhuts.portal` in
@@ -25,6 +24,7 @@
 //! Settings/Screenshot/ScreenCast to this backend while leaving
 //! FileChooser (and anything else) to an existing GTK/KDE portal backend.
 
+mod pipewire_stream;
 mod screencast;
 mod screenshot;
 mod settings;
@@ -73,8 +73,8 @@ async fn main() -> ExitCode {
 
 async fn start_service(job_tx: mpsc::UnboundedSender<wayland::Job>) -> zbus::Result<zbus::Connection> {
     let settings = settings::SettingsBackend::new();
+    let screencast = screencast::ScreenCastBackend::new(job_tx.clone());
     let screenshot = screenshot::ScreenshotBackend::new(job_tx);
-    let screencast = screencast::ScreenCastBackend::new();
 
     zbus::connection::Builder::session()?
         .name(BUS_NAME)?
