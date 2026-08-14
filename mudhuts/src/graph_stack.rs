@@ -523,19 +523,23 @@ impl GraphStack {
             .hut
     }
 
+    /// Depth-first search for a `ConsoleHut` with this id, rooted at
+    /// `start` — short-circuits on the first match instead of collecting
+    /// every id in the subtree first (unlike `all_node_ids`/
+    /// `all_node_ids_for`), since [`Self::find_mut`]/[`Self::find_mut_for`]
+    /// only ever want one specific node, often via a hot loop (see their
+    /// own doc comments).
+    fn find_console_node(&self, start: NodeId, id: u64) -> Option<NodeId> {
+        if self.graph.downcast::<ConsoleNode>(start).is_some_and(|c| c.hut.id == id) {
+            return Some(start);
+        }
+        self.graph.hut_list_input(start, "children").into_iter().find_map(|child| self.find_console_node(child, id))
+    }
+
     /// Find a `ConsoleHut` by id anywhere in the whole graph, across
     /// every output — mirrors `MruStackHut::find_mut`.
     pub fn find_mut(&mut self, id: u64) -> Option<&mut ConsoleHut> {
-        // No generic "every node id" iterator on `Graph` (nothing else
-        // has needed one) — walking every output's own top-level entries
-        // down through every reachable child is the same reach
-        // `MruStackHut::all_huts`/`find_mut` already have, just phrased
-        // against the graph's own reference tables instead of a `Hut`
-        // tree's owned `Vec`s.
-        let node_id = self
-            .all_node_ids()
-            .into_iter()
-            .find(|&node_id| self.graph.downcast::<ConsoleNode>(node_id).is_some_and(|c| c.hut.id == id))?;
+        let node_id = self.all_top_level_entries().copied().find_map(|top| self.find_console_node(top, id))?;
         Some(&mut self.graph.downcast_mut::<ConsoleNode>(node_id)?.hut)
     }
 
@@ -551,9 +555,9 @@ impl GraphStack {
     /// [`Self::find_mut`] before concluding the Hut actually exited.
     pub fn find_mut_for(&mut self, output_index: usize, id: u64) -> Option<&mut ConsoleHut> {
         let node_id = self
-            .all_node_ids_for(output_index)
-            .into_iter()
-            .find(|&node_id| self.graph.downcast::<ConsoleNode>(node_id).is_some_and(|c| c.hut.id == id))?;
+            .top_level_entries_for(output_index)
+            .copied()
+            .find_map(|top| self.find_console_node(top, id))?;
         Some(&mut self.graph.downcast_mut::<ConsoleNode>(node_id)?.hut)
     }
 
