@@ -153,7 +153,13 @@ pub fn init_winit(
                     // called here anyway (rather than hardcoding
                     // `Vec::new()`) so this starts working automatically
                     // if winit's own renderer-sharing gap is ever closed.
-                    let content = render::resolve_frame_content(state);
+                    // A winit session only ever has one output (index 0) —
+                    // see `GraphStack::begin_frame`'s doc comment for why
+                    // this needs to run once per whole frame regardless of
+                    // output count, now that `resolve_frame_content` itself
+                    // no longer does it internally.
+                    state.stack.begin_frame();
+                    let content = render::resolve_frame_content(state, 0);
 
                     // Scoped so the mutable borrow of `backend` from `bind()`
                     // ends before we need `backend` again below (`submit`,
@@ -173,6 +179,7 @@ pub fn init_winit(
                                 renderer,
                                 (size.w, size.h),
                                 content,
+                                0,
                             );
 
                             match damage_tracker.render_output(

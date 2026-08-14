@@ -38,8 +38,8 @@ type Element = OutputRenderElements<GlesRenderer, HutSpaceRenderElement>;
 /// `winit_backend.rs`, which pushes these ahead of the normal background
 /// elements — index 0 renders on top), or an empty list if no preview
 /// session is open.
-pub fn build(stack: &GraphStack, output_size: (i32, i32), renderer: &GlesRenderer, scale: f64) -> Vec<Element> {
-    if !stack.is_previewing() {
+pub fn build(stack: &GraphStack, output_index: usize, output_size: (i32, i32), renderer: &GlesRenderer, scale: f64) -> Vec<Element> {
+    if !stack.is_previewing_for(output_index) {
         return Vec::new();
     }
 
@@ -54,16 +54,16 @@ pub fn build(stack: &GraphStack, output_size: (i32, i32), renderer: &GlesRendere
     let padding = crate::render::scaled(PADDING, scale);
     let highlight_margin = crate::render::scaled(HIGHLIGHT_MARGIN, scale);
 
-    let count = stack.len().max(1) as i32;
+    let count = stack.len_for(output_index).max(1) as i32;
     let panel_w = count * thumb_w + (count - 1).max(0) * gap + 2 * padding;
     let panel_h = thumb_h + 2 * padding;
     let panel_x = (output_size.0 - panel_w) / 2;
     let panel_y = (output_size.1 - panel_h) / 2;
 
-    let preview_index = stack.preview_index();
+    let preview_index = stack.preview_index_for(output_index);
     let mut elements = Vec::new();
 
-    for (i, &entry) in stack.top_level_entries().enumerate() {
+    for (i, &entry) in stack.top_level_entries_for(output_index).enumerate() {
         let x = panel_x + padding + i as i32 * (thumb_w + gap);
         let y = panel_y + padding;
         let Some(console) = stack.graph().downcast::<ConsoleNode>(stack.graph().focused_leaf(entry)) else {
@@ -144,7 +144,7 @@ pub fn build(stack: &GraphStack, output_size: (i32, i32), renderer: &GlesRendere
     }
 
     let panel = SolidColorRenderElement::new(
-        stack.panel_id(),
+        stack.panel_id_for(output_index),
         Rectangle::<i32, Physical>::new(
             Point::from((panel_x, panel_y)),
             Size::from((panel_w, panel_h)),

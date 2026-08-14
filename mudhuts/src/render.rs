@@ -1,6 +1,5 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::OnceLock;
 
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::damage::OutputDamageTracker;
@@ -279,9 +278,17 @@ pub(crate) fn content_pieces_to_elements(
 /// compositor, matching every other stable-`Id` pattern in this codebase
 /// (see e.g. `ConsoleHut::element_id`'s doc comment) in spirit, just
 /// without an owning struct instance to hang it off of.
-fn normal_content_id() -> Id {
-    static ID: OnceLock<Id> = OnceLock::new();
-    ID.get_or_init(Id::new).clone()
+/// Keyed by output index, not a single global slot — real multi-monitor:
+/// each output composites its own "normal content" into its own wrapper
+/// element, and sharing one `Id`/damage/texture across outputs would
+/// make one output's content silently overwrite or misreport damage for
+/// another's (mirrors [`HutContentTarget`]/[`HUT_CONTENT`]'s own
+/// per-id-keyed shape, just keyed by output index instead of hut id).
+fn normal_content_id(output_index: usize) -> Id {
+    thread_local! {
+        static IDS: RefCell<HashMap<usize, Id>> = RefCell::new(HashMap::new());
+    }
+    IDS.with(|ids| ids.borrow_mut().entry(output_index).or_insert_with(Id::new).clone())
 }
 
 /// Real, persistent damage tracking for [`composite_normal_content`]'s
@@ -312,11 +319,11 @@ fn normal_content_id() -> Id {
 /// and this module's own `ChangeTracker`/`LabelCache` doc comments, which
 /// already state the general rule this violated: "a `CommitCounter` that
 /// never advances means 'never damaged again after the first frame'."
-fn with_normal_content_damage<T>(f: impl FnOnce(&mut DamageBag<i32, Buffer>) -> T) -> T {
+fn with_normal_content_damage<T>(output_index: usize, f: impl FnOnce(&mut DamageBag<i32, Buffer>) -> T) -> T {
     thread_local! {
-        static DAMAGE: RefCell<DamageBag<i32, Buffer>> = RefCell::new(DamageBag::default());
+        static DAMAGE: RefCell<HashMap<usize, DamageBag<i32, Buffer>>> = RefCell::new(HashMap::new());
     }
-    DAMAGE.with(|damage| f(&mut damage.borrow_mut()))
+    DAMAGE.with(|damage| f(damage.borrow_mut().entry(output_index).or_default()))
 }
 
 /// [`composite_normal_content`]'s offscreen render target — the synthetic
@@ -515,12 +522,24 @@ pub(crate) fn hut_thumbnail_texture(id: u64) -> Option<(GlesTexture, DamageSnaps
 /// `composite_normal_content`, itself only called after
 /// `build_frame_elements`'s own locked-session early return) — no reason
 /// to spend a real GPU redraw on content that's never going to be shown.
-pub fn resolve_frame_content(state: &mut State) -> Vec<crate::graph::ContentPiece> {
+///
+/// `output_index` selects *which* output's own independent stack to
+/// resolve — real multi-monitor: each `OutputSlot` shows its own
+/// top-level entry, not necessarily the one the user currently has
+/// input focus on (a backgrounded second monitor still renders its own
+/// live content every frame). `begin_frame()` (clearing the graph's
+/// per-frame memoization cache) is *not* called here — a real multi-
+/// output render pass calls this once per output in the same frame, and
+/// clearing the cache between them would defeat memoization for any
+/// node shared across outputs (none exist yet, but nothing about the
+/// graph model rules it out — see the RFC). Callers driving a whole
+/// frame across every output call [`crate::graph_stack::GraphStack::begin_frame`]
+/// themselves, once, before resolving any of them.
+pub fn resolve_frame_content(state: &mut State, output_index: usize) -> Vec<crate::graph::ContentPiece> {
     if state.locked {
         return Vec::new();
     }
-    let top = state.stack.focused_top_level();
-    state.stack.begin_frame();
+    let top = state.stack.focused_top_level_for(output_index);
     state.stack.resolve_content(top)
 }
 
@@ -545,12 +564,13 @@ fn content_elements(
     state: &mut State,
     renderer: &mut GlesRenderer,
     content: Vec<crate::graph::ContentPiece>,
+    output_index: usize,
 ) -> Vec<Element> {
-    let area = state.usable_area();
-    let scale = state.output_scale();
+    let area = state.usable_area_for(output_index);
+    let scale = state.output_scale_for(output_index);
     let mut elements = content_pieces_to_elements(content, renderer, (area.0 as f64, area.1 as f64), scale);
 
-    let top = state.stack.focused_top_level();
+    let top = state.stack.focused_top_level_for(output_index);
     if let Some(tile) = state.stack.graph().downcast::<crate::graph_nodes::TileNode>(top) {
         let children_len = state.stack.graph().hut_list_input(top, "children").len();
         if children_len >= 2 {
@@ -640,21 +660,25 @@ fn composite_normal_content(
     renderer: &mut GlesRenderer,
     size: (i32, i32),
     content: Vec<crate::graph::ContentPiece>,
+    output_index: usize,
 ) -> Option<CompositedTexture> {
     if size.0 <= 0 || size.1 <= 0 {
         return None;
     }
-    let scale = state.output_scale();
-    let elements = content_elements(state, renderer, content);
+    let scale = state.output_scale_for(output_index);
+    let elements = content_elements(state, renderer, content, output_index);
     let buffer_size: smithay::utils::Size<i32, Buffer> = size.into();
 
+    // Keyed by output index, not a single unkeyed slot — see
+    // `normal_content_id`'s own doc comment for why real multi-monitor
+    // needs this (mirrors `HUT_CONTENT`'s identical per-key shape).
     thread_local! {
-        static TARGET: RefCell<Option<NormalContentTarget>> = const { RefCell::new(None) };
+        static TARGETS: RefCell<HashMap<usize, NormalContentTarget>> = RefCell::new(HashMap::new());
     }
 
-    let (texture, snapshot) = TARGET.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        let stale = !matches!(slot.as_ref(), Some(t) if t.size == size && t.scale == scale);
+    let (texture, snapshot) = TARGETS.with(|cell| {
+        let mut targets = cell.borrow_mut();
+        let stale = !matches!(targets.get(&output_index), Some(t) if t.size == size && t.scale == scale);
         if stale {
             // Real scale, not `1.0` — see `synthetic_output`'s doc comment:
             // this is the one caller that hands its output straight to
@@ -668,9 +692,9 @@ fn composite_normal_content(
                 .inspect_err(|err| tracing::warn!("failed to create offscreen buffer for normal content: {err}"))
                 .ok()?;
             let tracker = OutputDamageTracker::from_output(&output);
-            *slot = Some(NormalContentTarget { output, texture, tracker, size, scale });
+            targets.insert(output_index, NormalContentTarget { output, texture, tracker, size, scale });
         }
-        let target = slot.as_mut().expect("just ensured Some above");
+        let target = targets.get_mut(&output_index).expect("just ensured Some above");
 
         let mut bound = renderer
             .bind(&mut target.texture)
@@ -693,7 +717,7 @@ fn composite_normal_content(
         // with (Phase 2.6's damage-avoidance discipline lives one level
         // up, in whatever decided to ping `redraw_ping`), so by the time
         // it's called, something real already triggered it.
-        let snapshot = with_normal_content_damage(|damage| {
+        let snapshot = with_normal_content_damage(output_index, |damage| {
             damage.add([Rectangle::from_size(buffer_size)]);
             damage.snapshot()
         });
@@ -701,7 +725,7 @@ fn composite_normal_content(
         Some((target.texture.clone(), snapshot))
     })?;
 
-    Some(CompositedTexture::new(normal_content_id(), texture, scale, snapshot))
+    Some(CompositedTexture::new(normal_content_id(output_index), texture, scale, snapshot))
 }
 
 /// Everything mudhuts draws while `state.locked` is set (see
@@ -766,11 +790,19 @@ fn lock_screen_elements(
 /// itself is written once. Backend-specific concerns (binding a
 /// framebuffer, damage tracking vs. DRM's `render_frame`, submitting/
 /// queuing the result) stay in each backend's own module.
+/// `output_index` selects which `OutputSlot` this frame is being built
+/// for — real multi-monitor: chrome/docks/the Alt-Tab popup all show
+/// *that* output's own independent stack state (its own focused entry,
+/// its own preview session), not necessarily whichever output currently
+/// has input focus, since every output renders its own live content
+/// every frame regardless of focus. A single-output session always
+/// passes `0`.
 pub fn build_frame_elements(
     state: &mut State,
     renderer: &mut GlesRenderer,
     size: (i32, i32),
     content: Vec<crate::graph::ContentPiece>,
+    output_index: usize,
 ) -> Vec<OutputRenderElements<GlesRenderer, HutSpaceRenderElement>> {
     // First, always — regardless of what else this frame does (even a
     // locked session below still has a live renderer here): reclaim
@@ -785,7 +817,8 @@ pub fn build_frame_elements(
     // else, not even layered underneath a lock surface — see
     // `handlers/session_lock.rs`'s module doc on why the protocol
     // requires this before it can even tell the client the lock
-    // succeeded.
+    // succeeded. Session lock stays a whole-compositor concept (every
+    // output blanks together), not per-output.
     if state.locked {
         let elements = lock_screen_elements(state, renderer, size);
         // See the matching call at this function's other exit point below.
@@ -793,11 +826,11 @@ pub fn build_frame_elements(
         return elements;
     }
 
-    let show_terminal = state.showing_terminal_effective();
-    let top = state.stack.focused_top_level();
+    let show_terminal = state.showing_terminal_effective_for(output_index);
+    let top = state.stack.focused_top_level_for(output_index);
     let is_tile = state.stack.graph().downcast::<crate::graph_nodes::TileNode>(top).is_some()
         && state.stack.graph().hut_list_input(top, "children").len() >= 2;
-    let scale = state.output_scale();
+    let scale = state.output_scale_for(output_index);
     let mut elements = Vec::new();
 
     // Only the focused ConsoleHut normally gets redrawn (see Phase 2.6's
@@ -810,8 +843,8 @@ pub fn build_frame_elements(
     // `resolve_frame_content` already released its own internal borrow of
     // the same underlying renderer; see that function's doc comment),
     // not another `graph.resolve_output` call.
-    if state.stack.is_previewing() {
-        let top_level: Vec<crate::graph::NodeId> = state.stack.all_top_level_entries().copied().collect();
+    if state.stack.is_previewing_for(output_index) {
+        let top_level: Vec<crate::graph::NodeId> = state.stack.top_level_entries_for(output_index).copied().collect();
         for &top in &top_level {
             let leaf = state.stack.graph().focused_leaf(top);
             if let Some(console) = state.stack.graph_mut().downcast_mut::<crate::graph_nodes::ConsoleNode>(leaf) {
@@ -825,7 +858,7 @@ pub fn build_frame_elements(
         // in sync at all, and its content isn't cheap to get from
         // anywhere else the way `ConsoleHut::redraw`'s terminal texture
         // already is).
-        let (area_x, area_y, _, _) = state.usable_area();
+        let (area_x, area_y, _, _) = state.usable_area_for(output_index);
         for &top in &top_level {
             if !state.stack.shows_terminal_effective(top) {
                 let leaf = state.stack.graph().focused_leaf(top);
@@ -842,7 +875,7 @@ pub fn build_frame_elements(
     // elements in front-to-back order) so the popup sits on top of
     // whatever's below, regardless of whether that's the terminal or a
     // client window; empty when no preview session is open.
-    elements.extend(switcher::build(&state.stack, size, renderer, scale));
+    elements.extend(switcher::build(&state.stack, output_index, size, renderer, scale));
 
     // Tile-Hut (Phase 6) still bypasses the normal single-ConsoleHut
     // chrome/docks pipeline entirely — every pane is visible
@@ -860,8 +893,8 @@ pub fn build_frame_elements(
         // first (see `village_chrome.rs`'s module doc). Empty unless the
         // focused top-level Hut actually is a Tab-Hut with 2+
         // children; `next_y` is unchanged (0) in that case.
-        let cell_w = state.stack.focused().glyphs.cell_width().max(1);
-        let cell_h = state.stack.focused().glyphs.cell_height().max(1) as i32;
+        let cell_w = state.stack.focused_for(output_index).glyphs.cell_width().max(1);
+        let cell_h = state.stack.focused_for(output_index).glyphs.cell_height().max(1) as i32;
         let (village_tab_elements, next_y) = village_chrome::build(
             state.stack.graph_mut(),
             top,
@@ -878,13 +911,13 @@ pub fn build_frame_elements(
         // above it, still on top of the terminal/window content and still
         // below the Alt-Tab popup above. Empty when the focused ConsoleHut has no
         // Main Windows.
-        elements.extend(chrome::build(state.stack.focused_mut(), renderer, next_y, scale, &state.theme));
+        elements.extend(chrome::build(state.stack.focused_mut_for(output_index), renderer, next_y, scale, &state.theme));
 
         // Docked Floating Window handles (Phase 5) — same z-order slot as the tab
         // strip, only shown alongside the Main Window they belong to (never
         // while the terminal itself is the visible view).
         if !show_terminal {
-            elements.extend(docks::build(state.stack.focused_mut(), renderer, size, scale, &state.theme));
+            elements.extend(docks::build(state.stack.focused_mut_for(output_index), renderer, size, scale, &state.theme));
         }
     }
 
@@ -909,8 +942,8 @@ pub fn build_frame_elements(
     // inside it is already positioned in real-output-absolute coordinates,
     // so the canvas it's rendered onto (and where that canvas then lands)
     // has to match that same coordinate range, not a smaller, re-based one.
-    let composited = composite_normal_content(state, renderer, size, content);
-    if let Some(output) = state.output.clone() {
+    let composited = composite_normal_content(state, renderer, size, content, output_index);
+    if let Some(output) = state.stack.outputs().get(output_index).map(|slot| slot.output.clone()) {
         let mut root_space = Space::<HutSpaceElement>::default();
         root_space.map_output(&output, (0, 0));
         if let Some(composited) = composited {

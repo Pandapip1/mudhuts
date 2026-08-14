@@ -592,6 +592,50 @@ impl State {
             .unwrap_or(1.0)
     }
 
+    /// Keeps `self.output`/`self.output_size` (deliberately still singular
+    /// fields — see `GraphStack::focused_output`'s doc comment) matching
+    /// whichever `OutputSlot` currently has input focus. Every one of
+    /// `input.rs`'s chrome/docks/terminal-hit-testing call sites, and the
+    /// handful of protocol-default-output lookups in `handlers/`, reads
+    /// through these two fields rather than `self.stack.outputs()`
+    /// directly — real multi-monitor's own "whatever the user is
+    /// currently interacting with" concern, mirrored by every other plain
+    /// (non-`_for`) accessor in this file. Call after anything that can
+    /// change which output is focused: `GraphStack::set_focused_output`
+    /// (focus-follows-mouse, `input.rs`), and connector connect/disconnect
+    /// (`udev_backend.rs`), which can both change *which* output is
+    /// focused and change that output's own `Output` handle out from
+    /// under an already-focused index.
+    pub fn sync_focused_output(&mut self) {
+        let slot = self.stack.outputs().get(self.stack.focused_output_index());
+        self.output = slot.map(|s| s.output.clone());
+        self.output_size = slot
+            .and_then(|s| s.output.current_mode())
+            .map(|mode| (mode.size.w, mode.size.h))
+            .unwrap_or((0, 0));
+    }
+
+    /// [`Self::output_scale`], for a specific output — see
+    /// [`Self::usable_area_for`]'s doc comment on why real multi-monitor
+    /// needs this alongside the focused-output version.
+    pub fn output_scale_for(&self, output_index: usize) -> f64 {
+        self.stack
+            .outputs()
+            .get(output_index)
+            .map(|slot| slot.output.current_scale().fractional_scale())
+            .unwrap_or(1.0)
+    }
+
+    /// [`Self::real_output_geometry`], for a specific output.
+    pub fn output_size_for(&self, output_index: usize) -> (i32, i32) {
+        self.stack
+            .outputs()
+            .get(output_index)
+            .and_then(|slot| slot.output.current_mode())
+            .map(|mode| (mode.size.w, mode.size.h))
+            .unwrap_or((0, 0))
+    }
+
     /// [`Self::output`]'s geometry — always at `(0, 0)` (mudhuts is
     /// single-output and both backends unconditionally `map_output` there),
     /// so this is really just "the current mode's size, transformed and
@@ -645,6 +689,32 @@ impl State {
         (physical.loc.x, physical.loc.y, physical.size.w, physical.size.h)
     }
 
+    /// [`Self::usable_area`], for a *specific* output rather than
+    /// implicitly the focused one — real multi-monitor's own need: a
+    /// backgrounded (unfocused) monitor's own render pass still has to
+    /// size/position its content against *its own* usable area, not the
+    /// currently-focused monitor's. `(0, 0, 0, 0)` for an unknown index
+    /// or an output with no real mode set yet (the placeholder synthetic
+    /// output every `OutputSlot` starts with — see `GraphStack::new`'s
+    /// doc comment) — every real caller only ever asks this for an
+    /// output that's already been through `GraphStack::set_output`/
+    /// `add_output` with a real connector, so this only actually matters
+    /// in the same brief startup window `usable_area`'s own `None`
+    /// fallback already covers.
+    pub fn usable_area_for(&self, output_index: usize) -> (i32, i32, i32, i32) {
+        let Some(slot) = self.stack.outputs().get(output_index) else {
+            return (0, 0, 0, 0);
+        };
+        if slot.output.current_mode().is_none() {
+            return (0, 0, 0, 0);
+        }
+        let scale = slot.output.current_scale().fractional_scale();
+        let zone = layer_map_for_output(&slot.output).non_exclusive_zone();
+        let physical: smithay::utils::Rectangle<i32, smithay::utils::Physical> =
+            zone.to_physical_precise_round(scale);
+        (physical.loc.x, physical.loc.y, physical.size.w, physical.size.h)
+    }
+
     /// [`Self::usable_area`]'s raw, unconverted counterpart — genuinely
     /// [`Logical`] (scale-divided), for the two call sites
     /// (`handlers/xdg_shell.rs`'s `new_toplevel`,
@@ -686,6 +756,10 @@ impl State {
     /// but forced true when that ConsoleHut has no Main Windows to toggle to.
     pub fn showing_terminal_effective(&self) -> bool {
         self.stack.shows_terminal_effective(self.stack.focused_top_level())
+    }
+
+    pub fn showing_terminal_effective_for(&self, output_index: usize) -> bool {
+        self.stack.shows_terminal_effective(self.stack.focused_top_level_for(output_index))
     }
 
     /// Screen-space offset of whichever pane currently has effective

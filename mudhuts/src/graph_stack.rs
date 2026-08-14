@@ -24,7 +24,7 @@ use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::output::Output;
 use smithay::reexports::calloop::LoopHandle;
 use smithay::reexports::calloop::channel::{self, Channel};
-use smithay::utils::{Logical, Point};
+use smithay::utils::{Logical, Point, Rectangle};
 
 use mudhuts_term::TermEvent;
 
@@ -264,6 +264,29 @@ impl GraphStack {
         }
     }
 
+    /// Which output's own real, positioned rectangle (`OutputSlot::position`
+    /// plus its current mode, scale-divided into Logical) contains `pos` —
+    /// per the user's resolved focus-follows-mouse policy. Falls back to
+    /// the currently-focused output if `pos` doesn't land inside any real
+    /// output's rect (e.g. before any output has a real mode yet, or the
+    /// pointer is briefly outside every known rect) — never a bare
+    /// `Option`, mirroring every other "there's always a currently-focused
+    /// output" invariant in this module.
+    pub fn output_index_at(&self, pos: Point<f64, Logical>) -> usize {
+        for (i, slot) in self.outputs.iter().enumerate() {
+            let Some(mode) = slot.output.current_mode() else {
+                continue;
+            };
+            let scale = slot.output.current_scale().fractional_scale();
+            let size = mode.size.to_f64().to_logical(scale);
+            let rect = Rectangle::<f64, Logical>::new(slot.position.to_f64(), size);
+            if rect.contains(pos) {
+                return i;
+            }
+        }
+        self.focused_output
+    }
+
     fn out(&self) -> &OutputSlot {
         &self.outputs[self.focused_output]
     }
@@ -272,8 +295,27 @@ impl GraphStack {
         &mut self.outputs[self.focused_output]
     }
 
+    /// Real multi-monitor: every method below this point that implicitly
+    /// means "the *focused* output" (`focused()`, `focused_top_level()`,
+    /// ...) has an explicit `_for(output_index)` counterpart here,
+    /// operating on *any* output's own independent stack regardless of
+    /// which one currently has input focus — needed because a
+    /// backgrounded (unfocused) monitor still needs to render its own
+    /// live content every frame, not a stale copy or the focused
+    /// monitor's own. `render.rs`'s per-output render pass uses these;
+    /// `input.rs`/chrome/docks (all about whatever the user is currently
+    /// interacting with) keep using the plain, focused-output versions
+    /// unchanged.
+    fn out_at(&self, index: usize) -> &OutputSlot {
+        &self.outputs[index]
+    }
+
     pub fn len(&self) -> usize {
         self.out().len()
+    }
+
+    pub fn len_for(&self, output_index: usize) -> usize {
+        self.out_at(output_index).len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -284,20 +326,40 @@ impl GraphStack {
         self.out().is_previewing()
     }
 
+    pub fn is_previewing_for(&self, output_index: usize) -> bool {
+        self.out_at(output_index).is_previewing()
+    }
+
     pub fn preview_index(&self) -> usize {
         self.out().preview_index()
+    }
+
+    pub fn preview_index_for(&self, output_index: usize) -> usize {
+        self.out_at(output_index).preview_index()
     }
 
     pub fn panel_id(&self) -> Id {
         self.out().panel_id()
     }
 
+    pub fn panel_id_for(&self, output_index: usize) -> Id {
+        self.out_at(output_index).panel_id()
+    }
+
     pub fn focused_top_level(&self) -> NodeId {
         self.out().focused_top_level()
     }
 
+    pub fn focused_top_level_for(&self, output_index: usize) -> NodeId {
+        self.out_at(output_index).focused_top_level()
+    }
+
     pub fn top_level_entries(&self) -> impl Iterator<Item = &NodeId> {
         self.out().top_level_entries()
+    }
+
+    pub fn top_level_entries_for(&self, output_index: usize) -> impl Iterator<Item = &NodeId> {
+        self.out_at(output_index).top_level_entries()
     }
 
     /// Every top-level entry across *every* output — for searches that
@@ -417,6 +479,27 @@ impl GraphStack {
             .hut
     }
 
+    /// [`Self::focused`], for a specific output rather than whichever one
+    /// currently has input focus — see the "real multi-monitor" doc
+    /// comment on [`Self::out_at`].
+    pub fn focused_for(&self, output_index: usize) -> &ConsoleHut {
+        let leaf = self.graph.focused_leaf(self.focused_top_level_for(output_index));
+        &self
+            .graph
+            .downcast::<ConsoleNode>(leaf)
+            .expect("a focused leaf with no focused_child of its own must be a ConsoleNode")
+            .hut
+    }
+
+    pub fn focused_mut_for(&mut self, output_index: usize) -> &mut ConsoleHut {
+        let leaf = self.graph.focused_leaf(self.focused_top_level_for(output_index));
+        &mut self
+            .graph
+            .downcast_mut::<ConsoleNode>(leaf)
+            .expect("a focused leaf with no focused_child of its own must be a ConsoleNode")
+            .hut
+    }
+
     /// Find a `ConsoleHut` by id anywhere in the whole graph, across
     /// every output — mirrors `MruStackHut::find_mut`.
     pub fn find_mut(&mut self, id: u64) -> Option<&mut ConsoleHut> {
@@ -487,6 +570,16 @@ impl GraphStack {
     /// not this method's.
     pub fn resize_all(&mut self, width: i32, height: i32) {
         let tops: Vec<NodeId> = self.all_top_level_entries().copied().collect();
+        for id in tops {
+            self.graph.with_node_mut(id, |node, graph| node.resize_to_pixels(graph, id, width, height));
+        }
+    }
+
+    /// Real multi-monitor: resizes only `output_index`'s own top-level
+    /// entries, for the case `resize_all`'s own doc comment flags as out
+    /// of its scope — two outputs with genuinely different real modes.
+    pub fn resize_output(&mut self, output_index: usize, width: i32, height: i32) {
+        let tops: Vec<NodeId> = self.top_level_entries_for(output_index).copied().collect();
         for id in tops {
             self.graph.with_node_mut(id, |node, graph| node.resize_to_pixels(graph, id, width, height));
         }
@@ -1064,5 +1157,63 @@ mod tests {
         let some_id = stack.all_huts().map(|h| h.id).find(|&id| Some(id) != nested_id).unwrap();
         assert!(stack.find_mut(some_id).is_some());
         assert!(stack.find_mut(999_999).is_none());
+    }
+
+    #[test]
+    fn add_output_creates_an_independent_stack_that_does_not_disturb_the_first() {
+        let mut stack = new_stack();
+        let first_id = stack.focused().id;
+        let second_output = crate::space_element::synthetic_output("second", (800, 600), 1.0);
+        let index = stack.add_output(second_output, Point::from((1920, 0))).unwrap();
+        assert_eq!(index, 1);
+        assert_eq!(stack.outputs().len(), 2);
+        // Focus hasn't moved — `add_output` only ever adds a slot, never
+        // reassigns `focused_output` on its own (that's `set_focused_output`'s
+        // job, driven by real pointer motion).
+        assert_eq!(stack.focused_output_index(), 0);
+        assert_eq!(stack.focused().id, first_id);
+        assert_ne!(stack.focused_for(1).id, first_id, "the new output's own ConsoleHut should be a fresh one");
+        assert_eq!(stack.len_for(0), 1);
+        assert_eq!(stack.len_for(1), 1);
+    }
+
+    #[test]
+    fn output_index_at_finds_the_output_whose_positioned_rect_contains_the_point() {
+        let mut stack = new_stack();
+        // Slot 0's placeholder starts at size (0, 0) — give it a real mode
+        // so it has a real rect to test against, mirroring what
+        // `udev_backend.rs::connector_connected` does for a real first
+        // connector.
+        stack.set_output(0, crate::space_element::synthetic_output("first", (1920, 1080), 1.0));
+        let second_output = crate::space_element::synthetic_output("second", (800, 600), 1.0);
+        stack.add_output(second_output, Point::from((1920, 0))).unwrap();
+
+        assert_eq!(stack.output_index_at(Point::from((100.0, 100.0))), 0);
+        assert_eq!(stack.output_index_at(Point::from((2000.0, 100.0))), 1);
+        // Outside every known rect — falls back to whichever is currently
+        // focused, never panics/returns an invalid index.
+        assert_eq!(stack.output_index_at(Point::from((-50.0, -50.0))), stack.focused_output_index());
+    }
+
+    #[test]
+    fn remove_output_drops_its_own_huts_and_shifts_later_indices_down() {
+        let mut stack = new_stack();
+        let first_id = stack.focused().id;
+        stack.add_output(crate::space_element::synthetic_output("b", (800, 600), 1.0), Point::from((1920, 0))).unwrap();
+        stack.add_output(crate::space_element::synthetic_output("c", (800, 600), 1.0), Point::from((2720, 0))).unwrap();
+        assert_eq!(stack.outputs().len(), 3);
+
+        stack.remove_output(1);
+        assert_eq!(stack.outputs().len(), 2, "should have dropped exactly one slot");
+        assert_eq!(stack.focused().id, first_id, "removing a non-focused output shouldn't disturb focus");
+        // What used to be index 2 ("c") should now be at index 1.
+        assert_eq!(stack.outputs()[1].output.name(), "c");
+    }
+
+    #[test]
+    fn remove_output_refuses_to_drop_the_last_remaining_slot() {
+        let mut stack = new_stack();
+        stack.remove_output(0);
+        assert_eq!(stack.outputs().len(), 1, "the last slot must never be removed");
     }
 }

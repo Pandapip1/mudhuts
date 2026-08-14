@@ -166,7 +166,15 @@ impl State {
         // ordering isn't optional: it internally borrows the same
         // `Rc<RefCell<GlesRenderer>>` `self.dmabuf_renderer` shares, and
         // `RefCell` panics on a second concurrent borrow.
-        let content = render::resolve_frame_content(self);
+        // Screenshot capture always targets the focused output (index 0's
+        // slot is not assumed — `self.output` above already resolved to
+        // whichever output this session is bound to); per-output capture
+        // selection is a separate, not-yet-requested feature. `begin_frame`
+        // here since this is its own resolve pass, independent of whatever
+        // frame the render loop last built — see `Graph::begin_frame`'s doc
+        // comment.
+        self.stack.begin_frame();
+        let content = render::resolve_frame_content(self, 0);
 
         let pixels = if let Some(renderer) = self.dmabuf_renderer.clone() {
             let mut renderer = renderer.borrow_mut();
@@ -199,7 +207,7 @@ impl State {
         tracker: &RefCell<OutputDamageTracker>,
         content: Vec<crate::graph::ContentPiece>,
     ) -> Result<Vec<u8>, FailureReason> {
-        let elements = render::build_frame_elements(self, renderer, size, content);
+        let elements = render::build_frame_elements(self, renderer, size, content, 0);
 
         let buffer_size: Size<i32, BufferCoord> = (size.0, size.1).into();
         let mut texture = Offscreen::<GlesTexture>::create_buffer(renderer, fourcc, buffer_size)

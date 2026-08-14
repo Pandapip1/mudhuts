@@ -137,6 +137,12 @@ type Elements = OutputRenderElements<GlesRenderer, HutSpaceRenderElement>;
 
 struct SurfaceData {
     output: Output,
+    /// Which `GraphStack::outputs()` slot this crtc drives — real
+    /// multi-monitor: `render_surface` needs this to resolve/build this
+    /// crtc's own content, not necessarily whichever output currently has
+    /// input focus. Kept in sync with `GraphStack::remove_output`'s own
+    /// index-shift by `connector_disconnected` (see its own comment).
+    output_index: usize,
     drm_output: CrtcOutput,
     /// Whether a submitted atomic commit for this crtc is still waiting
     /// on its `DrmEvent::VBlank` completion. Gates `render_surface`: a
@@ -428,6 +434,11 @@ pub fn init_udev(
         event_loop
             .handle()
             .insert_source(redraw_ping_source, move |(), _, state| {
+                // Once per whole multi-output frame, before iterating any
+                // crtc — see `GraphStack::begin_frame`'s doc comment: the
+                // per-frame memoization cache spans every output resolved
+                // in this pass, not just one.
+                state.stack.begin_frame();
                 let crtcs: Vec<_> = inner.borrow().surfaces.keys().copied().collect();
                 for crtc in crtcs {
                     render_surface(state, &inner, crtc);
@@ -466,6 +477,7 @@ pub fn init_udev(
                     }
                     // Nothing else re-kicks rendering after a resume —
                     // explicitly force a fresh pass on every crtc.
+                    state.stack.begin_frame();
                     let crtcs: Vec<_> = inner.borrow().surfaces.keys().copied().collect();
                     for crtc in crtcs {
                         render_surface(state, &inner, crtc);
@@ -736,22 +748,68 @@ fn connector_connected(
         }
     };
 
-    state.output = Some(output.clone());
-    // Slot 0 — this module still only ever drives a single desktop
-    // connector today (see this module's own doc comment on scope); real
-    // multi-monitor (a second connector calling `GraphStack::add_output`
-    // instead) is tracked as its own remaining piece of the RFC's Step 7,
-    // not built here.
-    state.stack.set_output(0, output.clone());
-    state.output_size = (wl_mode.size.w, wl_mode.size.h);
+    // Real multi-monitor: the very first desktop connector reuses
+    // `GraphStack::new`'s already-existing slot 0 (still holding its
+    // harmless synthetic placeholder `Output` at this point — see its own
+    // doc comment); every connector after that is a genuinely new
+    // `OutputSlot` with its own independent stack, positioned side by side
+    // to the right of every output already known, per the user's resolved
+    // policy (each output starts as its own independent workspace, no
+    // mirroring). `inner.surfaces` (not `state.stack.outputs()`, which
+    // never shrinks below one slot — see `GraphStack::remove_output`'s doc
+    // comment) is the source of truth for "is this the first real
+    // connector": it's empty exactly when no crtc currently drives a real
+    // desktop output.
+    let output_index = {
+        let inner_ref = inner.borrow();
+        if inner_ref.surfaces.is_empty() {
+            0
+        } else {
+            let next_x: i32 = state
+                .stack
+                .outputs()
+                .iter()
+                .filter_map(|slot| {
+                    let mode = slot.output.current_mode()?;
+                    let scale = slot.output.current_scale().fractional_scale();
+                    let w = (mode.size.w as f64 / scale).round() as i32;
+                    Some(slot.position.x + w)
+                })
+                .max()
+                .unwrap_or(0);
+            drop(inner_ref);
+            let position = Point::<i32, smithay::utils::Logical>::from((next_x, 0));
+            // Real position, not the `(0, 0)` `change_current_state` was
+            // given above (unconditionally, before this output's real
+            // place in a multi-monitor layout was known) — so clients
+            // using `xdg-output`/`wl_output.geometry` to lay out
+            // fullscreen/layer-shell surfaces across monitors see this
+            // output's genuine side-by-side location.
+            output.change_current_state(None, None, None, Some(position));
+            match state.stack.add_output(output.clone(), position) {
+                Ok(index) => index,
+                Err(err) => {
+                    tracing::warn!("failed to add output slot for {output_name}: {err}");
+                    return;
+                }
+            }
+        }
+    };
+    if output_index == 0 {
+        state.stack.set_output(0, output.clone());
+    }
+    state.sync_focused_output();
     // Catches up the initial ConsoleHut (spawned in `main.rs` before this
     // backend existed, at scale 1.0) and remembers `scale` for every ConsoleHut
-    // spawned from here on — see `Stack::rescale_all`'s doc comment.
+    // spawned from here on — see `Stack::rescale_all`'s doc comment. Shared
+    // across every output for now (`GraphStack::scale`'s own doc comment)
+    // rather than per-connector, so this stays a single call even for a
+    // second connector.
     if let Err(err) = state.stack.rescale_all(scale) {
         tracing::warn!("failed to rescale initial ConsoleHut to real output scale: {err}");
     }
-    let (_, _, usable_w, usable_h) = state.usable_area();
-    state.stack.resize_all(usable_w, usable_h);
+    let (_, _, usable_w, usable_h) = state.usable_area_for(output_index);
+    state.stack.resize_output(output_index, usable_w, usable_h);
     // Nothing else re-pushes capture buffer constraints when the output's
     // mode changes (the only point that happens under this backend, since
     // it has no runtime mode-switching) — without this, a capture session
@@ -763,6 +821,7 @@ fn connector_connected(
         crtc,
         SurfaceData {
             output,
+            output_index,
             drm_output,
             frame_pending: false,
             gamma_control_bound: false,
@@ -777,6 +836,7 @@ fn connector_connected(
     // machine a chance to settle before another commit lands on it.
     let inner = inner.clone();
     handle.insert_idle(move |state| {
+        state.stack.begin_frame();
         render_surface(state, &inner, crtc);
     });
 }
@@ -804,10 +864,25 @@ fn connector_disconnected(
     }
     let removed = inner_mut.surfaces.remove(&crtc);
     drop(inner_mut);
-    if let Some(surface) = removed
-        && state.output.as_ref() == Some(&surface.output)
-    {
-        state.output = None;
+    if let Some(surface) = removed {
+        // Refuses to actually remove the last remaining slot (see
+        // `GraphStack::remove_output`'s doc comment) — the disconnected
+        // connector's `OutputSlot` is left in place with its now-stale
+        // `Output` until another connector reattaches via `set_output`,
+        // matching the exact single-output startup state this module
+        // already tolerates before the first connector ever appears.
+        state.stack.remove_output(surface.output_index);
+        // Every other surface pointing at a slot index *after* the
+        // removed one shifts down by one along with it — mirrors
+        // `GraphStack::remove_output`'s own index-shift internally.
+        let mut inner_mut = inner.borrow_mut();
+        for other in inner_mut.surfaces.values_mut() {
+            if other.output_index > surface.output_index {
+                other.output_index -= 1;
+            }
+        }
+        drop(inner_mut);
+        state.sync_focused_output();
     }
 }
 
@@ -816,7 +891,7 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
     // *before* touching the renderer at all, so the common "nothing to
     // do" cases (no surface, a commit already in flight) don't pay for a
     // real graph resolve pass (a terminal redraw) just to throw it away.
-    {
+    let output_index = {
         let inner_ref = inner.borrow();
         let Some(surface) = inner_ref.surfaces.get(&crtc) else {
             tracing::debug!("render_surface: no surface for {crtc:?}, dropping the render chain here");
@@ -829,7 +904,8 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
             tracing::debug!("render_surface: frame already pending for {crtc:?}, skipping");
             return;
         }
-    }
+        surface.output_index
+    };
 
     // Every render pass, not just once at connector setup — matches
     // `winit_backend.rs`'s own redraw handler, which does the same
@@ -840,16 +916,18 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
     // `ConsoleHut::spawn`'s tiny 80x24-cell placeholder grid. Sized to the
     // *usable* area, not the raw output — shrinks automatically whenever
     // a layer-shell surface's exclusive zone changes (see
-    // `State::usable_area`'s doc comment).
-    let (_, _, usable_w, usable_h) = state.usable_area();
-    state.stack.resize_all(usable_w, usable_h);
+    // `State::usable_area`'s doc comment). This crtc's own output only —
+    // real multi-monitor: two outputs can have genuinely different modes
+    // (see `GraphStack::resize_output`'s own doc comment).
+    let (_, _, usable_w, usable_h) = state.usable_area_for(output_index);
+    state.stack.resize_output(output_index, usable_w, usable_h);
 
     // Resolved *before* acquiring the renderer borrow below — see
     // `render::resolve_frame_content`'s own doc comment for why that
     // ordering isn't optional (it borrows the exact same
     // `Rc<RefCell<GlesRenderer>>` acquired just below, and `RefCell`
     // panics on a second concurrent borrow).
-    let content = render::resolve_frame_content(state);
+    let content = render::resolve_frame_content(state, output_index);
 
     let mut inner_mut = inner.borrow_mut();
     let Inner {
@@ -877,12 +955,12 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
     let output = surface.output.clone();
 
     tracing::debug!(
-        "render_surface: focused hut={} showing_terminal_effective={} output_size={size:?}",
-        state.stack.focused().id,
-        state.showing_terminal_effective(),
+        "render_surface: output_index={output_index} focused hut={} showing_terminal_effective={} output_size={size:?}",
+        state.stack.focused_for(output_index).id,
+        state.showing_terminal_effective_for(output_index),
     );
 
-    let mut elements = render::build_frame_elements(state, renderer, size, content);
+    let mut elements = render::build_frame_elements(state, renderer, size, content, output_index);
 
     // Prepended, not appended — elements render front-to-back (index 0
     // on top, per the same convention `switcher::build`'s doc comment
@@ -894,6 +972,7 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
         pointer_images,
         pointer_element,
         pointer_image_cache,
+        output_index,
     );
     elements.splice(0..0, cursor_elements);
 
@@ -982,6 +1061,7 @@ fn build_cursor_elements(
     pointer_images: &mut HashMap<CursorIcon, Cursor>,
     pointer_element: &mut PointerElement,
     pointer_image_cache: &mut Vec<(xcursor::parser::Image, MemoryRenderBuffer)>,
+    output_index: usize,
 ) -> Vec<Elements> {
     // A client's cursor surface can be destroyed without the client ever
     // telling us to switch away from it (e.g. the client itself exits) —
@@ -1062,8 +1142,20 @@ fn build_cursor_elements(
     // `state.pointer_location`/`hotspot` are both genuinely Logical (see
     // `state.rs`'s `pointer_location` doc comment) — converted to physical
     // here, at the render boundary, same as everywhere else in this
-    // compositor.
-    let cursor_pos = (state.pointer_location - hotspot.to_f64())
+    // compositor. Real multi-monitor: `pointer_location` lives in one
+    // shared global compositor space (`OutputSlot::position`'s own doc
+    // comment), so it's re-based to *this* output's own local origin
+    // before conversion — rendering it unadjusted would place the cursor
+    // at the wrong local offset on every output except whichever one
+    // happens to sit at `(0, 0)`. Harmless (just off-screen, naturally
+    // clipped) on every output the pointer isn't currently over.
+    let output_position = state
+        .stack
+        .outputs()
+        .get(output_index)
+        .map(|slot| slot.position)
+        .unwrap_or_default();
+    let cursor_pos = (state.pointer_location - output_position.to_f64() - hotspot.to_f64())
         .to_physical(Scale::from(scale))
         .to_i32_round();
 
@@ -1085,6 +1177,10 @@ fn frame_finish(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Handl
         tracing::warn!("frame_submitted failed: {err}");
     }
 
+    // Its own independent render pass — not part of either multi-crtc
+    // loop above, so it needs its own `begin_frame` (see
+    // `GraphStack::begin_frame`'s doc comment).
+    state.stack.begin_frame();
     render_surface(state, inner, crtc);
 }
 

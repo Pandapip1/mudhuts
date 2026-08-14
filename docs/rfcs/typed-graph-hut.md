@@ -461,17 +461,65 @@ a window's owning Hut subtree only ever gets created under whichever
 `OutputSlot` was focused at creation time — no cross-`OutputSlot` move
 operation needs to exist yet.
 
-Deliberately not started this session: with policy resolved, the
-remaining blocker is pure volume/care, not an unresolved question — but
-executing a 106-call-site, 12-file change safely (plus real per-output
-`Output::create_global`/DRM connector-to-`OutputSlot` wiring in
-`udev_backend.rs`, plus the pointer-to-output lookup, plus keeping
-`winit_backend.rs`'s genuinely-single-output path correct throughout)
-is realistically multi-session work in its own right, not a should-fit-
-in-the-same-sitting extension of the graph rearchitecture above. Safer
-to land as its own clearly-scoped effort, verified incrementally the
-same way steps 1-4 were, than to rush a wide, load-bearing rewrite in
-one unreviewed pass this late in an already long session.
+Deliberately not started the session this was first scoped in: with
+policy resolved, the remaining blocker was pure volume/care, not an
+unresolved question.
+
+**Update (2026-08-14, later the same day): built, per the user's
+explicit "do the entirety of step 7 as a single atomic step" —
+implemented in full, not the connector-detection-only partial version
+considered and rejected above.** The actual shape differs from the
+`State`-level sketch above in one respect: `outputs: Vec<OutputSlot>`
+and `focused_output` live on `GraphStack` itself (not `State`), and
+rather than routing a single `stack()`/`stack_mut()` accessor through
+`outputs[focused_output]`, every method that implicitly meant "the
+focused output" (`focused()`, `usable_area()`, `is_previewing()`, ...)
+kept its existing signature — used unchanged by `input.rs`/chrome/docks,
+still all about "whatever the user is currently interacting with" — and
+gained an explicit `_for(output_index)` twin for the render path, which
+needs *every* output's own content every frame regardless of focus, not
+just the focused one. Landed:
+- `GraphStack::{add_output, remove_output, output_index_at, resize_output}`
+  and the full `_for(output_index)` accessor surface.
+- `real_output_geometry`'s `(0, 0)` assumption resolved via
+  `OutputSlot::position` (real side-by-side placement, left-to-right in
+  connector-scan order) plus `State::sync_focused_output` keeping
+  `state.output`/`state.output_size` (kept as fields, matching the sketch
+  above) pointing at whichever `OutputSlot` is now focused.
+- Focus-follows-mouse: `input.rs::handle_pointer_motion` computes
+  `output_index_at(pos)` first thing and calls `set_focused_output` — the
+  resolved policy's point (2) and (3), solved together as flagged above.
+- `udev_backend.rs`: real multi-CRTC connector detection (`SurfaceData`
+  gained `output_index`, kept in sync with `GraphStack::remove_output`'s
+  own index-shift on disconnect), per-output `resize_output`/
+  `resolve_frame_content`/`build_frame_elements`, and the compositor
+  cursor re-based to each output's own local origin before rendering
+  (previously would have drawn at the wrong offset on every output but
+  whichever sat at `(0, 0)`).
+- `GraphStack::begin_frame` (the per-frame memoization clear, moved out
+  of `resolve_frame_content` itself so it can span a whole multi-output
+  redraw pass) called once by every real render entry point:
+  `winit_backend.rs`, `handlers/capture.rs`, and each of
+  `udev_backend.rs`'s three independent render-triggering paths (the
+  redraw-ping multi-crtc loop, the post-resume multi-crtc loop, and each
+  single-crtc `frame_finish`/post-connect deferred render).
+- Per-output real distinct *sizes* (`resize_output`) are real; per-output
+  real distinct *scale* stays the deliberately deferred simplification
+  the mechanical sketch above didn't call out — `GraphStack::scale` is
+  still shared across every output, same as `winit_backend.rs`'s
+  genuinely-single-output path, which is otherwise unaffected by any of
+  this (still always output index `0`).
+- `cargo build`/`clippy --all-targets`/`test --workspace`: clean, 85
+  tests passing, zero warnings introduced.
+
+Not built (real gaps, not silently skipped): per-output *scale* (noted
+above); cross-output window migration (explicitly deferred by the user);
+per-output screenshot capture (`handlers/capture.rs` still always
+targets output index `0`/whichever is focused — a separate,
+not-yet-requested feature); no live multi-monitor hardware was available
+to verify against, so this is verified by careful reading and the
+existing (single-output-only) test suite, not a real second-monitor
+smoke test.
 
 ## Explicitly out of scope
 

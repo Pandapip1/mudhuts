@@ -187,6 +187,16 @@ impl State {
     /// mudhuts' own rendering needs).
     fn handle_pointer_motion(&mut self, pos: smithay::utils::Point<f64, smithay::utils::Logical>, time: u32) {
         self.pointer_location = pos;
+        // Real multi-monitor: focus follows the mouse across outputs (the
+        // user's resolved policy — see `GraphStack::output_index_at`'s doc
+        // comment). A no-op the moment the pointer stays within the
+        // already-focused output's own rect, which is the overwhelming
+        // majority of motion events.
+        let output_index = self.stack.output_index_at(pos);
+        if output_index != self.stack.focused_output_index() {
+            self.stack.set_focused_output(output_index);
+            self.sync_focused_output();
+        }
         let pos_physical = self.to_physical(pos);
         // Under winit this is a no-op ping (the host draws the cursor,
         // and `winit_backend.rs`'s own input handler already force-
