@@ -356,9 +356,23 @@ impl State {
         // Floating Window/Alert root (never Tile-Hut-paned) or a Main
         // Window that isn't actually visible right now — both match
         // today's pre-existing behavior exactly.
+        //
+        // `PositionerState::get_unconstrained_geometry`'s own doc comment
+        // requires `target` to be expressed relative to the *root
+        // toplevel's own geometry origin*, not absolute output space —
+        // confirmed against Smithay's own `anvil`/`smallvil` example
+        // compositors, which both additionally subtract the window's own
+        // absolute location (`target.loc -= window_geo.loc`) after
+        // subtracting `get_popup_toplevel_coords`. mudhuts was missing
+        // that step entirely, leaving `target.loc` at (approximately) the
+        // window's own absolute on-screen position instead of near
+        // `(0, 0)` — which shifted every unconstrained popup by roughly
+        // that amount (a right-click context menu opening far from the
+        // click, but still clickable/mapped correctly, since mapping
+        // doesn't depend on this constraint math at all).
         let mut target = match self.leaf_absolute_rect(&root) {
-            Some((x, y, w, h)) => {
-                let physical = Rectangle::<i32, Physical>::new(Point::from((x, y)), Size::from((w, h)));
+            Some((_, _, w, h)) => {
+                let physical = Rectangle::<i32, Physical>::new(Point::from((0, 0)), Size::from((w, h)));
                 physical.to_f64().to_logical(Scale::from(self.output_scale())).to_i32_round()
             }
             None => output_geo,
