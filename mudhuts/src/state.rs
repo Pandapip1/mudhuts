@@ -126,6 +126,15 @@ pub struct State {
     pub popups: PopupManager,
 
     pub seat: Seat<Self>,
+    /// Every physical keyboard device currently plugged in, under the real
+    /// udev/DRM backend only (always empty under winit — a nested window
+    /// has no hardware LEDs to update) — populated/pruned from
+    /// `InputEvent::DeviceAdded`/`DeviceRemoved` in `udev_backend.rs`'s
+    /// libinput event source, and iterated by `led_state_changed`
+    /// (`handlers/mod.rs`) to keep each one's Caps/Num/Scroll Lock LED in
+    /// sync with the seat's own xkb state. Mirrors `anvil`'s own
+    /// `udev.rs` `keyboards` field/pattern exactly.
+    pub keyboards: Vec<smithay::reexports::input::Device>,
 
     pub stack: MruStackHut,
     pub keymap: Keymap,
@@ -418,6 +427,7 @@ impl State {
             fractional_scale_manager_state,
             popups,
             seat,
+            keyboards: Vec::new(),
             stack,
             keymap: Keymap::load(),
             output_size: (0, 0),

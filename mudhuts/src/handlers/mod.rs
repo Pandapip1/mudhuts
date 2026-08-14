@@ -12,6 +12,7 @@ use std::sync::Arc;
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::renderer::ImportDma;
 use smithay::input::dnd::DndGrabHandler;
+use smithay::input::keyboard::LedState;
 use smithay::input::pointer::CursorImageStatus;
 use smithay::input::tablet::TabletSeatHandler;
 use smithay::input::{Seat, SeatHandler, SeatState};
@@ -53,6 +54,18 @@ impl SeatHandler for State {
         let client = focused.and_then(|s| dh.get_client(s.id()).ok());
         set_data_device_focus(dh, seat, client.clone());
         set_primary_focus(dh, seat, client);
+    }
+
+    /// Called by Smithay itself whenever a keyboard input/keymap change
+    /// flips a Caps/Num/Scroll Lock LED bit (see `Keyboard::input`'s own
+    /// internals) — keeps every physical keyboard's real LED in sync.
+    /// `self.keyboards` is always empty under winit (nothing to update, a
+    /// nested window has no hardware LEDs), so this is a no-op there.
+    /// Mirrors `anvil`'s own `update_led_state` pattern exactly.
+    fn led_state_changed(&mut self, _seat: &Seat<Self>, led_state: LedState) {
+        for keyboard in &mut self.keyboards {
+            keyboard.led_update(led_state.into());
+        }
     }
 }
 

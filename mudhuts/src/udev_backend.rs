@@ -484,6 +484,27 @@ pub fn init_udev(
     event_loop
         .handle()
         .insert_source(libinput_backend, move |event, _, state| {
+            // Keyboard hotplug: track the physical device so
+            // `led_state_changed` (`handlers/mod.rs`) can keep its real
+            // Caps/Num/Scroll Lock LEDs synced — matches `anvil`'s own
+            // `udev.rs` pattern. Seeded with the seat's *current* LED
+            // state immediately (not just future changes), so a keyboard
+            // plugged in mid-session doesn't start with stale/no LEDs.
+            match &event {
+                smithay::backend::input::InputEvent::DeviceAdded { device }
+                    if device.has_capability(smithay::reexports::input::DeviceCapability::Keyboard) =>
+                {
+                    let mut device = device.clone();
+                    if let Some(led_state) = state.seat.get_keyboard().map(|k| k.led_state()) {
+                        device.led_update(led_state.into());
+                    }
+                    state.keyboards.push(device);
+                }
+                smithay::backend::input::InputEvent::DeviceRemoved { device } => {
+                    state.keyboards.retain(|d| d != device);
+                }
+                _ => {}
+            }
             state.process_input_event(event);
         })
         .map_err(|err| format!("failed to register the libinput event source: {err}"))?;
