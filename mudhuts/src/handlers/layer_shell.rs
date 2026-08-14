@@ -74,14 +74,16 @@ impl WlrLayerShellHandler for State {
         // one (`self.output`) — a layer surface can be mapped on any
         // output (see `new_layer_surface`'s explicit `wl_output`
         // handling), so a status bar closing on a backgrounded monitor
-        // must still be found and unmapped from *its own* map.
-        let outputs: Vec<Output> = self.stack.outputs().iter().map(|slot| slot.output.clone()).collect();
-        let found = outputs.into_iter().find_map(|o| {
-            let layer = layer_map_for_output(&o)
+        // must still be found and unmapped from *its own* map. Iterates
+        // borrowed `&Output`s rather than cloning every output up front
+        // into a throwaway `Vec` — only the one actually found (if any)
+        // ever needs cloning.
+        let found = self.stack.outputs().iter().find_map(|slot| {
+            let layer = layer_map_for_output(&slot.output)
                 .layers()
                 .find(|l| l.layer_surface() == &surface)
                 .cloned();
-            layer.map(|l| (o, l))
+            layer.map(|l| (slot.output.clone(), l))
         });
         if let Some((output, layer)) = found {
             // `unmap_layer` re-`arrange()`s internally too — same
@@ -141,13 +143,17 @@ pub fn handle_commit(state: &mut State, surface: &WlSurface) {
     // (`state.output`) — `new_layer_surface` honors a client's explicit
     // `wl_output` choice, so a status bar bound to a backgrounded monitor
     // would otherwise never be found here, never get its initial
-    // configure, and never render.
-    let outputs: Vec<Output> = state.stack.outputs().iter().map(|slot| slot.output.clone()).collect();
-    let Some(output) = outputs.into_iter().find(|o| {
-        layer_map_for_output(o)
-            .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
-            .is_some()
-    }) else {
+    // configure, and never render. Iterates borrowed `&Output`s (see
+    // `layer_destroyed`'s identical reasoning) rather than cloning every
+    // output into a throwaway `Vec` first.
+    let Some(output) = state
+        .stack
+        .outputs()
+        .iter()
+        .map(|slot| &slot.output)
+        .find(|o| layer_map_for_output(o).layer_for_surface(surface, WindowSurfaceType::TOPLEVEL).is_some())
+        .cloned()
+    else {
         return;
     };
 
