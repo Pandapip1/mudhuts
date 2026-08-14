@@ -895,6 +895,19 @@ impl State {
         self.stack.leaf_absolute_rect(self.stack.focused_top_level(), root, self.usable_area())
     }
 
+    /// [`Self::leaf_absolute_rect`], for a specific output rather than
+    /// whichever one currently has input focus — `unconstrain_popup`'s
+    /// popup root doesn't have to be on the focused output, and the
+    /// focused-only version's `self.stack.focused_top_level()` would walk
+    /// the wrong output's own subtree entirely for one that isn't,
+    /// always missing (returning `None`, falling back to the coarser
+    /// whole-output rect) even for the very common "root is a plain
+    /// ConsoleHut's own Main Window" case this otherwise resolves
+    /// precisely.
+    pub fn leaf_absolute_rect_for(&self, output_index: usize, root: &WlSurface) -> Option<(i32, i32, i32, i32)> {
+        self.stack.leaf_absolute_rect(self.stack.focused_top_level_for(output_index), root, self.usable_area_for(output_index))
+    }
+
     /// Make the focused ConsoleHut's own `space` match what it should
     /// currently be showing: unmap whatever's mapped (harmless if nothing
     /// was), then map its active Main Window (if it isn't showing its

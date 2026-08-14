@@ -373,16 +373,22 @@ impl State {
             return;
         };
 
-        // `State::leaf_absolute_rect` (composable Hut hierarchy RFC's Open
-        // Question 3 resolution) gives this root's actual on-screen rect
-        // if it's a Main Window reachable through the Hut tree — narrower
-        // than the whole output once a Tile-Hut pane can show a Main
-        // Window (still out of v1 scope today, so this is currently
-        // always the same as `output_geo`, but stops being a no-op the
-        // moment that lands). Falls back to the full output rect for a
-        // Floating Window/Alert root (never Tile-Hut-paned) or a Main
-        // Window that isn't actually visible right now — both match
-        // today's pre-existing behavior exactly.
+        // `State::leaf_absolute_rect_for` (composable Hut hierarchy RFC's
+        // Open Question 3 resolution) gives this root's actual on-screen
+        // rect if it's a Main Window reachable through the Hut tree —
+        // already narrower than the raw output rect for the common case
+        // of a plain (non-Tab/Tile) top-level Hut whenever a layer-shell
+        // panel reserves exclusive space there (it resolves through
+        // `usable_area_for`, not the full output), and narrower still
+        // once a Tile-Hut pane can show a Main Window (out of v1 scope
+        // today). Scoped to this popup's own `output_index`, not the
+        // focused output — `unconstrain_popup`'s whole point is that a
+        // popup's parent window doesn't have to be the visible one; the
+        // focused-only version used to always miss (falling back to the
+        // coarser `output_geo` below) for a popup on any other output.
+        // Falls back to the full output rect for a Floating Window/Alert
+        // root (never Tile-Hut-paned) or a Main Window that isn't
+        // actually visible right now.
         //
         // `PositionerState::get_unconstrained_geometry`'s own doc comment
         // requires `target` to be expressed relative to the *root
@@ -397,7 +403,7 @@ impl State {
         // that amount (a right-click context menu opening far from the
         // click, but still clickable/mapped correctly, since mapping
         // doesn't depend on this constraint math at all).
-        let mut target = match self.leaf_absolute_rect(&root) {
+        let mut target = match self.leaf_absolute_rect_for(output_index, &root) {
             Some((_, _, w, h)) => {
                 let physical = Rectangle::<i32, Physical>::new(Point::from((0, 0)), Size::from((w, h)));
                 physical.to_f64().to_logical(Scale::from(self.output_scale_for(output_index))).to_i32_round()
