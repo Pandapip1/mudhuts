@@ -136,24 +136,38 @@ pub struct OutputPort {
 /// every frame goes through, not an acceptable tradeoff there the way
 /// it is for a popup only redrawn while open.
 ///
-/// Positions are physical-pixel-absolute, matching this codebase's
-/// established real-output-absolute-coordinates convention throughout
-/// `render.rs` (see that module's own doc comments on why that has to
-/// stay true all the way to the GPU).
+/// Positions are physical-pixel positions *within the producing node's
+/// own local frame* — a leaf like `ConsoleNode` always reports `(0, 0)`;
+/// a compositing node (`TileNode`) translates each child's pieces by
+/// that child's own offset within its own local frame before passing
+/// them upward. The one absolute translation (by the real output's
+/// `usable_area()` origin) happens exactly once, at the very top of the
+/// tree — mirroring `hut::TileHut::absolute_pane_rects`'s own "local
+/// `pane_rects`, translated by the caller" shape.
 #[derive(Clone)]
 pub enum ContentPiece {
     /// A GPU-rendered texture (a Console/Terminal's own content, or —
     /// once migration step 4 builds it — a Tile-Hut pane's border
-    /// highlight) at a physical-pixel-absolute position.
+    /// highlight). `id` is this piece's own stable cross-frame identity
+    /// — the same role `ConsoleHut::element_id` already plays — required
+    /// for `TextureRenderElement::from_texture_with_damage`'s outer
+    /// per-element damage tracking to recognize this as the *same*
+    /// element frame to frame rather than a fresh one every time (see
+    /// `ConsoleHut::damage_tracker`'s own doc comment on why a fresh
+    /// `Id` per frame is a real correctness bug, not cosmetic).
     Texture {
+        id: smithay::backend::renderer::element::Id,
         texture: smithay::backend::renderer::gles::GlesTexture,
         damage: smithay::backend::renderer::utils::DamageSnapshot<i32, smithay::utils::Buffer>,
         position: (f64, f64),
     },
     /// A real client `Window`'s own surface(s) — composited by
     /// Smithay's own `space_render_elements`/`AsRenderElements`
-    /// machinery, not rendered by this compositor itself. A Main
-    /// Window, Floating Window, Alert, or layer-shell client.
+    /// machinery, not rendered by this compositor itself (and so
+    /// needing no separate stable `Id` of its own — `Window`/its
+    /// surfaces already carry their own identity through that
+    /// machinery). A Main Window, Floating Window, Alert, or
+    /// layer-shell client.
     Window {
         window: smithay::desktop::Window,
         position: smithay::utils::Point<i32, smithay::utils::Logical>,

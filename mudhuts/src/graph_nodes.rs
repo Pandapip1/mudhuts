@@ -197,8 +197,8 @@ impl<Env> Node<Env> for TileNode {
 /// codebase's convention of degrading rather than guessing.
 fn translate_piece(piece: ContentPiece, dx: i32, dy: i32) -> ContentPiece {
     match piece {
-        ContentPiece::Texture { texture, damage, position: (x, y) } => {
-            ContentPiece::Texture { texture, damage, position: (x + dx as f64, y + dy as f64) }
+        ContentPiece::Texture { id, texture, damage, position: (x, y) } => {
+            ContentPiece::Texture { id, texture, damage, position: (x + dx as f64, y + dy as f64) }
         }
         window @ ContentPiece::Window { .. } => window,
     }
@@ -255,7 +255,12 @@ impl<'a> Node<RenderEnv<'a>> for ConsoleNode {
             return PortValue::Content(Vec::new());
         };
         let damage = self.hut.element_damage_snapshot();
-        PortValue::Content(vec![ContentPiece::Texture { texture, damage, position: (0.0, 0.0) }])
+        PortValue::Content(vec![ContentPiece::Texture {
+            id: self.hut.element_id.clone(),
+            texture,
+            damage,
+            position: (0.0, 0.0),
+        }])
     }
 }
 
