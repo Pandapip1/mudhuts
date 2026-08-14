@@ -115,16 +115,22 @@ impl State {
     /// ever runs once, at session creation, unless a handler calls it
     /// again), so without calling this on every output resize a session
     /// outlives the first resize and every later capture attempt fails
-    /// buffer-size validation against a stale size. Only ever one output in
-    /// this compositor (see the module doc), so unconditionally pushing the
-    /// same constraints to every live session is correct.
+    /// buffer-size validation against a stale size. Per-session, not one
+    /// shared push of the focused output's own mode — real multi-monitor:
+    /// each session is bound to whichever specific output its own source
+    /// was created for (recovered the same way `capture_constraints`
+    /// already does, via the `WeakOutput` `output_source_created` stashed
+    /// in the source's `user_data()`), not necessarily the focused one.
     pub fn refresh_capture_constraints(&mut self) {
-        let Some(mode) = self.output.as_ref().and_then(Output::current_mode) else {
-            return;
-        };
-        let constraints = buffer_constraints_for_mode(mode);
         for session in &self.image_copy_sessions {
-            session.update_constraints(constraints.clone());
+            let Some(output) = session.source().user_data().get::<WeakOutput>().and_then(WeakOutput::upgrade)
+            else {
+                continue;
+            };
+            let Some(mode) = output.current_mode() else {
+                continue;
+            };
+            session.update_constraints(buffer_constraints_for_mode(mode));
         }
     }
 
@@ -136,11 +142,19 @@ impl State {
     /// backend can legitimately run out of GPU memory — never something to
     /// crash the whole compositor over).
     fn capture_frame(&mut self, session: &SessionRef, frame: &Frame) -> Result<(), FailureReason> {
-        // Single-output compositor: `session` itself has nothing more to
-        // key off of than the source already validated via
-        // `capture_constraints` — only its `user_data()` (the per-session
-        // damage tracker below) is actually needed here.
-        let output = self.output.clone().ok_or(FailureReason::Unknown)?;
+        // The specific output this session's own source was created for
+        // — same `WeakOutput` recovery `capture_constraints` already
+        // does correctly. Not `self.output` (the *focused* output):
+        // real multi-monitor means a capture session for a non-focused
+        // monitor must still render *that* monitor's own content, not
+        // whichever one the user currently has input focus on.
+        let output = session
+            .source()
+            .user_data()
+            .get::<WeakOutput>()
+            .and_then(WeakOutput::upgrade)
+            .ok_or(FailureReason::Unknown)?;
+        let output_index = self.stack.output_index_for(&output).ok_or(FailureReason::Unknown)?;
         let mode = output.current_mode().ok_or(FailureReason::Unknown)?;
         let size = (mode.size.w, mode.size.h);
 
@@ -165,23 +179,20 @@ impl State {
         // `render::resolve_frame_content`'s own doc comment for why that
         // ordering isn't optional: it internally borrows the same
         // `Rc<RefCell<GlesRenderer>>` `self.dmabuf_renderer` shares, and
-        // `RefCell` panics on a second concurrent borrow.
-        // Screenshot capture always targets the focused output (index 0's
-        // slot is not assumed — `self.output` above already resolved to
-        // whichever output this session is bound to); per-output capture
-        // selection is a separate, not-yet-requested feature. `begin_frame`
-        // here since this is its own resolve pass, independent of whatever
-        // frame the render loop last built — see `Graph::begin_frame`'s doc
-        // comment.
+        // `RefCell` panics on a second concurrent borrow. `output_index`,
+        // not always `0` — this session's own output, resolved above.
+        // `begin_frame` here since this is its own resolve pass,
+        // independent of whatever frame the render loop last built — see
+        // `Graph::begin_frame`'s doc comment.
         self.stack.begin_frame();
-        let content = render::resolve_frame_content(self, 0);
+        let content = render::resolve_frame_content(self, output_index);
 
         let pixels = if let Some(renderer) = self.dmabuf_renderer.clone() {
             let mut renderer = renderer.borrow_mut();
-            self.render_capture(&mut renderer, size, fourcc, tracker, content)?
+            self.render_capture(&mut renderer, size, fourcc, tracker, content, output_index)?
         } else if let Some(backend) = self.winit_backend.clone() {
             let mut backend = backend.borrow_mut();
-            self.render_capture(backend.renderer(), size, fourcc, tracker, content)?
+            self.render_capture(backend.renderer(), size, fourcc, tracker, content, output_index)?
         } else {
             // Shouldn't happen — one of the two is always set once either
             // backend has finished starting up — but stay panic-free.
@@ -206,8 +217,9 @@ impl State {
         fourcc: Fourcc,
         tracker: &RefCell<OutputDamageTracker>,
         content: Vec<crate::graph::ContentPiece>,
+        output_index: usize,
     ) -> Result<Vec<u8>, FailureReason> {
-        let elements = render::build_frame_elements(self, renderer, size, content, 0);
+        let elements = render::build_frame_elements(self, renderer, size, content, output_index);
 
         let buffer_size: Size<i32, BufferCoord> = (size.0, size.1).into();
         let mut texture = Offscreen::<GlesTexture>::create_buffer(renderer, fourcc, buffer_size)
