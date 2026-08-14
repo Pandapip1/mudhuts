@@ -32,7 +32,17 @@ use mudhuts_term::GlyphCache;
 use mudhuts_term::palette::Rgb;
 use mudhuts_term::render::{CellInfo, Damage, damage_bounds};
 
-const ATLAS_SIZE: u32 = 1024;
+// 2048, not 1024: a `ShelfPacker` with no eviction (see its own doc
+// comment) means a single very long-lived terminal cycling through many
+// distinct glyphs (rotating logs, heavy CJK/emoji output) can exhaust a
+// small atlas, at which point new glyphs silently stop rendering for the
+// rest of that terminal's session. Quadrupling capacity for a few extra
+// MB of per-Hut GPU memory (see `queue_gl_delete`'s doc comment) makes
+// that far less likely to matter in practice, without taking on real
+// eviction's own hazard: evicting a glyph still visible on screen would
+// cause visible corruption, which is worse than a new glyph not
+// appearing.
+const ATLAS_SIZE: u32 = 2048;
 
 /// A raw GL object (program/buffer/framebuffer) queued for deletion once a
 /// renderer is next available — see [`queue_gl_delete`]'s doc comment for
@@ -68,7 +78,7 @@ thread_local! {
 /// `LabelRenderer` — one full set per ConsoleHut, recreated for every new
 /// terminal — leaked its shader program, VBO(s), framebuffer, and (for
 /// `GlyphAtlas` specifically) its full `ATLAS_SIZE`×`ATLAS_SIZE` texture
-/// (1024×1024 single-channel = exactly 1MB) for the rest of the
+/// (2048×2048 single-channel = exactly 4MB) for the rest of the
 /// compositor's lifetime: opening and closing a terminal repeatedly grew
 /// driver-side GL/GPU memory without bound, never reclaimed until mudhuts
 /// itself exited.
@@ -808,7 +818,7 @@ impl GpuTermRenderer {
         let resized = self.ensure_size(renderer, width, height)?;
 
         let white = self.atlas.borrow().white;
-        let mut instances = Vec::with_capacity(cells.len() * 2);
+        let mut instances = Vec::with_capacity(cells.len());
         for cell in cells {
             instances.push(Instance {
                 dst_pos: [(cell.col * cell_w) as f32, (cell.row * cell_h) as f32],
@@ -818,55 +828,45 @@ impl GpuTermRenderer {
                 color: rgb_f32(cell.bg),
             });
         }
-        let glyph_start = instances.len();
-        for cell in cells {
-            if cell.c == ' ' || cell.c == '\0' {
-                continue;
-            }
-            // Deferred per-glyph atlas lookups happen inside `with_context`
-            // below (need `&ffi::Gles2` to upload on first sight of a
-            // glyph); collect placement info now, resolve UVs there.
-            instances.push(Instance {
-                dst_pos: [0.0, 0.0],
-                dst_size: [0.0, 0.0],
-                uv_pos: [0.0, 0.0],
-                uv_size: [0.0, 0.0],
-                color: rgb_f32(cell.fg),
-            });
-        }
-
-        let bg_count = glyph_start;
+        let bg_count = instances.len();
         let tex_size = self.tex_size;
 
-        // Resolve glyph atlas entries (may upload new glyphs) and fill in
-        // the placement fields left blank above, dropping instances for
-        // glyphs that can't be placed (atlas full, or a truly empty
-        // glyph) rather than drawing garbage.
-        let mut glyph_instances = Vec::with_capacity(instances.len() - glyph_start);
-        {
-            let cells_with_glyphs = cells.iter().filter(|c| c.c != ' ' && c.c != '\0');
-            for (cell, instance) in cells_with_glyphs.zip(&instances[glyph_start..]) {
-                let entry = renderer
-                    .with_context(|gl| {
-                        self.atlas
-                            .borrow_mut()
-                            .atlas_entry(gl, glyph_cache, cell.c, cell.bold)
-                    })
-                    .map_err(|e| e.to_string())?;
-                let Some(entry) = entry else { continue };
-                let glyph_x = (cell.col * cell_w) as i32 + entry.xmin;
-                let glyph_y =
-                    (cell.row * cell_h) as i32 + baseline as i32 - entry.height as i32 - entry.ymin;
-                glyph_instances.push(Instance {
-                    dst_pos: [glyph_x as f32, glyph_y as f32],
-                    dst_size: [entry.width as f32, entry.height as f32],
-                    uv_pos: entry.uv_pos,
-                    uv_size: entry.uv_size,
-                    color: instance.color,
-                });
-            }
-        }
-        instances.truncate(bg_count);
+        // Resolve glyph atlas entries (may upload new glyphs) directly
+        // into placed instances — no placeholder pass first: an earlier
+        // version pushed a blank `Instance` per glyph cell up front, only
+        // to `truncate`/discard all of them once this real pass built the
+        // actual list, wasted allocation and writes on every redraw. One
+        // `with_context` for the whole batch, not one per cell either —
+        // it does a real `eglMakeCurrent` every call with no already-
+        // current short-circuit, so calling it per-glyph turned a redraw
+        // of e.g. ~200 visible glyphs into ~200 driver calls instead of 1.
+        let atlas = &self.atlas;
+        let glyph_instances: Vec<Instance> = renderer
+            .with_context(|gl| {
+                let mut atlas = atlas.borrow_mut();
+                let mut out = Vec::new();
+                for cell in cells {
+                    if cell.c == ' ' || cell.c == '\0' {
+                        continue;
+                    }
+                    let Some(entry) = atlas.atlas_entry(gl, glyph_cache, cell.c, cell.bold) else {
+                        continue;
+                    };
+                    let glyph_x = (cell.col * cell_w) as i32 + entry.xmin;
+                    let glyph_y =
+                        (cell.row * cell_h) as i32 + baseline as i32 - entry.height as i32 - entry.ymin;
+                    out.push(Instance {
+                        dst_pos: [glyph_x as f32, glyph_y as f32],
+                        dst_size: [entry.width as f32, entry.height as f32],
+                        uv_pos: entry.uv_pos,
+                        uv_size: entry.uv_size,
+                        color: rgb_f32(cell.fg),
+                    });
+                }
+                out
+            })
+            .map_err(|e| e.to_string())?;
+        instances.reserve(glyph_instances.len());
         instances.extend(glyph_instances);
 
         // A freshly (re)allocated target has no prior content to preserve
@@ -1008,28 +1008,35 @@ impl LabelRenderer {
         }];
         let bg_count = instances.len();
 
-        for (i, &c) in chars.iter().enumerate() {
-            if c == ' ' {
-                continue;
-            }
-            let entry = renderer
-                .with_context(|gl| {
-                    self.atlas
-                        .borrow_mut()
-                        .atlas_entry(gl, glyph_cache, c, false)
-                })
-                .map_err(|e| e.to_string())?;
-            let Some(entry) = entry else { continue };
-            let glyph_x = (i * cell_w) as i32 + entry.xmin;
-            let glyph_y = baseline as i32 - entry.height as i32 - entry.ymin;
-            instances.push(Instance {
-                dst_pos: [glyph_x as f32, glyph_y as f32],
-                dst_size: [entry.width as f32, entry.height as f32],
-                uv_pos: entry.uv_pos,
-                uv_size: entry.uv_size,
-                color: rgb_f32(fg),
-            });
-        }
+        // One `with_context` (real `eglMakeCurrent`) for the whole label,
+        // not one per glyph — see `GpuTermRenderer::redraw`'s identical
+        // fix/doc comment for why that matters.
+        let atlas = &self.atlas;
+        let glyph_instances: Vec<Instance> = renderer
+            .with_context(|gl| {
+                let mut atlas = atlas.borrow_mut();
+                let mut out = Vec::new();
+                for (i, &c) in chars.iter().enumerate() {
+                    if c == ' ' {
+                        continue;
+                    }
+                    let Some(entry) = atlas.atlas_entry(gl, glyph_cache, c, false) else {
+                        continue;
+                    };
+                    let glyph_x = (i * cell_w) as i32 + entry.xmin;
+                    let glyph_y = baseline as i32 - entry.height as i32 - entry.ymin;
+                    out.push(Instance {
+                        dst_pos: [glyph_x as f32, glyph_y as f32],
+                        dst_size: [entry.width as f32, entry.height as f32],
+                        uv_pos: entry.uv_pos,
+                        uv_size: entry.uv_size,
+                        color: rgb_f32(fg),
+                    });
+                }
+                out
+            })
+            .map_err(|e| e.to_string())?;
+        instances.extend(glyph_instances);
 
         let (instance_vbo, fbo) = (self.instance_vbo, self.fbo);
         let atlas = self.atlas.borrow();
