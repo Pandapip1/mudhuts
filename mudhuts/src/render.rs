@@ -781,28 +781,39 @@ fn composite_normal_content(
 /// popup, chrome, terminal/window content) should be visible, or even
 /// get a fresh texture, while the session is locked.
 ///
-/// The locking client's own [`LockSurface`](smithay::wayland::session_lock::LockSurface),
-/// once mapped and alive, wins; otherwise (nothing mapped yet, or a
-/// stale one that's gone) a plain opaque rectangle covering the whole
-/// output, so the screen actually goes blank the instant `state.locked`
-/// flips true rather than leaving the last real frame on screen until
-/// some client gets around to mapping a lock surface — the protocol
-/// requires exactly that blank-or-locked frame to have been presented
-/// before `locked()` can even be sent to the client (see
-/// `handlers/session_lock.rs`'s `lock` doc comment).
+/// This output's own lock surface
+/// ([`LockSurface`](smithay::wayland::session_lock::LockSurface)), once
+/// mapped and alive, wins; otherwise (nothing mapped yet for *this*
+/// output, or a stale one that's gone) a plain opaque rectangle covering
+/// the whole output, so the screen actually goes blank the instant
+/// `state.locked` flips true rather than leaving the last real frame on
+/// screen until some client gets around to mapping a lock surface — the
+/// protocol requires exactly that blank-or-locked frame to have been
+/// presented before `locked()` can even be sent to the client (see
+/// `handlers/session_lock.rs`'s `lock` doc comment). Real multi-monitor:
+/// looked up by this specific `output_index`'s own `Output` identity in
+/// `state.lock_surfaces`, not a single shared slot — a conforming
+/// locker maps one lock surface per output, and every output needs its
+/// own interactive unlock prompt, not just whichever one was mapped
+/// most recently.
 fn lock_screen_elements(
     state: &State,
     renderer: &mut GlesRenderer,
     size: (i32, i32),
+    output_index: usize,
 ) -> Vec<Element> {
-    if let Some(surface) = &state.lock_surface
+    let this_output = state.stack.outputs().get(output_index).map(|slot| &slot.output);
+    let matching = this_output
+        .and_then(|output| state.lock_surfaces.iter().find(|(o, _)| o == output))
+        .map(|(_, surface)| surface);
+    if let Some(surface) = matching
         && surface.alive()
     {
         let elems: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = render_elements_from_surface_tree(
             renderer,
             surface.wl_surface(),
             smithay::utils::Point::<i32, smithay::utils::Physical>::from((0, 0)),
-            Scale::from(state.output_scale()),
+            Scale::from(state.output_scale_for(output_index)),
             1.0,
             Kind::Unspecified,
         );
@@ -866,7 +877,7 @@ pub fn build_frame_elements(
     // succeeded. Session lock stays a whole-compositor concept (every
     // output blanks together), not per-output.
     if state.locked {
-        let elements = lock_screen_elements(state, renderer, size);
+        let elements = lock_screen_elements(state, renderer, size, output_index);
         // See the matching call at this function's other exit point below.
         crate::malloc::trim(0);
         return elements;

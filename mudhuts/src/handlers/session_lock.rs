@@ -30,9 +30,11 @@
 //!    submitted one — see those call sites for where `pending_lock` is
 //!    finally taken and confirmed.
 //! 3. The client calls `get_lock_surface` for whatever output(s) it knows
-//!    about (just the one, here) → [`new_surface`](SessionLockHandler::new_surface)
-//!    fires, and the resulting [`LockSurface`] is stored so `render.rs`
-//!    can composite it once it has content.
+//!    about — one call per output, real multi-monitor — →
+//!    [`new_surface`](SessionLockHandler::new_surface) fires once per call,
+//!    and the resulting [`LockSurface`] is stored (keyed by that output)
+//!    so `render.rs` can composite each output's own surface once it has
+//!    content.
 //! 4. `unlock_and_destroy` from the client that actually holds the lock →
 //!    Smithay validates that it's the right instance (a stale/second
 //!    client's attempt is rejected at the protocol level before this even
@@ -68,17 +70,17 @@ impl SessionLockHandler for State {
         }
         self.accepted_lock = Some(confirmation.ext_session_lock().clone());
         self.locked = true;
-        // A stale lock surface from some previous lock session shouldn't
-        // still be showing (there shouldn't be one, since `unlock` always
+        // Stale lock surfaces from some previous lock session shouldn't
+        // still be showing (there shouldn't be any, since `unlock` always
         // clears this too, but staying defensive rather than assuming).
-        self.lock_surface = None;
+        self.lock_surfaces.clear();
         self.pending_lock = Some(confirmation);
         self.request_redraw();
     }
 
     fn unlock(&mut self) {
         self.locked = false;
-        self.lock_surface = None;
+        self.lock_surfaces.clear();
         self.accepted_lock = None;
         // Shouldn't still be `Some` by the time a legitimate `unlock`
         // fires (it's only ever held between `lock` and the next
@@ -128,7 +130,11 @@ impl SessionLockHandler for State {
         // the size just set above out to the client, since that automatic
         // call happens right after this function returns.
         surface.send_configure();
-        self.lock_surface = Some(surface);
+        // Replace, not append — a client re-requesting a lock surface
+        // for an output it already has one on shouldn't end up with two
+        // entries for the same `Output`.
+        self.lock_surfaces.retain(|(existing, _)| existing != &out);
+        self.lock_surfaces.push((out, surface));
         self.request_redraw();
     }
 }
