@@ -49,7 +49,7 @@ impl TabNode {
     /// own `children` input instead of a `Vec<Hut>` field length.
     /// Returns whether anything actually cycled, matching
     /// `Hut::cycle_innermost`'s own return convention.
-    pub fn cycle(&mut self, graph: &Graph, self_id: NodeId, dir: Direction) -> bool {
+    pub fn cycle<Env>(&mut self, graph: &Graph<Env>, self_id: NodeId, dir: Direction) -> bool {
         let len = graph.hut_list_input(self_id, "children").len();
         if len < 2 {
             return false;
@@ -65,14 +65,14 @@ impl Default for TabNode {
     }
 }
 
-impl Node for TabNode {
+impl<Env> Node<Env> for TabNode {
     fn inputs(&self) -> &[InputPort] {
         CHILDREN_INPUT
     }
     fn outputs(&self) -> &[OutputPort] {
         CONTENT_OUTPUT
     }
-    fn resolve(&mut self, graph: &mut Graph, self_id: NodeId, _port: &'static str) -> PortValue {
+    fn resolve(&mut self, graph: &mut Graph<Env>, self_id: NodeId, _port: &'static str) -> PortValue {
         let children = graph.hut_list_input(self_id, "children");
         match children.get(*self.active) {
             Some(&child) => graph
@@ -112,7 +112,7 @@ impl TileNode {
     /// Same wraparound rule as [`TabNode::cycle`], applied to which pane
     /// has keyboard focus instead of which tab is shown — mirrors
     /// `Hut::cycle_innermost`'s Tile-Hut arm.
-    pub fn cycle(&mut self, graph: &Graph, self_id: NodeId, dir: Direction) -> bool {
+    pub fn cycle<Env>(&mut self, graph: &Graph<Env>, self_id: NodeId, dir: Direction) -> bool {
         let len = graph.hut_list_input(self_id, "children").len();
         if len < 2 {
             return false;
@@ -122,14 +122,14 @@ impl TileNode {
     }
 }
 
-impl Node for TileNode {
+impl<Env> Node<Env> for TileNode {
     fn inputs(&self) -> &[InputPort] {
         CHILDREN_INPUT
     }
     fn outputs(&self) -> &[OutputPort] {
         CONTENT_OUTPUT
     }
-    fn resolve(&mut self, graph: &mut Graph, self_id: NodeId, _port: &'static str) -> PortValue {
+    fn resolve(&mut self, graph: &mut Graph<Env>, self_id: NodeId, _port: &'static str) -> PortValue {
         // Every pane is visible at once (unlike TabNode) — every child
         // gets resolved, not just `active`, even though there's nowhere
         // real to composite the results into yet (see this module's doc
@@ -164,14 +164,14 @@ mod tests {
         resolved: std::rc::Rc<std::cell::Cell<bool>>,
     }
     const LEAF_OUTPUTS: &[OutputPort] = &[OutputPort { name: "content", kind: PortKind::Content }];
-    impl Node for LeafNode {
+    impl<Env> Node<Env> for LeafNode {
         fn inputs(&self) -> &[InputPort] {
             &[]
         }
         fn outputs(&self) -> &[OutputPort] {
             LEAF_OUTPUTS
         }
-        fn resolve(&mut self, _graph: &mut Graph, _self_id: NodeId, _port: &'static str) -> PortValue {
+        fn resolve(&mut self, _graph: &mut Graph<Env>, _self_id: NodeId, _port: &'static str) -> PortValue {
             self.resolved.set(true);
             PortValue::Content(RenderedContent::default())
         }

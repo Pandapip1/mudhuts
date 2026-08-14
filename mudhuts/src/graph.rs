@@ -5,13 +5,14 @@
 //! why ports are a closed runtime enum rather than a `Node<In, Out>` type
 //! parameter.
 //!
-//! Deliberately has no dependency on `GlesRenderer` or any other real
-//! rendering type — kept fully unit-testable against synthetic nodes with
-//! no GL context required, matching how `stack.rs`'s own tests already
-//! avoid needing one. Real render integration (a node needing an actual
-//! `&mut GlesRenderer` to produce its `RenderedContent`) is an open
-//! question left to migration step 3, once there's a concrete node that
-//! actually needs it — see [`RenderedContent`]'s doc comment.
+//! Deliberately has no dependency on `GlesRenderer` itself, or on doing
+//! any actual rendering — [`RenderedContent`] names `GlesTexture`/
+//! `DamageSnapshot` as plain (usually `None`) field types, the same way
+//! `ConsoleHut::last_texture` already does, but nothing here ever needs a
+//! live GL context to construct or test against one: every test in this
+//! module and `graph_nodes.rs` runs with `RenderedContent::default()`
+//! (`None`/`None`), matching how `stack.rs`'s own tests already avoid
+//! needing a real renderer at all.
 //!
 //! ## Two kinds of link, not one
 //!
@@ -37,12 +38,38 @@
 //!   needed on the source side (a Hut reference can point at *any* node
 //!   in the graph, unlike a value link, which must match a specific
 //!   declared output kind).
+//!
+//! ## Why `Graph<Env>`
+//!
+//! A real render-shaped node (Console/Terminal, migration step 3) needs
+//! an actual `&mut GlesRenderer` inside its own `Node::resolve` to
+//! produce a real [`RenderedContent`] — but this module has no
+//! `GlesRenderer` dependency at all (see above), and `Node::resolve`'s
+//! signature has no renderer parameter. Adding one directly would force
+//! *every* node (including every purely-structural one like `TabNode`,
+//! and every synthetic test node in this module) to thread a renderer
+//! through regardless of whether it needs one, and would force this
+//! module itself to import `GlesRenderer` just to name the parameter
+//! type — breaking the "runs with zero GL context" property every test
+//! here and in `graph_nodes.rs` relies on.
+//!
+//! Instead, `Graph` is generic over an environment type (`Env`,
+//! defaulting to `()`), held as a field a node's own `resolve` reaches
+//! via `graph.env` only if it actually needs to. `Graph<()>` (what every
+//! test in this module and `graph_nodes.rs` uses, via the plain
+//! `Graph::new()`) needs nothing. The real compositor's graph is
+//! `Graph<RenderEnv<'_>>`, defined in `graph_nodes.rs` alongside the
+//! first node that actually reaches into it. A node that never touches
+//! `graph.env` can stay fully generic over `Env` (`impl<Env> Node<Env>
+//! for TabNode`, see `graph_nodes.rs`) — it works unchanged whether it's
+//! ever resolved inside a test's `Graph<()>` or the real `Graph<
+//! RenderEnv<'_>>`.
 
 // Migration step 1 (see this module's doc comment): nothing in
 // `main.rs`/`state.rs` constructs a real `Graph` yet, so every item here
 // is genuinely dead code from the non-test binary's point of view — the
 // module's own unit tests already exercise the whole API (see below).
-// Remove once migration step 2 wires a real `Graph` into `main.rs`.
+// Remove once migration step 4 wires a real `Graph` into `main.rs`.
 #![allow(dead_code)]
 
 use std::collections::HashMap;
@@ -95,15 +122,19 @@ pub struct OutputPort {
     pub kind: PortKind,
 }
 
-/// Placeholder for a node's rendered frame content. Real content
-/// (`GlesTexture` + `DamageSnapshot<i32, Buffer>`, the same shape
-/// `ConsoleHut::redraw`/`element_damage_snapshot` already produce) gets
-/// filled in during migration step 3, once a real Console/Terminal node
-/// exists to produce one — kept empty here so the graph core itself has
-/// no `GlesRenderer` dependency and stays unit-testable standalone (see
-/// this module's doc comment).
+/// A node's rendered frame content — a real texture plus a damage
+/// snapshot once migration step 3's Console/Terminal leaf produces one
+/// (the same shape `ConsoleHut::redraw`/`element_damage_snapshot`
+/// already return), `None` for a node with nothing to show yet (a purely
+/// structural node like `TabNode`/`TileNode` that never actually holds
+/// pixels itself — its own `content` output resolves by delegating to
+/// whichever child is active, not by producing anything here directly)
+/// or before a real renderer has ever run.
 #[derive(Clone, Default)]
-pub struct RenderedContent {}
+pub struct RenderedContent {
+    pub texture: Option<smithay::backend::renderer::gles::GlesTexture>,
+    pub damage: Option<smithay::backend::renderer::utils::DamageSnapshot<i32, smithay::utils::Buffer>>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeId(u64);
@@ -112,8 +143,11 @@ pub struct NodeId(u64);
 /// Tab/Tile/Main-Window/Layer-Shell/Output compositing node, or a
 /// non-render control node (e.g. the RFC's refresh-rate example). A pure
 /// sink (Output Hut) has `outputs() == &[]`; a pure leaf (Console/
-/// Terminal) has `inputs() == &[]`.
-pub trait Node {
+/// Terminal) has `inputs() == &[]`. Generic over `Env` — see this
+/// module's "Why `Graph<Env>`" doc section; a node that never needs the
+/// environment can implement this for *any* `Env` (`impl<Env> Node<Env>
+/// for MyNode`).
+pub trait Node<Env> {
     fn inputs(&self) -> &[InputPort];
     fn outputs(&self) -> &[OutputPort];
 
@@ -131,7 +165,7 @@ pub trait Node {
     /// Tab-Hut's `graph.hut_list_input(self_id, "children")`), since
     /// `Node` has no other way to know which id it was constructed under
     /// (`Graph::add_node` assigns it after the fact).
-    fn resolve(&mut self, graph: &mut Graph, self_id: NodeId, port: &'static str) -> PortValue;
+    fn resolve(&mut self, graph: &mut Graph<Env>, self_id: NodeId, port: &'static str) -> PortValue;
 }
 
 #[derive(Debug)]
@@ -153,8 +187,9 @@ pub enum GraphError {
 /// One graph: every node plus its two link tables (value links and Hut-
 /// reference links — see this module's doc comment for why they're kept
 /// separate). Both are stored keyed by their *downstream* (input) side.
-pub struct Graph {
-    nodes: HashMap<NodeId, Box<dyn Node>>,
+/// Generic over `Env` — see this module's "Why `Graph<Env>`" doc section.
+pub struct Graph<Env = ()> {
+    nodes: HashMap<NodeId, Box<dyn Node<Env>>>,
     /// Value-port links (`Content`/`Control`) — `(node, port) ->
     /// (upstream node, upstream port)`, at most one source per input
     /// (linking again replaces the previous source).
@@ -176,16 +211,32 @@ pub struct Graph {
     /// tree) is only actually computed once per frame, not once per
     /// reachable path to it.
     cache: HashMap<(NodeId, &'static str), PortValue>,
+    /// Whatever a real node's `resolve` needs beyond the graph itself —
+    /// `()` for every test in this module/`graph_nodes.rs`, a
+    /// `RenderEnv<'_>` (holding a `&mut GlesRenderer`) for the real
+    /// compositor's graph. Reached directly as a field (`graph.env`),
+    /// not through a method, since a node's `resolve` already has `&mut
+    /// Graph<Env>` in hand.
+    pub env: Env,
 }
 
-impl Default for Graph {
+impl<Env: Default> Default for Graph<Env> {
     fn default() -> Self {
-        Self::new()
+        Self::with_env(Env::default())
     }
 }
 
-impl Graph {
+impl Graph<()> {
+    /// Convenience constructor for the common `Env = ()` case — every
+    /// test in this module and `graph_nodes.rs` uses this, unchanged
+    /// from before `Graph` became generic over `Env`.
     pub fn new() -> Self {
+        Self::with_env(())
+    }
+}
+
+impl<Env> Graph<Env> {
+    pub fn with_env(env: Env) -> Self {
         Self {
             nodes: HashMap::new(),
             links: HashMap::new(),
@@ -193,10 +244,11 @@ impl Graph {
             hut_list_refs: HashMap::new(),
             next_id: 0,
             cache: HashMap::new(),
+            env,
         }
     }
 
-    pub fn add_node(&mut self, node: Box<dyn Node>) -> NodeId {
+    pub fn add_node(&mut self, node: Box<dyn Node<Env>>) -> NodeId {
         let id = NodeId(self.next_id);
         self.next_id += 1;
         self.nodes.insert(id, node);
@@ -357,20 +409,21 @@ mod tests {
 
     /// A pure control leaf — no inputs, one `Control` output — for
     /// exercising value linking/resolution without needing any real
-    /// render-shaped node.
+    /// render-shaped node. Generic over `Env` (never touches it) — see
+    /// this module's "Why `Graph<Env>`" doc section.
     struct ConstNode {
         value: f64,
         resolve_count: std::rc::Rc<std::cell::Cell<u32>>,
     }
     const CONST_OUTPUTS: &[OutputPort] = &[OutputPort { name: "value", kind: PortKind::Control }];
-    impl Node for ConstNode {
+    impl<Env> Node<Env> for ConstNode {
         fn inputs(&self) -> &[InputPort] {
             &[]
         }
         fn outputs(&self) -> &[OutputPort] {
             CONST_OUTPUTS
         }
-        fn resolve(&mut self, _graph: &mut Graph, _self_id: NodeId, _port: &'static str) -> PortValue {
+        fn resolve(&mut self, _graph: &mut Graph<Env>, _self_id: NodeId, _port: &'static str) -> PortValue {
             self.resolve_count.set(self.resolve_count.get() + 1);
             PortValue::Control(self.value)
         }
@@ -381,14 +434,14 @@ mod tests {
     struct DoubleNode;
     const DOUBLE_INPUTS: &[InputPort] = &[InputPort { name: "input", kind: PortKind::Control }];
     const DOUBLE_OUTPUTS: &[OutputPort] = &[OutputPort { name: "output", kind: PortKind::Control }];
-    impl Node for DoubleNode {
+    impl<Env> Node<Env> for DoubleNode {
         fn inputs(&self) -> &[InputPort] {
             DOUBLE_INPUTS
         }
         fn outputs(&self) -> &[OutputPort] {
             DOUBLE_OUTPUTS
         }
-        fn resolve(&mut self, graph: &mut Graph, self_id: NodeId, _port: &'static str) -> PortValue {
+        fn resolve(&mut self, graph: &mut Graph<Env>, self_id: NodeId, _port: &'static str) -> PortValue {
             match graph.resolve_input(self_id, "input") {
                 Some(PortValue::Control(n)) => PortValue::Control(n * 2.0),
                 _ => PortValue::Control(0.0),
@@ -407,14 +460,14 @@ mod tests {
     }
     const TAB_INPUTS: &[InputPort] = &[InputPort { name: "children", kind: PortKind::HutList }];
     const TAB_OUTPUTS: &[OutputPort] = &[OutputPort { name: "value", kind: PortKind::Control }];
-    impl Node for TabLikeNode {
+    impl<Env> Node<Env> for TabLikeNode {
         fn inputs(&self) -> &[InputPort] {
             TAB_INPUTS
         }
         fn outputs(&self) -> &[OutputPort] {
             TAB_OUTPUTS
         }
-        fn resolve(&mut self, graph: &mut Graph, self_id: NodeId, _port: &'static str) -> PortValue {
+        fn resolve(&mut self, graph: &mut Graph<Env>, self_id: NodeId, _port: &'static str) -> PortValue {
             let children = graph.hut_list_input(self_id, "children");
             match children.get(self.active) {
                 Some(&child) => graph.resolve_output(child, "value").unwrap_or(PortValue::Control(0.0)),
@@ -505,14 +558,14 @@ mod tests {
         // input instead.
         struct MainLikeNode;
         const MAIN_INPUTS: &[InputPort] = &[InputPort { name: "main", kind: PortKind::Hut }];
-        impl Node for MainLikeNode {
+        impl<Env> Node<Env> for MainLikeNode {
             fn inputs(&self) -> &[InputPort] {
                 MAIN_INPUTS
             }
             fn outputs(&self) -> &[OutputPort] {
                 &[]
             }
-            fn resolve(&mut self, _graph: &mut Graph, _self_id: NodeId, _port: &'static str) -> PortValue {
+            fn resolve(&mut self, _graph: &mut Graph<Env>, _self_id: NodeId, _port: &'static str) -> PortValue {
                 unreachable!("MainLikeNode has no outputs")
             }
         }
@@ -580,5 +633,31 @@ mod tests {
             graph.hut_list_input(tab, "children").is_empty(),
             "a Hut reference to a removed node should be pruned, not dangle"
         );
+    }
+
+    #[test]
+    fn a_real_env_is_reachable_from_inside_resolve() {
+        // Proves the actual mechanism migration step 3 depends on: a
+        // node resolved inside a `Graph<Env>` for a non-`()` `Env` can
+        // read `graph.env` from within its own `resolve` call. Doesn't
+        // need anything renderer-shaped to prove this — a plain `i32`
+        // env stands in for `RenderEnv<'_>` just as well.
+        struct ReadsEnvNode;
+        const ENV_OUTPUTS: &[OutputPort] = &[OutputPort { name: "value", kind: PortKind::Control }];
+        impl Node<i32> for ReadsEnvNode {
+            fn inputs(&self) -> &[InputPort] {
+                &[]
+            }
+            fn outputs(&self) -> &[OutputPort] {
+                ENV_OUTPUTS
+            }
+            fn resolve(&mut self, graph: &mut Graph<i32>, _self_id: NodeId, _port: &'static str) -> PortValue {
+                PortValue::Control(graph.env as f64)
+            }
+        }
+        let mut graph: Graph<i32> = Graph::with_env(42);
+        let a = graph.add_node(Box::new(ReadsEnvNode));
+        graph.begin_frame();
+        assert!(matches!(graph.resolve_output(a, "value"), Some(PortValue::Control(n)) if n == 42.0));
     }
 }
