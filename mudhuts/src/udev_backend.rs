@@ -1040,6 +1040,26 @@ fn connector_disconnected(
         // output removal to drop it, so a monitor unplugged mid-lock
         // otherwise left a stale, un-purgeable entry behind forever.
         state.lock_surfaces.retain(|(o, _)| o != &surface.output);
+        // Same reasoning for a stale entry left behind if a monitor is
+        // unplugged mid-lock, before the next full lock/unlock cycle
+        // clears it — see `State::pending_lock_confirmed_outputs`'s doc
+        // comment.
+        state.pending_lock_confirmed_outputs.retain(|o| o != &surface.output);
+        // Every Hut this output is about to lose (only if `remove_output`
+        // below will actually remove the slot — it refuses to for the
+        // very last one, in which case nothing is really destroyed yet)
+        // needs its Alt-Tab thumbnail cache entry purged too — see
+        // `render::purge_hut_content`'s doc comment. `remove_output`
+        // itself has no hook back into `State`/`render.rs`'s thread-local
+        // caches, so this is the one place responsible for it on the
+        // hotplug-disconnect path, same as the shell-exit path in
+        // `state.rs`.
+        let will_remove_output = state.stack.outputs().len() > 1;
+        let removed_hut_ids: Vec<u64> = if will_remove_output {
+            state.stack.all_huts_for(surface.output_index).map(|hut| hut.id).collect()
+        } else {
+            Vec::new()
+        };
         // Refuses to actually remove the last remaining slot (see
         // `GraphStack::remove_output`'s doc comment) — the disconnected
         // connector's `OutputSlot` is left in place with its now-stale
@@ -1047,6 +1067,9 @@ fn connector_disconnected(
         // matching the exact single-output startup state this module
         // already tolerates before the first connector ever appears.
         state.stack.remove_output(surface.output_index);
+        for id in removed_hut_ids {
+            crate::render::purge_hut_content(id);
+        }
         // Every other surface pointing at a slot index *after* the
         // removed one shifts down by one along with it — mirrors
         // `GraphStack::remove_output`'s own index-shift internally.
