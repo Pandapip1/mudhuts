@@ -197,6 +197,83 @@ smithay::backend::renderer::element::render_elements! {
 
 type Element = OutputRenderElements<GlesRenderer, HutSpaceRenderElement>;
 
+/// Convert a graph node's resolved `Vec<`[`crate::graph::ContentPiece`]`>`
+/// into real frame elements — migration step 4's render bridge. `origin`
+/// is `State::usable_area()`'s own `(x, y)`, applied to `Texture` pieces
+/// only (they arrive local-frame-relative — see `ContentPiece`'s own doc
+/// comment); `Window` pieces arrive already-absolute (`ConsoleNode`
+/// reads them straight from `ConsoleHut::space`, whose own elements were
+/// mapped with this same origin already baked in) and must **not** be
+/// translated again here, or a Main Window would render offset twice.
+///
+/// `Window` pieces are expanded into real render elements right here,
+/// not any earlier — `AsRenderElements::render_elements` produces
+/// `TextureRenderElement`/`WaylandSurfaceRenderElement`, neither of which
+/// implements `Clone` (each owns real per-element damage state with its
+/// own `Drop`-time bookkeeping, confirmed against Smithay's pinned
+/// source), so they can never be the thing `Graph::resolve_output`'s
+/// per-frame memoization cache clones — this function is what turns the
+/// still-Clone-safe `ContentPiece::Window` (a bare `Window` + position)
+/// into the real, non-Clone elements, exactly once per frame, after
+/// caching is no longer a concern. Smithay's own `Window::AsRenderElements`
+/// impl already walks `PopupManager::popups_for_surface` internally, so
+/// this loses no popup fidelity versus the pre-graph
+/// `space_render_elements`-based path, which delegates to the exact same
+/// `Window` impl under the hood.
+pub(crate) fn content_pieces_to_elements(
+    pieces: Vec<crate::graph::ContentPiece>,
+    renderer: &mut GlesRenderer,
+    origin: (f64, f64),
+    scale: f64,
+) -> Vec<Element> {
+    let mut elements = Vec::new();
+    for piece in pieces {
+        match piece {
+            crate::graph::ContentPiece::Texture { id, texture, damage, position: (x, y) } => {
+                let element = TextureRenderElement::from_texture_with_damage(
+                    id,
+                    renderer.context_id(),
+                    (origin.0 + x, origin.1 + y),
+                    texture,
+                    texture_buffer_scale(scale),
+                    Transform::Normal,
+                    None,
+                    None,
+                    None,
+                    None,
+                    damage,
+                    Kind::Unspecified,
+                );
+                elements.push(OutputRenderElements::from(element));
+            }
+            crate::graph::ContentPiece::Window { window, position } => {
+                let physical_loc = position.to_f64().to_physical_precise_round(Scale::from(scale));
+                let window_elements: Vec<HutSpaceRenderElement> =
+                    smithay::backend::renderer::element::AsRenderElements::<GlesRenderer>::render_elements(
+                        &window,
+                        renderer,
+                        physical_loc,
+                        Scale::from(scale),
+                        1.0,
+                    );
+                // `SpaceRenderElements::Element(Wrap::from(_))`, not a
+                // direct `OutputRenderElements::from` — matches exactly
+                // how `space_render_elements`'s own internals wrap a
+                // `Space`-external render element (checked against
+                // Smithay's pinned source): `OutputRenderElements` only
+                // has a `From<SpaceRenderElements<R, E>>`, not a direct
+                // `From<HutSpaceRenderElement>`.
+                elements.extend(window_elements.into_iter().map(|e| {
+                    OutputRenderElements::from(SpaceRenderElements::Element(
+                        smithay::backend::renderer::element::Wrap::from(e),
+                    ))
+                }));
+            }
+        }
+    }
+    elements
+}
+
 /// Stable identity for [`composite_normal_content`]'s single composited
 /// wrapper element — a module-level singleton (not a `State`/per-instance
 /// field) since there's only ever one "normal content" slot in the whole
