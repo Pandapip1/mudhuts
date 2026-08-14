@@ -1,7 +1,7 @@
 use std::sync::OnceLock;
 
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
-use smithay::reexports::wayland_server::Client;
+use smithay::reexports::wayland_server::{Client, Resource};
 use smithay::reexports::wayland_server::protocol::{wl_buffer, wl_surface::WlSurface};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
@@ -74,15 +74,35 @@ impl BufferHandler for State {
 }
 
 /// `wp_fractional_scale_v1` — see `state.rs`'s `fractional_scale_manager_state`
-/// doc comment. mudhuts is single-output, so there's no anvil-style
-/// "which output does this surface actually scan out from" question to
-/// answer here — every surface gets the one output's scale, full stop.
+/// doc comment.
 impl FractionalScaleHandler for State {
     fn new_fractional_scale(&mut self, surface: WlSurface) {
-        let Some(output) = self.output.as_ref() else {
+        // No real output exists yet (a client can race the compositor's
+        // own connector enumeration at startup) — send nothing rather
+        // than falling through to `output_scale_for`'s own out-of-range
+        // default of `1.0`: this handler never re-pushes a corrected
+        // scale later (see this field's own doc comment), so eagerly
+        // sending a possibly-wrong `1.0` here would permanently lock the
+        // client to it once a real, differently-scaled output shows up.
+        if self.output.is_none() {
             return;
-        };
-        let scale = output.current_scale().fractional_scale();
+        }
+        // This surface's own owning Hut/output, not `self.output` (the
+        // focused one) — real multi-monitor, same as everywhere else. A
+        // `wp_fractional_scale_v1` object is typically created right
+        // after the surface itself, often before it's even a mapped
+        // toplevel `find_window_by_surface` could resolve, so this
+        // resolves ownership the same way `handlers/xdg_shell.rs`'s
+        // `new_toplevel` picks a default Hut for a brand-new surface: via
+        // the client's process ancestry, falling back to the focused
+        // output only if that doesn't resolve to a known Hut.
+        let output_index = surface
+            .client()
+            .and_then(|client| client.get_credentials(&self.display_handle).ok())
+            .and_then(|creds| crate::ownership::find_owning_hut(creds.pid as u32, &self.stack))
+            .and_then(|hut_id| self.stack.output_index_for_hut(hut_id))
+            .unwrap_or_else(|| self.stack.focused_output_index());
+        let scale = self.output_scale_for(output_index);
         with_states(&surface, |states| {
             with_fractional_scale(states, |fractional_scale| {
                 fractional_scale.set_preferred_scale(scale);

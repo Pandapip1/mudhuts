@@ -108,12 +108,13 @@ pub struct State {
     /// client render its own content at the output's real scale instead
     /// of over- or under-sampling. Driven by
     /// `FractionalScaleHandler::new_fractional_scale`
-    /// (`handlers/compositor.rs`), which pushes `State::output_scale()`
-    /// to a surface the moment it asks for one — mudhuts is single-
-    /// output and never changes scale mid-session (see `output_scale()`'s
-    /// doc comment), so unlike anvil's `post_repaint`, there's no
-    /// ongoing per-frame re-push loop needed here: nothing could ever
-    /// change between one push and the next.
+    /// (`handlers/compositor.rs`), which pushes the scale of whichever
+    /// output the surface's own owning Hut resolves to (real multi-
+    /// monitor: not necessarily the focused one) the moment it asks for
+    /// one. No output ever changes scale mid-session (see
+    /// `output_scale_for()`'s doc comment), so unlike anvil's
+    /// `post_repaint`, there's no ongoing per-frame re-push loop needed
+    /// here: nothing could ever change between one push and the next.
     pub fractional_scale_manager_state: FractionalScaleManagerState,
     /// `ext_data_control_v1` — lets a privileged client (a clipboard
     /// manager/history tool) see and set *both* selections above on this
