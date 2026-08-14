@@ -186,6 +186,13 @@ impl State {
     /// (see `State::usable_area`'s doc comment on why physical is what
     /// mudhuts' own rendering needs).
     fn handle_pointer_motion(&mut self, pos: smithay::utils::Point<f64, smithay::utils::Logical>, time: u32) {
+        // `pos` arrives genuinely global (`State::pointer_location`'s own
+        // doc comment — real multi-monitor's shared compositor space):
+        // `PointerMotionAbsolute` derives it from `real_output_geometry`,
+        // always `(0, 0)`-rooted since winit is genuinely single-output
+        // there (global and local coincide); `PointerMotion` derives it
+        // from `GraphStack::virtual_bounding_box`, genuinely global for
+        // real multi-monitor hardware.
         self.pointer_location = pos;
         // Real multi-monitor: focus follows the mouse across outputs (the
         // user's resolved policy — see `GraphStack::output_index_at`'s doc
@@ -213,6 +220,21 @@ impl State {
             // happened to repair it.
             self.sync_keyboard_focus_to_view();
         }
+        // Everything past this point — `self.surface_under`, the
+        // terminal's own physical-pixel-native hit-testing, and the real
+        // `wl_pointer.motion` event itself (which also becomes
+        // `pointer.current_location()`, what `try_click_chrome`/
+        // `try_click_layer_surface` read on the next button press) —
+        // needs a position *local* to the now-focused output's own
+        // `(0, 0)` origin, matching how `hut.space`/`layer_map_for_output`
+        // position their own elements (see `GraphStack::virtual_bounding_box`'s
+        // doc comment for the mirror-image concern this pairs with).
+        // Feeding it the raw global `pos` instead — on any output not
+        // sitting at global `(0, 0)` — hit-tested/mapped every one of
+        // these against coordinates far outside that output's own real
+        // bounds, breaking clicks/hover/selection there entirely.
+        let output_position = self.stack.outputs().get(output_index).map(|slot| slot.position).unwrap_or_default();
+        let pos = pos - output_position.to_f64();
         let pos_physical = self.to_physical(pos);
         // Under winit this is a no-op ping (the host draws the cursor,
         // and `winit_backend.rs`'s own input handler already force-
@@ -804,20 +826,37 @@ impl State {
                 // report relative deltas, not an absolute position the
                 // way a nested winit window's host compositor does for
                 // `PointerMotionAbsolute` below — accumulate into the
-                // persisted `pointer_location` and clamp to the output's
-                // bounds (mirrors `.smithay-ref/anvil/src/
-                // input_handler.rs`'s `clamp_coords`, simplified since
-                // mudhuts is single-output). `pointer_location` and
+                // persisted `pointer_location` and clamp to the *whole
+                // virtual desktop's* bounds (mirrors `.smithay-ref/anvil/
+                // src/input_handler.rs`'s `clamp_coords`, generalized to
+                // real multi-monitor via `GraphStack::virtual_bounding_box`).
+                // Clamping against just the focused output's own bounds
+                // (this used to, back when mudhuts was single-output)
+                // pinned a real pointer device at that output's edge —
+                // it could never actually cross onto a second monitor,
+                // no matter how far the mouse moved, unlike every other
+                // multi-monitor piece around it. `pointer_location` and
                 // `event.delta()` are both genuinely Logical (anvil's own
                 // reference clamps against `space.output_geometry`, not a
-                // raw physical mode size, for the same reason) — clamped
-                // against the output's *Logical* bounds, not
-                // `self.output_size` (physical), to keep both sides of
-                // the clamp in the same space.
-                let (max_x, max_y) = self.output_size_logical();
+                // raw physical mode size, for the same reason).
+                let bounds = self.stack.virtual_bounding_box();
                 let mut new_location = self.pointer_location + event.delta();
-                new_location.x = new_location.x.clamp(0.0, max_x.max(0) as f64);
-                new_location.y = new_location.y.clamp(0.0, max_y.max(0) as f64);
+                new_location.x = new_location.x.clamp(bounds.loc.x, (bounds.loc.x + bounds.size.w).max(bounds.loc.x));
+                new_location.y = new_location.y.clamp(bounds.loc.y, (bounds.loc.y + bounds.size.h).max(bounds.loc.y));
+                // `bounds` is only a bounding *hull*, not a true union
+                // (see `GraphStack::virtual_bounding_box`'s doc comment)
+                // — clamp a second time, into whichever output this
+                // resolves to's own real rect, so a "dead zone" between
+                // two different-height outputs can never leave `pos`
+                // somewhere `output_index_at` reports as one output while
+                // not actually being contained by that output's own rect
+                // (which would otherwise get rebased in `handle_pointer_motion`
+                // as if it were safely inside).
+                let output_index = self.stack.output_index_at(new_location);
+                if let Some(rect) = self.stack.output_rect(output_index) {
+                    new_location.x = new_location.x.clamp(rect.loc.x, (rect.loc.x + rect.size.w).max(rect.loc.x));
+                    new_location.y = new_location.y.clamp(rect.loc.y, (rect.loc.y + rect.size.h).max(rect.loc.y));
+                }
                 self.handle_pointer_motion(new_location, event.time_msec());
             }
             InputEvent::PointerMotionAbsolute { event, .. } => {

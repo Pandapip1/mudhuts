@@ -287,8 +287,25 @@ impl GraphStack {
         }
     }
 
-    /// Which output's own real, positioned rectangle (`OutputSlot::position`
-    /// plus its current mode, scale-divided into Logical) contains `pos` —
+    /// Output `index`'s own real, positioned rectangle — `OutputSlot::position`
+    /// plus its current mode, scale-divided into Logical. `None` if
+    /// `index` is out of range or that output has no real mode yet.
+    /// Shared by [`Self::output_index_at`]/[`Self::virtual_bounding_box`],
+    /// and used directly by `input.rs`'s relative-motion clamp to keep a
+    /// real pointer's position genuinely *inside* whichever output it
+    /// resolves to — see that call site's own comment: two side-by-side
+    /// outputs of different heights leave a "dead zone" region inside
+    /// [`Self::virtual_bounding_box`]'s own bounding hull but outside
+    /// every real output's rect, which this lets a caller clamp out of.
+    pub fn output_rect(&self, index: usize) -> Option<Rectangle<f64, Logical>> {
+        let slot = self.outputs.get(index)?;
+        let mode = slot.output.current_mode()?;
+        let scale = slot.output.current_scale().fractional_scale();
+        let size = mode.size.to_f64().to_logical(scale);
+        Some(Rectangle::<f64, Logical>::new(slot.position.to_f64(), size))
+    }
+
+    /// Which output's own real, positioned rectangle contains `pos` —
     /// per the user's resolved focus-follows-mouse policy. Falls back to
     /// the currently-focused output if `pos` doesn't land inside any real
     /// output's rect (e.g. before any output has a real mode yet, or the
@@ -296,18 +313,43 @@ impl GraphStack {
     /// `Option`, mirroring every other "there's always a currently-focused
     /// output" invariant in this module.
     pub fn output_index_at(&self, pos: Point<f64, Logical>) -> usize {
-        for (i, slot) in self.outputs.iter().enumerate() {
-            let Some(mode) = slot.output.current_mode() else {
-                continue;
-            };
-            let scale = slot.output.current_scale().fractional_scale();
-            let size = mode.size.to_f64().to_logical(scale);
-            let rect = Rectangle::<f64, Logical>::new(slot.position.to_f64(), size);
-            if rect.contains(pos) {
+        for i in 0..self.outputs.len() {
+            if self.output_rect(i).is_some_and(|rect| rect.contains(pos)) {
                 return i;
             }
         }
         self.focused_output
+    }
+
+    /// The bounding hull of every real output's own positioned rect — the
+    /// whole virtual desktop a pointer can actually be somewhere within,
+    /// not just the focused output's own local `(0, 0)..size` bounds.
+    /// Used by `input.rs`'s relative-motion (real mouse/touchpad) clamp:
+    /// clamping against the focused output alone (this method's
+    /// predecessor) meant a real pointer device could never actually
+    /// cross onto a second monitor at all — `pointer_location` just
+    /// pinned at the focused output's own edge — even though every other
+    /// multi-monitor piece (`output_index_at`, focus-follows-mouse) was
+    /// already built to handle it. Falls back to a zero-sized rect at the
+    /// origin if no output has a real mode yet (matches `output_index_at`'s
+    /// own "there's always a fallback" shape).
+    ///
+    /// A bounding *hull*, not a true union: two side-by-side outputs of
+    /// different heights (mudhuts' own connector-connect layout always
+    /// places new outputs to the right at the same `y = 0`, so this only
+    /// ever bites on mismatched heights, never widths) leave a "dead
+    /// zone" region inside this hull that belongs to neither real
+    /// output. Clamping only against this alone would let a fast-enough
+    /// diagonal motion land there, where `output_index_at` falls back to
+    /// whichever output is already focused without that output's rect
+    /// actually containing the point — `input.rs`'s caller clamps a
+    /// second time, into [`Self::output_rect`] for whichever index that
+    /// resolves to, specifically to close that gap.
+    pub fn virtual_bounding_box(&self) -> Rectangle<f64, Logical> {
+        (0..self.outputs.len())
+            .filter_map(|i| self.output_rect(i))
+            .reduce(|a, b| a.merge(b))
+            .unwrap_or_else(|| Rectangle::new((0.0, 0.0).into(), (0.0, 0.0).into()))
     }
 
     fn out(&self) -> &OutputSlot {
@@ -1478,6 +1520,34 @@ mod tests {
         // Outside every known rect — falls back to whichever is currently
         // focused, never panics/returns an invalid index.
         assert_eq!(stack.output_index_at(Point::from((-50.0, -50.0))), stack.focused_output_index());
+
+        // A point in the "dead zone" `virtual_bounding_box`'s own doc
+        // comment describes — inside the hull, but outside both real
+        // outputs (second output is only 600 tall, first is 1080) —
+        // falls back the same way, rather than claiming to be inside
+        // either output's own rect.
+        let dead_zone = Point::from((2000.0, 800.0));
+        assert!(stack.output_rect(0).is_some_and(|r| !r.contains(dead_zone)));
+        assert!(stack.output_rect(1).is_some_and(|r| !r.contains(dead_zone)));
+        assert_eq!(stack.output_index_at(dead_zone), stack.focused_output_index());
+    }
+
+    #[test]
+    fn virtual_bounding_box_unions_every_positioned_output_rect() {
+        // Regression case: `input.rs`'s real-mouse relative-motion clamp
+        // used to clamp against just the focused output's own local
+        // bounds, which pinned a real pointer device at that output's
+        // edge forever — it could never actually reach a second monitor.
+        let mut stack = new_stack();
+        stack.set_output(0, crate::space_element::synthetic_output("first", (1920, 1080), 1.0));
+        stack.add_output(crate::space_element::synthetic_output("second", (800, 600), 1.0), Point::from((1920, 0))).unwrap();
+
+        let bounds = stack.virtual_bounding_box();
+        assert_eq!(bounds.loc, Point::from((0.0, 0.0)));
+        // The union should reach past the first output's own 1920 width,
+        // out to the second output's far edge at 1920 + 800.
+        assert_eq!(bounds.size.w, 2720.0);
+        assert_eq!(bounds.size.h, 1080.0, "height is the union's max, not the first output's own");
     }
 
     #[test]
