@@ -295,7 +295,8 @@ impl Terminal {
         if !changed {
             return None;
         }
-        Some(render::collect_cells(term.renderable_content()))
+        let capacity = term.columns() * term.screen_lines();
+        Some(render::collect_cells(term.renderable_content(), capacity))
     }
 
     /// Rasterize the current grid into `buf` (RGBA8, `width * height * 4`

@@ -288,8 +288,13 @@ pub struct CellInfo {
 /// [`render`], this always covers the whole viewport — the GPU path
 /// redraws every cell whenever *anything* changed rather than tracking
 /// fine-grained per-line damage, since instanced GPU draws make that
-/// optimization unnecessary (see the Phase 2.6 plan notes).
-pub fn collect_cells(content: RenderableContent<'_>) -> Vec<CellInfo> {
+/// optimization unnecessary (see the Phase 2.6 plan notes). `capacity`
+/// (`columns * screen_lines`, known to the caller before `content`'s own
+/// `GridIterator` is ever walked — `GridIterator` isn't `ExactSizeIterator`,
+/// so this can't be derived from `content` itself) avoids reallocating/
+/// copy-growing this `Vec` on every single call, called on every terminal
+/// redraw.
+pub fn collect_cells(content: RenderableContent<'_>, capacity: usize) -> Vec<CellInfo> {
     let colors: &Colors = content.colors;
     let cursor_point = content.cursor.point;
     let cursor_shape = content.cursor.shape;
@@ -297,7 +302,7 @@ pub fn collect_cells(content: RenderableContent<'_>) -> Vec<CellInfo> {
     let selection = content.selection;
 
     let display_offset = content.display_offset as i32;
-    let mut cells = Vec::new();
+    let mut cells = Vec::with_capacity(capacity);
     for indexed in content.display_iter {
         // A display-iterator point's `line` is in *grid* space, not
         // viewport space — line 0 there is the top of the non-scrolled
