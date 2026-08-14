@@ -100,6 +100,20 @@ impl<Env> Node<Env> for TabNode {
             None => PortValue::Content(RenderedContent::default()),
         }
     }
+
+    fn focused_child(&self, graph: &Graph<Env>, self_id: NodeId) -> Option<NodeId> {
+        graph.hut_list_input(self_id, "children").get(*self.active).copied()
+    }
+
+    fn resize_to_pixels(&mut self, graph: &mut Graph<Env>, self_id: NodeId, width: i32, height: i32) {
+        // Every child gets the full size, not just `active` — mirrors
+        // `Hut::resize_to_pixels`'s Tab arm exactly: only `active` is
+        // ever shown, but every child needs to track the real size so
+        // switching to it doesn't show a stale layout.
+        for child in graph.hut_list_input(self_id, "children") {
+            graph.with_node_mut(child, |node, graph| node.resize_to_pixels(graph, child, width, height));
+        }
+    }
 }
 
 impl Redrawable for TabNode {
@@ -184,6 +198,27 @@ impl<Env> Node<Env> for TileNode {
             }
         }
         PortValue::Content(pieces)
+    }
+
+    fn focused_child(&self, graph: &Graph<Env>, self_id: NodeId) -> Option<NodeId> {
+        // The *active pane's* own focused leaf, not just itself — mirrors
+        // `Hut::focused_hut`'s Tile arm (`tile.children[*tile.active].0.
+        // focused_hut()`). Returning this pane's id from `focused_child`
+        // is enough on its own: `Graph::focused_leaf`'s walk keeps
+        // calling `focused_child` again on whatever this returns, so a
+        // pane that's itself a nested Tab/Tile keeps resolving deeper
+        // automatically.
+        graph.hut_list_input(self_id, "children").get(*self.active).copied()
+    }
+
+    fn resize_to_pixels(&mut self, graph: &mut Graph<Env>, self_id: NodeId, width: i32, height: i32) {
+        let children = graph.hut_list_input(self_id, "children");
+        let fracs = if self.fracs.len() == children.len() { self.fracs.clone() } else { vec![1.0; children.len()] };
+        self.size = (width, height);
+        let rects = crate::hut::pane_rects(self.axis, fracs.into_iter(), (width, height));
+        for (child, (_, _, w, h)) in children.into_iter().zip(rects) {
+            graph.with_node_mut(child, |node, graph| node.resize_to_pixels(graph, child, w, h));
+        }
     }
 }
 
@@ -335,6 +370,22 @@ impl Node<RenderEnv> for ConsoleNode {
             })
             .collect();
         PortValue::Content(pieces)
+    }
+
+    fn touched(&self) -> bool {
+        self.hut.touched()
+    }
+
+    fn mark_touched(&mut self) {
+        self.hut.mark_touched();
+    }
+
+    fn resize_to_pixels(&mut self, _graph: &mut Graph<RenderEnv>, _self_id: NodeId, width: i32, height: i32) {
+        self.hut.resize_to_pixels(width, height);
+    }
+
+    fn rescale(&mut self, scale: f64) -> Result<(), String> {
+        self.hut.rescale(scale)
     }
 }
 
@@ -564,6 +615,7 @@ mod tests {
     /// leaf actually got resolved, without needing any real rendering.
     struct LeafNode {
         resolved: std::rc::Rc<std::cell::Cell<bool>>,
+        resized: std::rc::Rc<std::cell::Cell<(i32, i32)>>,
     }
     const LEAF_OUTPUTS: &[OutputPort] = &[OutputPort { name: "content", kind: PortKind::Content }];
     impl<Env> Node<Env> for LeafNode {
@@ -577,12 +629,23 @@ mod tests {
             self.resolved.set(true);
             PortValue::Content(RenderedContent::default())
         }
+        fn resize_to_pixels(&mut self, _graph: &mut Graph<Env>, _self_id: NodeId, width: i32, height: i32) {
+            self.resized.set((width, height));
+        }
     }
 
     fn leaf(graph: &mut Graph) -> (NodeId, std::rc::Rc<std::cell::Cell<bool>>) {
         let flag: std::rc::Rc<std::cell::Cell<bool>> = Default::default();
-        let id = graph.add_node(Box::new(LeafNode { resolved: flag.clone() }));
+        let id = graph.add_node(Box::new(LeafNode { resolved: flag.clone(), resized: Default::default() }));
         (id, flag)
+    }
+
+    fn leaf_with_size_tracking(
+        graph: &mut Graph,
+    ) -> (NodeId, std::rc::Rc<std::cell::Cell<(i32, i32)>>) {
+        let resized: std::rc::Rc<std::cell::Cell<(i32, i32)>> = Default::default();
+        let id = graph.add_node(Box::new(LeafNode { resolved: Default::default(), resized: resized.clone() }));
+        (id, resized)
     }
 
     /// A cheap placeholder `Hut::Tab` — mirrors `hut::tests::placeholder`
@@ -715,6 +778,51 @@ mod tests {
         graph.begin_frame();
         let output = OutputHut;
         assert!(output.present(&mut graph, output_id).is_none());
+    }
+
+    #[test]
+    fn tab_node_focused_child_is_the_active_one() {
+        let mut graph = Graph::new();
+        let (a, _) = leaf(&mut graph);
+        let (b, _) = leaf(&mut graph);
+        let mut tab = TabNode::new();
+        *tab.active = 1;
+        let tab_id = graph.add_node(Box::new(tab));
+        graph.set_hut_list(tab_id, "children", vec![a, b]).unwrap();
+
+        assert_eq!(graph.focused_leaf(tab_id), b);
+    }
+
+    #[test]
+    fn tab_node_resize_to_pixels_resizes_every_child_not_just_active() {
+        let mut graph = Graph::new();
+        let (a, a_resized) = leaf_with_size_tracking(&mut graph);
+        let (b, b_resized) = leaf_with_size_tracking(&mut graph);
+        let mut tab = TabNode::new();
+        *tab.active = 1;
+        let tab_id = graph.add_node(Box::new(tab));
+        graph.set_hut_list(tab_id, "children", vec![a, b]).unwrap();
+
+        graph.with_node_mut(tab_id, |node, graph| node.resize_to_pixels(graph, tab_id, 800, 600));
+
+        assert_eq!(a_resized.get(), (800, 600), "inactive children still need to track the real size");
+        assert_eq!(b_resized.get(), (800, 600));
+    }
+
+    #[test]
+    fn tile_node_resize_to_pixels_splits_by_fracs() {
+        let mut graph = Graph::new();
+        let (a, a_resized) = leaf_with_size_tracking(&mut graph);
+        let (b, b_resized) = leaf_with_size_tracking(&mut graph);
+        let mut tile = TileNode::new(Axis::Horizontal);
+        tile.fracs = vec![1.0, 1.0];
+        let tile_id = graph.add_node(Box::new(tile));
+        graph.set_hut_list(tile_id, "children", vec![a, b]).unwrap();
+
+        graph.with_node_mut(tile_id, |node, graph| node.resize_to_pixels(graph, tile_id, 800, 600));
+
+        assert_eq!(a_resized.get(), (400, 600), "even fracs should split the width evenly");
+        assert_eq!(b_resized.get(), (400, 600));
     }
 
     #[test]

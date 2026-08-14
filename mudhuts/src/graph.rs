@@ -223,6 +223,48 @@ pub trait Node<Env> {
     /// `Node` has no other way to know which id it was constructed under
     /// (`Graph::add_node` assigns it after the fact).
     fn resolve(&mut self, graph: &mut Graph<Env>, self_id: NodeId, port: &'static str) -> PortValue;
+
+    /// This node's own currently-focused child, if it delegates focus
+    /// downward (a Tab/Tile-shaped node picking one active child) —
+    /// `None` for a genuine leaf (Console/Terminal), whose own id
+    /// callers should treat as the focused leaf itself. Mirrors
+    /// `Hut::focused_hut`'s recursive walk, generalized so
+    /// `Graph::focused_leaf` (below) doesn't need to know which concrete
+    /// node type it's looking at — a `GraphStack` walks this repeatedly
+    /// until it hits a leaf, the same way `Hut::focused_hut` recurses
+    /// through `Tab`/`Tile` until it hits a bare `Console`.
+    fn focused_child(&self, _graph: &Graph<Env>, _self_id: NodeId) -> Option<NodeId> {
+        None
+    }
+
+    /// Whether this leaf has ever been interacted with — see
+    /// `ConsoleHut::touched`'s doc comment. Defaults to `true`: matches
+    /// `Hut::touched`'s existing rule that anything *other* than a bare
+    /// Console leaf (a Tab/Tile a user deliberately composed) is always
+    /// considered touched, never a "never-used, safe-to-discard"
+    /// candidate.
+    fn touched(&self) -> bool {
+        true
+    }
+
+    /// Marks this leaf touched, if it tracks that at all — a no-op
+    /// default, matching `Hut::mark_touched`'s existing no-op for
+    /// anything but a bare Console leaf.
+    fn mark_touched(&mut self) {}
+
+    /// Resize every leaf reachable from this node to fill an output of
+    /// `width`x`height` physical pixels — mirrors
+    /// `Hut::resize_to_pixels`. Default no-op (a pure control/sink node,
+    /// or any node with nothing pixel-sized of its own, has nothing to
+    /// resize).
+    fn resize_to_pixels(&mut self, _graph: &mut Graph<Env>, _self_id: NodeId, _width: i32, _height: i32) {}
+
+    /// Rebuild this leaf's glyph cache (or whatever else is scale-
+    /// dependent) for a newly-known real output scale — mirrors
+    /// `ConsoleHut::rescale`. Default no-op.
+    fn rescale(&mut self, _scale: f64) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -326,6 +368,43 @@ impl<Env> Graph<Env> {
         for targets in self.hut_list_refs.values_mut() {
             targets.retain(|target| *target != id);
         }
+    }
+
+    pub fn node(&self, id: NodeId) -> Option<&dyn Node<Env>> {
+        self.nodes.get(&id).map(|b| &**b)
+    }
+
+    pub fn node_mut(&mut self, id: NodeId) -> Option<&mut (dyn Node<Env> + 'static)>
+    where
+        Env: 'static,
+    {
+        self.nodes.get_mut(&id).map(|b| &mut **b)
+    }
+
+    /// Call `f` with mutable access to node `id` *and* the rest of the
+    /// graph simultaneously — the same "temporarily remove, call, put
+    /// back" technique [`Self::resolve_output`] already uses (see that
+    /// method's doc comment), exposed generically here for any operation
+    /// that needs to recurse into other nodes while mutating one (e.g.
+    /// [`Node::resize_to_pixels`] cascading a resize down through a
+    /// Tab/Tile node's children). `None` if `id` doesn't exist.
+    pub fn with_node_mut<R>(&mut self, id: NodeId, f: impl FnOnce(&mut dyn Node<Env>, &mut Self) -> R) -> Option<R> {
+        let mut node = self.nodes.remove(&id)?;
+        let result = f(&mut *node, self);
+        self.nodes.insert(id, node);
+        Some(result)
+    }
+
+    /// Walk `id`'s [`Node::focused_child`] chain down to the actual
+    /// focused leaf — the generic version of `Hut::focused_hut`'s
+    /// recursive walk (see that trait method's own doc comment). Returns
+    /// `id` itself if it's already a leaf (or unknown — nothing to walk
+    /// down to).
+    pub fn focused_leaf(&self, mut id: NodeId) -> NodeId {
+        while let Some(child) = self.node(id).and_then(|n| n.focused_child(self, id)) {
+            id = child;
+        }
+        id
     }
 
     fn port_kind(&self, id: NodeId, name: &'static str, want_output: bool) -> Result<PortKind, GraphError> {
@@ -531,6 +610,9 @@ mod tests {
                 None => PortValue::Control(0.0),
             }
         }
+        fn focused_child(&self, graph: &Graph<Env>, self_id: NodeId) -> Option<NodeId> {
+            graph.hut_list_input(self_id, "children").get(self.active).copied()
+        }
     }
 
     #[test]
@@ -590,6 +672,33 @@ mod tests {
 
         graph.begin_frame();
         assert!(matches!(graph.resolve_output(tab, "value"), Some(PortValue::Control(n)) if n == 2.0));
+    }
+
+    #[test]
+    fn focused_leaf_walks_down_through_nested_focused_children() {
+        let mut graph = Graph::new();
+        let a = graph.add_node(Box::new(ConstNode { value: 1.0, resolve_count: Default::default() }));
+        let b = graph.add_node(Box::new(ConstNode { value: 2.0, resolve_count: Default::default() }));
+        let inner_tab = graph.add_node(Box::new(TabLikeNode { active: 1 }));
+        graph.set_hut_list(inner_tab, "children", vec![a, b]).unwrap();
+        let outer_tab = graph.add_node(Box::new(TabLikeNode { active: 0 }));
+        graph.set_hut_list(outer_tab, "children", vec![inner_tab]).unwrap();
+
+        assert_eq!(graph.focused_leaf(outer_tab), b, "should walk through both levels to the real leaf");
+        assert_eq!(graph.focused_leaf(a), a, "a leaf with no focused_child override is its own focused leaf");
+    }
+
+    #[test]
+    fn with_node_mut_gives_simultaneous_access_to_the_node_and_the_rest_of_the_graph() {
+        let mut graph = Graph::new();
+        let a = graph.add_node(Box::new(ConstNode { value: 5.0, resolve_count: Default::default() }));
+        let tab = graph.add_node(Box::new(TabLikeNode { active: 0 }));
+        graph.set_hut_list(tab, "children", vec![a]).unwrap();
+
+        let children_seen_from_inside = graph.with_node_mut(tab, |_node, graph| {
+            graph.hut_list_input(tab, "children")
+        });
+        assert_eq!(children_seen_from_inside, Some(vec![a]));
     }
 
     #[test]
