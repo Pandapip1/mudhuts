@@ -74,6 +74,10 @@ impl SessionLockHandler for State {
         // still be showing (there shouldn't be any, since `unlock` always
         // clears this too, but staying defensive rather than assuming).
         self.lock_surfaces.clear();
+        // See `State::pending_lock_confirmed_outputs`'s doc comment —
+        // fresh for this lock session, not carried over from any
+        // previous one.
+        self.pending_lock_confirmed_outputs.clear();
         self.pending_lock = Some(confirmation);
         self.request_redraw();
     }
@@ -81,6 +85,7 @@ impl SessionLockHandler for State {
     fn unlock(&mut self) {
         self.locked = false;
         self.lock_surfaces.clear();
+        self.pending_lock_confirmed_outputs.clear();
         self.accepted_lock = None;
         // Shouldn't still be `Some` by the time a legitimate `unlock`
         // fires (it's only ever held between `lock` and the next

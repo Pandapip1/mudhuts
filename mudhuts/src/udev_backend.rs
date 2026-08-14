@@ -1178,17 +1178,33 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
                         if let Some(adaptive) = surface.adaptive_refresh.as_mut() {
                             adaptive.frames_since_check += 1;
                         }
-                        // Only now — a locked frame has actually been
-                        // built (via `render.rs`'s early-return guard) and
-                        // successfully queued for real presentation — is
-                        // it safe to tell the locking client its lock
-                        // succeeded. See `handlers/session_lock.rs`'s
-                        // `lock` doc comment for why this can't happen any
-                        // earlier (e.g. synchronously inside that handler).
-                        if state.locked
-                            && let Some(confirmation) = state.pending_lock.take()
-                        {
-                            confirmation.lock();
+                        // A locked frame has actually been built (via
+                        // `render.rs`'s early-return guard) and
+                        // successfully queued for real presentation on
+                        // *this* output. See `handlers/session_lock.rs`'s
+                        // `lock` doc comment for why confirming can't
+                        // happen any earlier (e.g. synchronously inside
+                        // that handler). But this only tells the locking
+                        // client its lock succeeded once *every*
+                        // currently-connected output has reached this
+                        // point — see `State::pending_lock_confirmed_outputs`'s
+                        // doc comment: each crtc queues independently, so
+                        // confirming on the first one to finish would let
+                        // every other monitor's pre-lock content stay
+                        // visible after the client's already been told
+                        // the session is secured.
+                        if state.locked && state.pending_lock.is_some() {
+                            if !state.pending_lock_confirmed_outputs.contains(&output) {
+                                state.pending_lock_confirmed_outputs.push(output.clone());
+                            }
+                            let all_confirmed = state
+                                .stack
+                                .outputs()
+                                .iter()
+                                .all(|slot| state.pending_lock_confirmed_outputs.contains(&slot.output));
+                            if all_confirmed && let Some(confirmation) = state.pending_lock.take() {
+                                confirmation.lock();
+                            }
                         }
                     }
                     Err(err) => tracing::warn!("failed to queue DRM frame: {err}"),
