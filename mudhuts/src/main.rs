@@ -1,3 +1,4 @@
+mod autostart;
 mod chrome;
 mod config;
 mod cursor;
@@ -105,7 +106,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         hut,
         term_events,
         loop_handle,
-        extra_env,
+        extra_env.clone(),
         redraw::RedrawHandle::new(redraw_ping.clone()),
     )?;
     let mut state = State::new(&mut event_loop, display, stack, socket, redraw_ping)?;
@@ -131,6 +132,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // backend with real safety stakes (it can seize DRM master / switch
     // VTs), so it should never activate by surprise.
     if args.tty {
+        // Gated to a real session only — under winit (nested/dev testing)
+        // this would spawn a user's entire real desktop autostart set
+        // into a throwaway test window every time, which nobody wants.
+        autostart::run(&mut state.stack, &extra_env);
         udev_backend::init_udev(&mut event_loop, &mut state, redraw_ping_source)?;
     } else {
         winit_backend::init_winit(&mut event_loop, &mut state, redraw_ping_source)?;

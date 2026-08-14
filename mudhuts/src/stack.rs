@@ -271,7 +271,14 @@ impl MruStackHut {
             .map_err(|e| e.to_string())
     }
 
-    fn spawn_and_insert(&mut self) -> Result<(), String> {
+    /// Spawns a genuinely new background ConsoleHut and appends it to the
+    /// end of The Stack, without touching `current` — so it never becomes
+    /// focused/visible on its own. Returns its id, e.g. for
+    /// `autostart.rs`, which needs a real, already-registered id to hand
+    /// an about-to-be-spawned client via `MUDHUTS_HUT_ID` before that
+    /// client has connected to anything yet (see `ownership.rs`'s module
+    /// doc for why setting that env var directly is enough on its own).
+    pub fn spawn_and_insert(&mut self) -> Result<u64, String> {
         let (hut, events) = ConsoleHut::spawn(self.extra_env.clone(), self.scale)?;
         let id = hut.id;
         self.insert_channel(id, events)?;
@@ -280,7 +287,7 @@ impl MruStackHut {
         let mut hut = Hut::Console(Box::new(hut));
         hut.attach_redraw_handle(self.redraw.clone());
         self.huts.push(hut);
-        Ok(())
+        Ok(id)
     }
 
     /// Move `pos` forward by one step, applying the discard/spawn rules:
