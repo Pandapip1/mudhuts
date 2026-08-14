@@ -424,13 +424,25 @@ pub(crate) fn hut_thumbnail_texture(id: u64) -> Option<(GlesTexture, DamageSnaps
 /// Tile-Hut's panes, the terminal, or the focused Console Hut's own
 /// `space` — built the same way each of `build_frame_elements`'s three
 /// branches always has, in the same real-output-*absolute* physical
-/// coordinates they always have (the terminal at literal `(0, 0)`; a
-/// Tile-Hut's panes and a Console Hut's Main Window/Floating
-/// Windows/Alerts at their own `usable_area()`-offset positions) — *not*
-/// re-based to be local to some smaller canvas. See
-/// [`composite_normal_content`]'s own doc comment on why that has to stay
-/// true all the way through to the offscreen texture this gets rendered
-/// into.
+/// coordinates they always have: **every** branch (the terminal included)
+/// positions its content at `usable_area()`'s own origin, not literally
+/// `(0, 0)` — matching `State::active_pane_offset()`'s identical
+/// assumption for mouse routing (selection, click, scroll) in exactly
+/// this non-Tile case. The terminal branch didn't for a while (rendered
+/// unconditionally at `(0, 0)`) — a real bug, not a documented exception:
+/// invisible whenever `usable_area()`'s origin was already `(0, 0)`
+/// (`usable_area()` only reserves from below/the sides shift `w`/`h`, not
+/// `loc`, unless something's anchored to the *top* or *left* edge —
+/// e.g. a bottom-anchored `wlr-layer-shell` panel, which never moves the
+/// origin), which is why it went unnoticed until a top-anchored panel
+/// (reported live: waybar's `position: top`) made the terminal's content
+/// render `origin.y` pixels higher than every mouse/selection coordinate
+/// assumed it was, while the panel's own surface — positioned by
+/// Smithay's own `layer_map_for_output`/`space_render_elements`, entirely
+/// unrelated machinery — rendered and hit-tested correctly the whole
+/// time. See [`composite_normal_content`]'s own doc comment on why using
+/// real-output-absolute coordinates throughout has to stay true all the
+/// way through to the offscreen texture this gets rendered into.
 fn content_elements(state: &mut State, renderer: &mut GlesRenderer) -> Vec<Element> {
     if matches!(state.stack.focused_top_level(), Hut::Tile(tile) if tile.children.len() >= 2) {
         return build_tile_elements(state, renderer);
@@ -438,6 +450,11 @@ fn content_elements(state: &mut State, renderer: &mut GlesRenderer) -> Vec<Eleme
 
     if state.showing_terminal_effective() {
         let scale = state.output_scale();
+        // Computed before taking `hut`'s mutable borrow below —
+        // `usable_area` needs `&state` as a whole, which the borrow
+        // checker won't allow alongside an active `&mut state.stack`
+        // borrow (same reasoning as `State::sync_visible_main_window`).
+        let (area_x, area_y, _, _) = state.usable_area();
         let hut = state.stack.focused_mut();
         let Some(texture) = hut.redraw(renderer) else {
             return Vec::new();
@@ -455,7 +472,7 @@ fn content_elements(state: &mut State, renderer: &mut GlesRenderer) -> Vec<Eleme
         let element = TextureRenderElement::from_texture_with_damage(
             hut.element_id.clone(),
             renderer.context_id(),
-            (0.0, 0.0),
+            (area_x as f64, area_y as f64),
             texture,
             texture_buffer_scale(scale),
             Transform::Normal,
