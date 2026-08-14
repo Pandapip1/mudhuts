@@ -844,7 +844,7 @@ impl GpuTermRenderer {
         let glyph_instances: Vec<Instance> = renderer
             .with_context(|gl| {
                 let mut atlas = atlas.borrow_mut();
-                let mut out = Vec::new();
+                let mut out = Vec::with_capacity(cells.len());
                 for cell in cells {
                     if cell.c == ' ' || cell.c == '\0' {
                         continue;
@@ -1015,7 +1015,7 @@ impl LabelRenderer {
         let glyph_instances: Vec<Instance> = renderer
             .with_context(|gl| {
                 let mut atlas = atlas.borrow_mut();
-                let mut out = Vec::new();
+                let mut out = Vec::with_capacity(chars.len());
                 for (i, &c) in chars.iter().enumerate() {
                     if c == ' ' {
                         continue;
