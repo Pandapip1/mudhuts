@@ -236,7 +236,21 @@ impl XdgShellHandler for State {
             start_global_location,
         };
 
+        // Set *after* `set_grab`, not before — `set_grab` first calls the
+        // pointer's outgoing grab's own `unset()` if one is already
+        // active (Smithay's `PointerHandle::set_grab`, real source:
+        // unset-then-install), and `MoveSurfaceGrab::unset` unconditionally
+        // clears `dragging_hut_id`. A stale-serial-driven second
+        // `xdg_toplevel.move` for a client that already has a live
+        // `MoveSurfaceGrab` (its serial doesn't change for the grab's
+        // whole lifetime, so `check_grab` above can't rule this out) would
+        // otherwise have this new `Some(hut_id)` immediately clobbered
+        // back to `None` by the old grab's own `unset` a line below,
+        // un-guarding a still-live drag. See `State::dragging_hut_id`'s
+        // own doc comment — cleared by `MoveSurfaceGrab::unset` once
+        // *this* grab ends.
         pointer.set_grab(self, grab, serial, Focus::Clear);
+        self.dragging_hut_id = Some(hut_id);
     }
 
     fn resize_request(

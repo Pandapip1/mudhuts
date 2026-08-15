@@ -246,6 +246,12 @@ impl PointerGrab<State> for MoveSurfaceGrab {
     /// written — worth revisiting if a third near-identical drag type
     /// ever shows up, or if the two are caught drifting.
     fn unset(&mut self, data: &mut State) {
+        // The grab is ending either way past this point — cleared
+        // unconditionally, not just on the branches below that also
+        // persist something, so `sync_visible_main_window`/`sync_hut_space`
+        // stop skipping this Hut's resync as soon as the drag is actually
+        // over (see [`State::dragging_hut_id`]'s own doc comment).
+        data.dragging_hut_id = None;
         // The dragged window's real owning Hut, not `data.stack.focused()`
         // — see [`MoveSurfaceGrab::hut_id`]'s own doc comment: the
         // pointer may have crossed onto a different output mid-drag.
@@ -257,6 +263,10 @@ impl PointerGrab<State> for MoveSurfaceGrab {
         let Some(location) =
             hut.space().element_location(&crate::space_element::HutSpaceElement::Window(self.window.clone()))
         else {
+            // Nothing to persist, but still redraw — the grab is over
+            // either way, and a stale drag-time frame otherwise lingers
+            // until something else happens to trigger a redraw.
+            data.request_redraw();
             return;
         };
 

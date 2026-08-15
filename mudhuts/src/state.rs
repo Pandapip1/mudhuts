@@ -162,6 +162,36 @@ pub struct State {
     /// see `docks.rs`.
     pub dock_drag: Option<crate::docks::DockDrag>,
 
+    /// The id of whichever Hut currently owns an in-progress live drag —
+    /// either `dock_drag` above, or a real `grabs.rs::MoveSurfaceGrab`
+    /// (which Smithay owns once `pointer.set_grab()` is called, so
+    /// `State` has no other way to see it's active). Set at drag-start
+    /// (`docks::start_drag`, `handlers/xdg_shell.rs::move_request`),
+    /// cleared at drag-end (`docks::finish_drag`,
+    /// `grabs::MoveSurfaceGrab::unset`). Checked by
+    /// `sync_visible_main_window`/`sync_hut_space` to skip resyncing
+    /// *this specific* Hut's `space` while its drag is live: a real
+    /// PointerGrab doesn't block keyboard input, so a keybinding that
+    /// changes what's visible (`Action::ToggleTerminal`, `TabNext`, ...)
+    /// can fire on the very Hut a drag is actively writing a live,
+    /// not-yet-persisted position into via `ConsoleHut::space_raw_mut` —
+    /// `sync_main_window_space` unconditionally unmaps everything first,
+    /// which would discard that live write mid-drag, exactly the
+    /// corruption the `space()`/`space_raw_mut`/`space_mut` split
+    /// elsewhere in this codebase already exists to prevent.
+    ///
+    /// One field shared by two independent drag mechanisms, relying on
+    /// them never being live at once (a dock handle press is intercepted
+    /// by `input.rs` before it can reach `move_request`; a client only
+    /// issues `xdg_toplevel.move` for a window it owns, never a dock
+    /// handle) — nothing in the type enforces that itself. Set *after*,
+    /// not before, whatever installs the drag (`move_request`'s own
+    /// comment on why: `pointer.set_grab` replacing an already-live grab
+    /// synchronously calls the outgoing one's `unset()` first, which
+    /// would otherwise immediately clobber a value just set for the new
+    /// one).
+    pub dragging_hut_id: Option<u64>,
+
     /// The pointer's current position, tracked here explicitly for the
     /// udev/libinput backend's relative-motion events (real mice/
     /// touchpads report deltas, not an absolute position the way a
@@ -479,6 +509,7 @@ impl State {
             text_selection_dragged: false,
             mouse_report_button_held: None,
             dock_drag: None,
+            dragging_hut_id: None,
             pointer_location: Point::from((0.0, 0.0)),
             cursor_status: CursorImageStatus::default_named(),
             cursor_shape_manager_state,
@@ -954,11 +985,22 @@ impl State {
     /// which Hut this call is for, so it's a safe no-op whenever the
     /// visible view it would resync to hasn't actually changed.
     pub fn sync_visible_main_window(&mut self) {
-        // Computed before taking `hut`'s mutable borrow below — `focused_usable_area`
-        // needs `&self` as a whole, which the borrow checker won't allow
-        // alongside an active `&mut self.stack` borrow.
-        let (area_x, area_y, _, _) = self.focused_usable_area();
-        self.stack.focused_mut().sync_main_window_space((area_x, area_y));
+        // Skip the resync itself (but still fall through to the keyboard-
+        // focus resync below) if the focused Hut is the one a live drag
+        // is currently writing into — see `State::dragging_hut_id`'s own
+        // doc comment. `sync_main_window_space` unconditionally unmaps
+        // every element first, which would discard that drag's live,
+        // not-yet-persisted `space_raw_mut` write; a keybinding that
+        // reaches this function (`Action::ToggleTerminal`, `TabNext`/
+        // `TabPrev`, ...) doesn't stop working just because the pointer
+        // also has a grab active.
+        if self.dragging_hut_id != Some(self.stack.focused().id) {
+            // Computed before taking `hut`'s mutable borrow below — `focused_usable_area`
+            // needs `&self` as a whole, which the borrow checker won't allow
+            // alongside an active `&mut self.stack` borrow.
+            let (area_x, area_y, _, _) = self.focused_usable_area();
+            self.stack.focused_mut().sync_main_window_space((area_x, area_y));
+        }
         self.sync_keyboard_focus_to_view();
     }
 
@@ -977,9 +1019,14 @@ impl State {
         let Some(output_index) = self.stack.output_index_for_hut(hut_id) else {
             return;
         };
-        let (area_x, area_y, _, _) = self.usable_area_for(output_index);
-        if let Some(hut) = self.stack.find_mut(hut_id) {
-            hut.sync_main_window_space((area_x, area_y));
+        // See `sync_visible_main_window`'s own doc comment on why a
+        // currently-dragging Hut skips the resync itself but still falls
+        // through to the keyboard-focus resync below.
+        if self.dragging_hut_id != Some(hut_id) {
+            let (area_x, area_y, _, _) = self.usable_area_for(output_index);
+            if let Some(hut) = self.stack.find_mut(hut_id) {
+                hut.sync_main_window_space((area_x, area_y));
+            }
         }
         self.sync_keyboard_focus_to_view();
     }

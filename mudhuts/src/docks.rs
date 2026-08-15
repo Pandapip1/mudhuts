@@ -327,6 +327,7 @@ pub fn start_drag(state: &mut State, pos: Point<f64, Physical>) -> bool {
         output,
     };
     drag.attach_redraw_handle(state.redraw_handle());
+    state.dragging_hut_id = Some(drag.hut_id);
     state.dock_drag = Some(drag);
     true
 }
@@ -424,6 +425,7 @@ pub fn finish_drag(state: &mut State) {
     let Some(drag) = state.dock_drag.take() else {
         return;
     };
+    state.dragging_hut_id = None;
     if !drag.detached {
         return;
     }
