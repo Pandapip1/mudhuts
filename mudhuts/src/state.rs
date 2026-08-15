@@ -596,8 +596,21 @@ impl State {
                     self.loop_signal.stop();
                     return;
                 }
-                if let Err(err) = self.stack.remove_exited(id) {
-                    tracing::error!("failed to respawn after shell exit: {err}");
+                match self.stack.remove_exited(id) {
+                    // Focus can shift to a different Hut/pane here (a
+                    // bare top-level removal shifts `current`, a nested
+                    // removal can collapse a Tab/Tile node onto a
+                    // sibling) — without this, real Wayland keyboard
+                    // focus stays pointed at whatever surface it was on
+                    // before the exit, silently routing every later
+                    // keystroke to the wrong Hut/pane. See
+                    // `GraphStack::remove_exited`'s own doc comment.
+                    Ok(Some(output_index)) => {
+                        let hut_id = self.stack.focused_for(output_index).id;
+                        self.sync_hut_space(hut_id);
+                    }
+                    Ok(None) => {}
+                    Err(err) => tracing::error!("failed to respawn after shell exit: {err}"),
                 }
                 // This id can never exist again (`ConsoleHut::id` is a
                 // fresh counter per spawn) — see `render::purge_hut_content`'s

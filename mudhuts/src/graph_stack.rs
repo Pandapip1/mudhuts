@@ -1041,12 +1041,35 @@ impl GraphStack {
     /// A `ConsoleHut`'s shell exited — mirrors
     /// `MruStackHut::remove_exited` exactly, including the "collapse a
     /// Tab/Tile node left with one child" rule.
-    pub fn remove_exited(&mut self, id: u64) -> Result<(), String> {
+    ///
+    /// Returns the touched output's index (`Some`) so the caller can
+    /// resync keyboard focus there — this can shift which entry is
+    /// focused (a bare top-level removal shifts/clamps `current`, a
+    /// nested removal can collapse a Tab/Tile node onto a sibling pane),
+    /// but nothing in this method touches `KeyboardHandle::set_focus`
+    /// itself (no `&mut State`/renderer available here), so a caller that
+    /// skips the resync leaves real Wayland keyboard focus pointed at
+    /// whatever surface it was on before the exit — silently routing
+    /// every subsequent keystroke to the wrong Hut/pane whenever the
+    /// newly-focused entry differs from the old one. `None` for the
+    /// unknown-id no-op case, where nothing actually changed.
+    pub fn remove_exited(&mut self, id: u64) -> Result<Option<usize>, String> {
         let Some(node_id) = self.all_node_ids().into_iter().find(|&node_id| {
             self.graph.downcast::<ConsoleNode>(node_id).is_some_and(|c| c.hut.id == id)
         }) else {
-            return Ok(());
+            return Ok(None);
         };
+        // Resolved *before* any removal below, while `id`'s own Hut still
+        // exists to find — the nested branch's `remove_child` search is
+        // global (`self.all_node_ids()`, not scoped to any one output),
+        // so `self.focused_output` is the wrong fallback whenever the
+        // collapsed Tab/Tile pane lives on a *background* output: it
+        // would report the unrelated focused output as touched, so the
+        // caller's keyboard-focus resync (see this method's own doc
+        // comment) would resync the wrong output and leave the actually-
+        // changed background output's `Space` — and its keyboard focus —
+        // stale.
+        let owning_output = self.output_index_for_hut(id);
 
         // Search every output's own top-level slots, not just the
         // focused one — real multi-monitor: `node_id` can be a bare
@@ -1090,12 +1113,14 @@ impl GraphStack {
             // it, collapsing that node back to a bare child if only one
             // survives (mirrors `Hut::remove_child_hut`). Doesn't change
             // any output's own top-level `huts` list, so there's no
-            // specific *other* output to re-clamp below — the focused
-            // one is as good a default as any (matches the old
-            // unconditional behavior for this branch).
+            // specific *other* output to re-clamp below — but `owning_output`
+            // (resolved above, before removal) is still needed as the
+            // caller's keyboard-focus resync target: `remove_child`'s own
+            // search is global, so the collapsed pane can just as easily
+            // be on a background output as the focused one.
             self.remove_child(node_id);
             self.graph.remove_node(node_id);
-            self.focused_output
+            owning_output.unwrap_or(self.focused_output)
         };
 
         // `touched_output`, not unconditionally the focused one — the
@@ -1115,7 +1140,7 @@ impl GraphStack {
         if let Some(preview) = &mut out.preview {
             *preview = (*preview).min(max_index);
         }
-        Ok(())
+        Ok(Some(touched_output))
     }
 
     /// Remove `target` from whichever node's own `children` list
