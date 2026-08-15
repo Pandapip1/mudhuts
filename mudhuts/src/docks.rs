@@ -109,11 +109,24 @@ pub struct DockDrag {
     /// one path silently rebased position/scale math against a real but
     /// wrong output. Storing only the stable `Output` handle makes that
     /// class of bug structurally impossible — there's no second, staler
-    /// value to disagree with. `GraphStack::remove_output` also always
-    /// destroys a removed output's own Huts together with it (Huts never
-    /// migrate outputs while alive), so `output_index_for` failing here
-    /// already implies `hut_id`'s Hut is gone too — no separate
-    /// Hut-existence fallback needed for this specific resolution.
+    /// value to disagree with.
+    ///
+    /// `output_index_for` failing does *not* always mean `hut_id`'s Hut
+    /// is gone, though — a real, previously-believed-sound argument here
+    /// ("`remove_output` always destroys a removed output's own Huts
+    /// together with it") turned out to miss one case: `remove_output`
+    /// refuses to ever remove the very last remaining slot, so on a
+    /// single-output machine, unplugging and replugging the one
+    /// connector mid-drag leaves the Hut (and this drag) alive while
+    /// `GraphStack::set_output` swaps in a brand new `Output` Arc for
+    /// that slot underneath it, permanently breaking identity-based
+    /// lookups for the handle captured here. `advance_drag` falls back
+    /// to `output_index_for_hut(hut_id)` on a miss (mirroring
+    /// `finish_drag`'s own resolution, which was never affected by this
+    /// bug since it always resolved by hut id) and self-heals this field
+    /// back to the freshly-resolved `Output` once that happens, so the
+    /// fallback is only ever paid once per reconnect, not for the rest
+    /// of the drag.
     output: Output,
 }
 
@@ -357,11 +370,33 @@ pub fn advance_drag(state: &mut State, global_pos: Point<f64, Logical>) {
     let detached = drag.detached;
     let hut_id = drag.hut_id;
     // Resolved fresh, not cached — see [`DockDrag::output`]'s own doc
-    // comment on why. `output_index_for` failing here means this
-    // output (and, with it, this drag's own Hut) was unplugged mid-drag.
-    let Some(output_index) = state.stack.output_index_for(&drag.output) else {
+    // comment on why. Falls back to a hut-id-based search
+    // (`output_index_for_hut`, mirroring `finish_drag`'s own resolution
+    // and `find_mut_for_hint`'s fast-path/fallback shape) if the cached
+    // `Output` handle has gone stale: `GraphStack::remove_output` never
+    // removes the very last remaining slot, so on a single-output
+    // machine, unplugging and replugging the one connector mid-drag
+    // leaves this drag's own Hut alive while `set_output` swaps in a
+    // brand new `Output` Arc for that slot underneath it — permanently
+    // breaking `Output`-identity lookups for a handle captured before
+    // the swap, even though the Hut (and the drag) are both still very
+    // much alive. Only actually means the drag's Hut is gone if BOTH
+    // resolutions fail.
+    let output_index =
+        state.stack.output_index_for(&drag.output).or_else(|| state.stack.output_index_for_hut(hut_id));
+    let Some(output_index) = output_index else {
         return;
     };
+    // Self-heal the cached `Output` handle once it's known stale, so
+    // later calls this same drag hit the cheap identity fast path again
+    // instead of paying for the hut-id fallback on every remaining
+    // motion sample.
+    if let Some(resolved) = state.stack.outputs().get(output_index).map(|slot| slot.output.clone())
+        && let Some(drag) = &mut state.dock_drag
+        && drag.output != resolved
+    {
+        drag.output = resolved;
+    }
     let scale = state.output_scale_for(output_index);
     let output_position = state.stack.output_position(output_index);
     let pos = (global_pos - output_position.to_f64()).to_physical(Scale::from(scale));

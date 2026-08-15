@@ -614,14 +614,17 @@ impl GraphStack {
         // Bounds-checked, not `top_level_entries_for`'s own unchecked
         // `out_at` — every other `_for(output_index)` accessor in this
         // file is called with an index resolved fresh within the same
-        // call, but this one's hot-path callers (`grabs.rs`'s
-        // `MoveSurfaceGrab`, `docks.rs`'s `DockDrag`, both via
-        // `find_mut_for_hint`) cache `output_index` *across* multiple
-        // event-loop turns — an output unplugged mid-drag can shift
-        // later indices down (`GraphStack::remove_output`'s own doc
-        // comment) and leave a cached index pointing past the end of
-        // `self.outputs`, which `out_at`'s unchecked indexing would
-        // panic on.
+        // call, but this one's hot-path caller `grabs.rs`'s
+        // `MoveSurfaceGrab` (via `find_mut_for_hint`) caches
+        // `output_index` on itself *across* multiple event-loop turns —
+        // an output unplugged mid-drag can shift later indices down
+        // (`GraphStack::remove_output`'s own doc comment) and leave that
+        // cached index pointing past the end of `self.outputs`, which
+        // `out_at`'s unchecked indexing would panic on. `docks.rs`'s
+        // `advance_drag` is the other `find_mut_for_hint` caller, but no
+        // longer caches an index on `DockDrag` itself the same way — see
+        // `DockDrag::output`'s own doc comment — it just resolves one
+        // fresh each call and passes it straight through as the hint.
         if output_index >= self.outputs.len() {
             return None;
         }
