@@ -951,6 +951,25 @@ impl State {
         self.stack.focused_mut().sync_main_window_space((area_x, area_y));
     }
 
+    /// [`Self::sync_visible_main_window`], for a specific Hut rather than
+    /// implicitly the focused one — a no-op if `hut_id` no longer exists
+    /// (its shell exited) or its output can't be resolved. Needed
+    /// anywhere a Hut other than the focused one just had its window
+    /// model mutated (`handlers/shell.rs`'s `retag`,
+    /// `handlers/xdg_shell.rs`'s `toplevel_destroyed`, both of which
+    /// search *every* output's own Huts, not just the focused output's):
+    /// `sync_visible_main_window` alone would rebuild the wrong Hut's
+    /// `space`, leaving the one that actually changed un-remapped.
+    pub fn sync_hut_space(&mut self, hut_id: u64) {
+        let Some(output_index) = self.stack.output_index_for_hut(hut_id) else {
+            return;
+        };
+        let (area_x, area_y, _, _) = self.usable_area_for(output_index);
+        if let Some(hut) = self.stack.find_mut(hut_id) {
+            hut.sync_main_window_space((area_x, area_y));
+        }
+    }
+
     /// Find a window (Main Window, Floating Window, or Alert) by its surface
     /// across *every* ConsoleHut, not just whatever's currently visible in
     /// the focused one's own `space` — a background ConsoleHut's windows

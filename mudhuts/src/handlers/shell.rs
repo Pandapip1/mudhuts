@@ -226,7 +226,7 @@ fn retag(state: &mut State, tagged_surface: &WlSurface, target: Option<(Role, Wl
     // borrow); `sync_visible_main_window`/`request_redraw` need `&mut
     // State` themselves, so they're called after the loop's borrow has
     // ended rather than from inside it.
-    let mut handled = false;
+    let mut handled_hut_id = None;
     for hut in state.stack.all_huts_mut() {
         let Some(window) = hut
             .take_bare_main_window(tagged_surface)
@@ -234,6 +234,11 @@ fn retag(state: &mut State, tagged_surface: &WlSurface, target: Option<(Role, Wl
         else {
             continue;
         };
+        // Captured now — `all_huts_mut()` walks every output, not just
+        // the focused one, so the Hut this retag actually landed on
+        // isn't necessarily the focused one (see this function's own
+        // resync below).
+        handled_hut_id = Some(hut.id);
 
         match &target {
             None => {
@@ -269,15 +274,21 @@ fn retag(state: &mut State, tagged_surface: &WlSurface, target: Option<(Role, Wl
                 }
             },
         }
-        handled = true;
         break;
     }
 
-    if handled {
-        state.sync_visible_main_window();
-        // Paired call `sync_keyboard_focus_to_view`'s own doc comment
-        // requires — retagging a window between Main-Window/Floating/
-        // Alert roles can change what's visibly mapped for its Hut.
+    if let Some(hut_id) = handled_hut_id {
+        // This Hut's own space, not `state.sync_visible_main_window()`
+        // (which only ever rebuilds the *focused* Hut's `space` — same
+        // fix/reasoning as `grabs.rs`'s `unset`/`docks.rs`'s
+        // `finish_drag`): the retagged window's Hut isn't necessarily
+        // the focused one, since the loop above searches every output.
+        state.sync_hut_space(hut_id);
+        // Keyboard focus is inherently seat-wide (one focused surface at
+        // a time), not per-output — a no-op if the retagged Hut wasn't
+        // the focused one, but still required alongside the sync above
+        // per `sync_keyboard_focus_to_view`'s own doc comment for the
+        // case where it was.
         state.sync_keyboard_focus_to_view();
         state.request_redraw();
     } else {
