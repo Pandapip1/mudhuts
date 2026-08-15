@@ -305,6 +305,18 @@ impl GraphStack {
         Some(Rectangle::<f64, Logical>::new(slot.position.to_f64(), size))
     }
 
+    /// Output `index`'s own real position in the shared global compositor
+    /// space — `(0, 0)` for an out-of-range index, the same "never end up
+    /// with nothing to add/subtract" convention every caller of this was
+    /// independently re-deriving by hand before this existed
+    /// (`grabs.rs`'s `MoveSurfaceGrab`, `docks.rs`'s `DockDrag`,
+    /// `input.rs`'s pointer-motion rebasing, `handlers/xdg_shell.rs`'s
+    /// `move_request`) — one place to change if that fallback policy
+    /// (e.g. it should propagate `None` instead) ever needs to.
+    pub fn output_position(&self, index: usize) -> Point<i32, Logical> {
+        self.outputs.get(index).map(|slot| slot.position).unwrap_or_default()
+    }
+
     /// Which output's own real, positioned rectangle contains `pos` —
     /// per the user's resolved focus-follows-mouse policy. Falls back to
     /// the currently-focused output if `pos` doesn't land inside any real
@@ -1595,6 +1607,15 @@ mod tests {
         assert!(stack.output_rect(0).is_some_and(|r| !r.contains(dead_zone)));
         assert!(stack.output_rect(1).is_some_and(|r| !r.contains(dead_zone)));
         assert_eq!(stack.output_index_at(dead_zone), stack.focused_output_index());
+    }
+
+    #[test]
+    fn output_position_falls_back_to_the_origin_for_an_out_of_range_index() {
+        let mut stack = new_stack();
+        stack.add_output(crate::space_element::synthetic_output("second", (800, 600), 1.0), Point::from((1920, 0))).unwrap();
+        assert_eq!(stack.output_position(0), Point::from((0, 0)));
+        assert_eq!(stack.output_position(1), Point::from((1920, 0)));
+        assert_eq!(stack.output_position(5), Point::from((0, 0)), "out-of-range falls back to the origin, not a panic");
     }
 
     #[test]
