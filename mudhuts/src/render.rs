@@ -475,8 +475,9 @@ fn refresh_hut_content_thumbnail(
     if size.0 <= 0 || size.1 <= 0 {
         return;
     }
-    hut.sync_main_window_space(area_origin);
-    let elements = match space_render_elements::<_, HutSpaceElement, _>(renderer, [&hut.space], &hut.space_output, 1.0) {
+    let space_output = hut.space_output.clone();
+    let space = hut.space_mut(area_origin);
+    let elements = match space_render_elements::<_, HutSpaceElement, _>(renderer, [&*space], &space_output, 1.0) {
         Ok(elements) => elements,
         Err(err) => {
             tracing::warn!("failed to collect space elements for Alt-Tab thumbnail: {err}");
@@ -934,9 +935,25 @@ pub fn build_frame_elements(
         // anywhere else the way `ConsoleHut::redraw`'s terminal texture
         // already is).
         let (area_x, area_y, _, _) = state.usable_area_for(output_index);
-        for &top in &top_level {
-            if !state.stack.shows_terminal_effective(top) {
-                let leaf = state.stack.graph().focused_leaf(top);
+        for &entry_top in &top_level {
+            // Skips the *focused* entry (`top`, from just above) — unlike
+            // every backgrounded entry, it can be the one a real drag
+            // (`grabs.rs`'s `MoveSurfaceGrab`/`docks.rs`'s `DockDrag`) is
+            // actively writing a live, not-yet-persisted position into
+            // via `ConsoleHut::space_raw_mut` right now (holding a
+            // floating window's title bar while also holding a
+            // stack-hold keybinding to open this very preview is an
+            // unusual but real combination). `refresh_hut_content_thumbnail`
+            // calls the self-syncing `space_mut`, which would rebuild
+            // from the model and discard that live write every single
+            // preview frame — the same corruption this whole file's
+            // `space_raw_mut`/`space()` split exists to prevent
+            // elsewhere. The focused entry's thumbnail just stays
+            // whatever it last was; harmless staleness, matching this
+            // cache's existing tolerance for a since-closed Hut's entry
+            // never being pruned either.
+            if entry_top != top && !state.stack.shows_terminal_effective(entry_top) {
+                let leaf = state.stack.graph().focused_leaf(entry_top);
                 if let Some(console) =
                     state.stack.graph_mut().downcast_mut::<crate::graph_nodes::ConsoleNode>(leaf)
                 {
