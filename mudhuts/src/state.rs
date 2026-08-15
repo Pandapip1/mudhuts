@@ -943,12 +943,23 @@ impl State {
     /// *other* caller of the underlying `ConsoleHut::sync_main_window_space`,
     /// syncing a background entry's own `space` only while its thumbnail
     /// is actually about to be shown.
+    ///
+    /// Also resyncs keyboard focus (`input.rs`'s `sync_keyboard_focus_to_view`)
+    /// every time, not left as a separate call the caller has to remember
+    /// to pair this with — across several rounds of review, real call
+    /// sites kept turning up that called this but not that, leaving
+    /// keyboard input going to a now-hidden surface. Folded in instead of
+    /// documented as a convention: `sync_keyboard_focus_to_view` only
+    /// ever touches the *focused* Hut's own keyboard focus regardless of
+    /// which Hut this call is for, so it's a safe no-op whenever the
+    /// visible view it would resync to hasn't actually changed.
     pub fn sync_visible_main_window(&mut self) {
         // Computed before taking `hut`'s mutable borrow below — `usable_area`
         // needs `&self` as a whole, which the borrow checker won't allow
         // alongside an active `&mut self.stack` borrow.
         let (area_x, area_y, _, _) = self.usable_area();
         self.stack.focused_mut().sync_main_window_space((area_x, area_y));
+        self.sync_keyboard_focus_to_view();
     }
 
     /// [`Self::sync_visible_main_window`], for a specific Hut rather than
@@ -959,7 +970,9 @@ impl State {
     /// `handlers/xdg_shell.rs`'s `toplevel_destroyed`, both of which
     /// search *every* output's own Huts, not just the focused output's):
     /// `sync_visible_main_window` alone would rebuild the wrong Hut's
-    /// `space`, leaving the one that actually changed un-remapped.
+    /// `space`, leaving the one that actually changed un-remapped. Also
+    /// resyncs keyboard focus, same as `sync_visible_main_window` — see
+    /// its own doc comment.
     pub fn sync_hut_space(&mut self, hut_id: u64) {
         let Some(output_index) = self.stack.output_index_for_hut(hut_id) else {
             return;
@@ -968,6 +981,7 @@ impl State {
         if let Some(hut) = self.stack.find_mut(hut_id) {
             hut.sync_main_window_space((area_x, area_y));
         }
+        self.sync_keyboard_focus_to_view();
     }
 
     /// Find a window (Main Window, Floating Window, or Alert) by its surface

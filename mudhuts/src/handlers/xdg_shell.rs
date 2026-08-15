@@ -88,7 +88,6 @@ impl XdgShellHandler for State {
         }
 
         let window = Window::new_wayland_window(surface);
-        let wl_surface = window.toplevel().map(|t| t.wl_surface().clone());
 
         let is_focused_hut = owning_hut_id == self.stack.focused().id;
         let was_empty = self
@@ -117,19 +116,14 @@ impl XdgShellHandler for State {
         if should_show_now {
             *self.stack.focused_mut().showing_terminal = false;
         }
+        // Also gives the new window real keyboard input immediately, not
+        // only after the user clicks it (`sync_visible_main_window` now
+        // always resyncs keyboard focus too — see its own doc comment):
+        // matters especially for the `should_show_now` case, where there
+        // was never an existing window to click away from focus in the
+        // first place. A hand-rolled `keyboard.set_focus` call used to
+        // live here instead, doing the same thing by hand.
         self.sync_visible_main_window();
-
-        // A new window should be able to receive keyboard input as soon as
-        // it's visible, not only after the user clicks it — matters
-        // especially for the should_show_now case, where there was never
-        // an existing window to click away from focus in the first place.
-        if should_show_now && let Some(keyboard) = self.seat.get_keyboard() {
-            keyboard.set_focus(
-                self,
-                wl_surface,
-                smithay::utils::SERIAL_COUNTER.next_serial(),
-            );
-        }
         self.request_redraw();
     }
 
@@ -155,11 +149,6 @@ impl XdgShellHandler for State {
             // (focused-output-only) — same fix/reasoning as
             // `handlers/shell.rs`'s `retag`.
             self.sync_hut_space(hut_id);
-            // Keyboard focus is seat-wide, not per-output — a no-op
-            // unless `hut_id` was also the globally-focused Hut, but
-            // still required per `sync_keyboard_focus_to_view`'s own doc
-            // comment for the case where it was.
-            self.sync_keyboard_focus_to_view();
         }
         self.request_redraw();
     }
@@ -230,7 +219,7 @@ impl XdgShellHandler for State {
         let Some(initial_window_location) = self
             .stack
             .focused()
-            .space
+            .space()
             .element_location(&crate::space_element::HutSpaceElement::Window(window.clone()))
         else {
             return;

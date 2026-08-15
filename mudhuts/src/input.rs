@@ -213,12 +213,6 @@ impl State {
             // left the first hit-test after landing on a new monitor
             // liable to resolve against a stale mapped-window set.
             self.sync_visible_main_window();
-            // Paired call `sync_keyboard_focus_to_view`'s own doc comment
-            // requires after anything that changes the focused Hut —
-            // without it, keyboard input kept going to the old output's
-            // now-hidden surface until some unrelated focus change
-            // happened to repair it.
-            self.sync_keyboard_focus_to_view();
         }
         // Everything past this point — `self.surface_under`, the
         // terminal's own physical-pixel-native hit-testing, and the real
@@ -307,37 +301,25 @@ impl State {
     /// key events via `set_focus`, and the terminal only gets them via
     /// `showing_terminal_effective()` itself (see `process_input_event`),
     /// so the window needs *no* stale focus lingering while it's hidden,
-    /// and *does* need focus the moment it's shown. Must be called
-    /// alongside every `sync_visible_main_window()` call that can change
-    /// which ConsoleHut/tab/pane is now showing — `Action::ToggleTerminal`,
-    /// every chrome click (`try_click_chrome`), the instant paths of
-    /// `Action::StackNext`/`StackPrev`/`TabNext`/`TabPrev`/`WrapTab`/
-    /// `WrapTile`, the `stack-hold` release closure's own `commit_preview`,
-    /// `handlers/xdg_shell.rs`'s `toplevel_destroyed` (the focused Hut's
-    /// visible window closing can fall back to another window/the
-    /// terminal), and `handlers/shell.rs`'s `retag` (moving a window
-    /// between Main-Window/Floating/Alert roles can change what's
-    /// visibly mapped) — a call site that syncs the window but not this
-    /// used to leave keyboard input going to the old, now-hidden surface
-    /// until some unrelated event happened to repair it.
+    /// and *does* need focus the moment it's shown.
     ///
-    /// KNOWN DESIGN RISK, not addressed: this pairing is a hand-followed
-    /// convention, not something the compiler (or anything else)
-    /// enforces — `handlers/xdg_shell.rs`'s `new_toplevel` already
-    /// reaches for its own hand-rolled `keyboard.set_focus(...)` instead
-    /// of calling this, and multiple call sites listed above were
-    /// themselves found missing this pairing across several rounds of
-    /// review, not caught in one pass. Every *new* visibility-changing
-    /// call site added anywhere is just as easy to forget as the ones
-    /// already fixed. A structural fix (e.g. folding this call into
-    /// `sync_visible_main_window`/`sync_hut_space` itself, so the two
-    /// can't be called independently) wasn't done because keyboard focus
-    /// is seat-wide while those two are per-Hut — pairing them
-    /// unconditionally would resync keyboard focus even when a
-    /// *non-focused* Hut's space changed, which is harmless (a no-op,
-    /// per this method's own focused-Hut-only logic) but was judged not
-    /// obviously worth the coupling. Revisit if another call site is
-    /// found missing this.
+    /// Called automatically from `state.rs`'s `sync_visible_main_window`/
+    /// `sync_hut_space` themselves now, not left as a separate call every
+    /// mutation site has to remember to pair with those — across several
+    /// rounds of review, real call sites kept turning up that synced the
+    /// visible window but not this, leaving keyboard input going to the
+    /// old, now-hidden surface until some unrelated event happened to
+    /// repair it; a hand-followed convention with no compiler backing was
+    /// never going to stop that from recurring. Keyboard focus is
+    /// seat-wide while `sync_hut_space` is per-Hut, so folding it in
+    /// unconditionally does mean this can run for a Hut that isn't the
+    /// focused one — harmless, since this method only ever touches
+    /// keyboard focus for `self.stack.focused()`'s own current view
+    /// regardless of which Hut's `space` just changed, so it's a no-op
+    /// whenever the Hut that actually changed wasn't the focused one.
+    /// `handlers/xdg_shell.rs`'s `new_toplevel` used to hand-roll its own
+    /// separate `keyboard.set_focus(...)` call instead of using this —
+    /// removed once folding this in made it fully redundant.
     pub(crate) fn sync_keyboard_focus_to_view(&mut self) {
         let target = if self.showing_terminal_effective() {
             None
@@ -412,7 +394,6 @@ impl State {
                     *tile.active = i;
                 }
                 self.sync_visible_main_window();
-                self.sync_keyboard_focus_to_view();
                 return true;
             }
         }
@@ -434,7 +415,6 @@ impl State {
             // through `TabNode::active`, which already requested the
             // redraw.
             self.sync_visible_main_window();
-            self.sync_keyboard_focus_to_view();
             return true;
         }
 
@@ -451,7 +431,6 @@ impl State {
                 hut.set_active_main_window(hit.index - 1);
             }
             self.sync_visible_main_window();
-            self.sync_keyboard_focus_to_view();
             return true;
         }
 
@@ -600,10 +579,14 @@ impl State {
                 let Some(focused) = keyboard.current_focus() else {
                     return;
                 };
+                // `space()`, not the self-syncing `space_mut` — see
+                // `state.rs`'s `surface_under`'s own doc comment on why
+                // forcing a sync risks discarding a live in-progress
+                // drag write elsewhere in the same Hut's `space`.
                 let window = self
                     .stack
                     .focused()
-                    .space
+                    .space()
                     .elements()
                     .filter_map(|e| match e {
                         crate::space_element::HutSpaceElement::Window(w) => Some(w),
@@ -635,7 +618,6 @@ impl State {
                     // under the purely demand-driven udev backend).
                     *hut.showing_terminal = !*hut.showing_terminal;
                     self.sync_visible_main_window();
-                    self.sync_keyboard_focus_to_view();
                 }
             }
             Action::StackNext => {
@@ -658,7 +640,6 @@ impl State {
                 }
                 if instant {
                     self.sync_visible_main_window();
-                    self.sync_keyboard_focus_to_view();
                 }
                 // The newly-focused (or newly-previewed) ConsoleHut gets resized
                 // to the real output size as part of the redraw this
@@ -675,7 +656,6 @@ impl State {
                 if instant {
                     self.stack.prev();
                     self.sync_visible_main_window();
-                    self.sync_keyboard_focus_to_view();
                 } else {
                     self.stack.preview_prev();
                 }
@@ -703,7 +683,6 @@ impl State {
                     self.stack.cycle_innermost(crate::hut::Direction::Next);
                 }
                 self.sync_visible_main_window();
-                self.sync_keyboard_focus_to_view();
             }
             Action::TabPrev => {
                 if self.stack.focused().main_window_count() >= 2 {
@@ -713,7 +692,6 @@ impl State {
                     self.stack.cycle_innermost(crate::hut::Direction::Prev);
                 }
                 self.sync_visible_main_window();
-                self.sync_keyboard_focus_to_view();
             }
             Action::WrapTab => {
                 // `Stack::wrap_tab` already requests its own redraw
@@ -723,14 +701,12 @@ impl State {
                     tracing::error!("failed to spawn a new ConsoleHut for wrap-tab: {err}");
                 }
                 self.sync_visible_main_window();
-                self.sync_keyboard_focus_to_view();
             }
             Action::WrapTile => {
                 if let Err(err) = self.stack.wrap_tile() {
                     tracing::error!("failed to spawn a new ConsoleHut for wrap-tile: {err}");
                 }
                 self.sync_visible_main_window();
-                self.sync_keyboard_focus_to_view();
             }
             Action::CopySelection => {
                 // Deliberately separate from the primary-selection commit
@@ -833,7 +809,6 @@ impl State {
                             // redraw (see `Action::StackNext`'s arm above).
                             data.stack.commit_preview();
                             data.sync_visible_main_window();
-                            data.sync_keyboard_focus_to_view();
                         }
 
                         // Global keybindings always win, regardless of
@@ -1050,14 +1025,22 @@ impl State {
                     } else if let Some(window) = self
                         .stack
                         .focused()
-                        .space
+                        .space()
                         .element_under(pos)
                         .and_then(|(e, _loc)| match e {
                             crate::space_element::HutSpaceElement::Window(w) => Some(w.clone()),
                             crate::space_element::HutSpaceElement::Composited(_) => None,
                         })
                     {
-                        self.stack.focused_mut().space.raise_element(
+                        // Raw, not the self-syncing `space_mut` — see
+                        // `state.rs`'s `surface_under`'s own doc comment:
+                        // a forced sync here would risk discarding a live
+                        // in-progress drag position or (for the
+                        // `raise_element` call right below) an earlier
+                        // `raise_element`'s own z-order adjustment, since
+                        // `space_mut` always rebuilds in the model's
+                        // fixed iteration order.
+                        self.stack.focused_mut().space_raw_mut().raise_element(
                             &crate::space_element::HutSpaceElement::Window(window.clone()),
                             true,
                         );

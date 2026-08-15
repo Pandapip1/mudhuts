@@ -284,12 +284,6 @@ fn retag(state: &mut State, tagged_surface: &WlSurface, target: Option<(Role, Wl
         // `finish_drag`): the retagged window's Hut isn't necessarily
         // the focused one, since the loop above searches every output.
         state.sync_hut_space(hut_id);
-        // Keyboard focus is inherently seat-wide (one focused surface at
-        // a time), not per-output — a no-op if the retagged Hut wasn't
-        // the focused one, but still required alongside the sync above
-        // per `sync_keyboard_focus_to_view`'s own doc comment for the
-        // case where it was.
-        state.sync_keyboard_focus_to_view();
         state.request_redraw();
     } else {
         tracing::warn!("mudhuts_window_role_v1: tagged toplevel not found in any ConsoleHut");
