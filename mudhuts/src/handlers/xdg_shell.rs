@@ -204,6 +204,13 @@ impl XdgShellHandler for State {
         // pointer crosses onto another monitor mid-drag.
         let hut_id = self.stack.focused().id;
         let output_index = self.stack.focused_output_index();
+        // See `MoveSurfaceGrab::start_global_location`'s own doc comment
+        // — `start_data.location` alone is local to *this* output, not
+        // necessarily whatever output focus is on by the time `motion()`
+        // runs later.
+        let start_output_position =
+            self.stack.outputs().get(output_index).map(|slot| slot.position).unwrap_or_default();
+        let start_global_location = start_data.location + start_output_position.to_f64();
 
         let Some(window) = self.find_window_by_surface(&wl_surface) else {
             return;
@@ -225,6 +232,7 @@ impl XdgShellHandler for State {
             floating_window: is_floating_window,
             hut_id,
             output_index,
+            start_global_location,
         };
 
         pointer.set_grab(self, grab, serial, Focus::Clear);

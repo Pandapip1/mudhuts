@@ -58,6 +58,20 @@ pub struct MoveSurfaceGrab {
     /// so every use falls back to a full `GraphStack::find_mut` rather
     /// than ever trusting a miss here as "the Hut exited."
     pub output_index: usize,
+    /// `self.start_data.location`, rebased to a genuinely global
+    /// (virtual-desktop) position at grab-start time — `MotionEvent::location`
+    /// (what later `motion()` calls receive) is always *local* to
+    /// whichever output currently has focus (`handle_pointer_motion`'s
+    /// own doc comment), which can be a *different* output than the one
+    /// `start_data.location` was local to if focus-follows-mouse switches
+    /// mid-drag. Subtracting two locations expressed in different
+    /// outputs' local origins corrupts the delta by roughly the distance
+    /// between them; converting both sides to a common global frame
+    /// (this field, computed once here; `motion()`'s own `event.location`
+    /// rebased fresh every call, since which output it's local to can
+    /// itself change mid-drag) avoids that regardless of how many times
+    /// focus moves during a single drag.
+    pub start_global_location: Point<f64, Logical>,
 }
 
 impl PointerGrab<State> for MoveSurfaceGrab {
@@ -71,7 +85,19 @@ impl PointerGrab<State> for MoveSurfaceGrab {
         // While the grab is active, no client has pointer focus.
         handle.motion(data, None, event);
 
-        let delta = event.location - self.start_data.location;
+        // `event.location` is local to whichever output *currently* has
+        // focus (see `start_global_location`'s own doc comment) — rebase
+        // to the same global frame before comparing against it, fresh
+        // every call, since a mid-drag focus change can make even *this*
+        // rebase target a different output than the previous call's.
+        let event_output_position = data
+            .stack
+            .outputs()
+            .get(data.stack.focused_output_index())
+            .map(|slot| slot.position)
+            .unwrap_or_default();
+        let event_global_location = event.location + event_output_position.to_f64();
+        let delta = event_global_location - self.start_global_location;
         let new_location = self.initial_window_location.to_f64() + delta;
         // Fast path first (see `output_index`'s doc comment) — falls
         // back to the full graph-wide search only on a miss, so a
