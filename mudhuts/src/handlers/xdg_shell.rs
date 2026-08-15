@@ -56,7 +56,21 @@ impl XdgShellHandler for State {
             .and_then(|creds| ownership::find_owning_hut(creds.pid as u32, &self.stack))
             .unwrap_or_else(|| self.stack.focused().id);
 
-        if let Some(output_index) = self.stack.output_index_for_hut(owning_hut_id) {
+        // `self.output.is_some()`, not just a resolved `output_index` —
+        // `GraphStack::new` always seeds slot 0 with a synthetic
+        // placeholder `Output` (a real `(0, 0)`-sized mode, not `None`)
+        // immediately at construction, before any real backend has
+        // attached anything, so `output_index_for_hut` alone would
+        // already resolve `Some(0)` during that startup window and size
+        // this configure off the placeholder's zero mode instead of
+        // skipping it — `self.output` only becomes `Some` once a real
+        // connector has actually attached (`sync_focused_output`, called
+        // from `udev_backend.rs`'s `connector_connected`), matching this
+        // guard's original intent before `owning_hut_id` was resolved
+        // ahead of it.
+        if self.output.is_some()
+            && let Some(output_index) = self.stack.output_index_for_hut(owning_hut_id)
+        {
             // Sized to the *usable* area, not the raw output geometry —
             // shrunk by any layer-shell surface's exclusive zone (a
             // status bar, say) — see `State::usable_area`'s doc comment.
