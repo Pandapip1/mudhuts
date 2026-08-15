@@ -422,6 +422,33 @@ fn real_output_geometry_for_output(output: &Output) -> Option<Rectangle<i32, Log
     Some(Rectangle::new((0, 0).into(), size))
 }
 
+/// Shared body of [`State::focused_usable_area`]/[`State::usable_area_for`]
+/// — the layer-map-zone-lookup-and-physical-conversion math itself doesn't
+/// care which `Output` it's given or which caller's own missing-output
+/// fallback applies (see [`real_output_geometry_for_output`]'s identical
+/// reasoning). Pulled out specifically so it's unit-testable against a
+/// synthetic `Output` without needing a whole `State` — this exact
+/// physical/logical conversion is what silently broke (fed a *physical*
+/// value where `Space::map_element` required a genuinely *logical* one)
+/// in the fractional-scale black-bar-under-waybar bug; see
+/// `console_hut.rs`'s `sync_main_window_space` doc comment for the full
+/// mechanism.
+fn usable_area_physical_for_output(output: &Output) -> (i32, i32, i32, i32) {
+    let scale = output.current_scale().fractional_scale();
+    let zone = layer_map_for_output(output).non_exclusive_zone();
+    let physical: smithay::utils::Rectangle<i32, smithay::utils::Physical> =
+        zone.to_physical_precise_round(scale);
+    (physical.loc.x, physical.loc.y, physical.size.w, physical.size.h)
+}
+
+/// Shared body of [`State::focused_usable_area_logical`]/
+/// [`State::usable_area_logical_for`] — [`usable_area_physical_for_output`]'s
+/// unconverted counterpart, for the same reason that one exists.
+fn usable_area_logical_for_output(output: &Output) -> (i32, i32, i32, i32) {
+    let zone = layer_map_for_output(output).non_exclusive_zone();
+    (zone.loc.x, zone.loc.y, zone.size.w, zone.size.h)
+}
+
 impl State {
     /// `socket` must already be listening (see [`create_socket`]) — created
     /// separately so `main` can export `WAYLAND_DISPLAY` for the ConsoleHut's
@@ -807,10 +834,7 @@ impl State {
         let Some(output) = self.output.as_ref() else {
             return (0, 0, self.output_size.0, self.output_size.1);
         };
-        let zone = layer_map_for_output(output).non_exclusive_zone();
-        let physical: smithay::utils::Rectangle<i32, smithay::utils::Physical> =
-            zone.to_physical_precise_round(self.focused_output_scale());
-        (physical.loc.x, physical.loc.y, physical.size.w, physical.size.h)
+        usable_area_physical_for_output(output)
     }
 
     /// [`Self::focused_usable_area`], for a *specific* output rather than
@@ -832,11 +856,7 @@ impl State {
         if slot.output.current_mode().is_none() {
             return (0, 0, 0, 0);
         }
-        let scale = slot.output.current_scale().fractional_scale();
-        let zone = layer_map_for_output(&slot.output).non_exclusive_zone();
-        let physical: smithay::utils::Rectangle<i32, smithay::utils::Physical> =
-            zone.to_physical_precise_round(scale);
-        (physical.loc.x, physical.loc.y, physical.size.w, physical.size.h)
+        usable_area_physical_for_output(&slot.output)
     }
 
     /// [`Self::focused_usable_area`]'s raw, unconverted counterpart — genuinely
@@ -855,8 +875,7 @@ impl State {
         let Some(output) = self.output.as_ref() else {
             return (0, 0, self.output_size.0, self.output_size.1);
         };
-        let zone = layer_map_for_output(output).non_exclusive_zone();
-        (zone.loc.x, zone.loc.y, zone.size.w, zone.size.h)
+        usable_area_logical_for_output(output)
     }
 
     /// [`Self::focused_usable_area_logical`], for a *specific* output rather than
@@ -879,8 +898,7 @@ impl State {
         let Some(slot) = self.stack.outputs().get(output_index) else {
             return (0, 0, 0, 0);
         };
-        let zone = layer_map_for_output(&slot.output).non_exclusive_zone();
-        (zone.loc.x, zone.loc.y, zone.size.w, zone.size.h)
+        usable_area_logical_for_output(&slot.output)
     }
 
     /// The whole output's current size, genuinely [`Logical`] (scale-
@@ -1236,4 +1254,69 @@ pub struct ClientState {
 impl ClientData for ClientState {
     fn initialized(&self, _client_id: ClientId) {}
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::space_element::synthetic_output;
+
+    use super::{real_output_geometry_for_output, usable_area_logical_for_output, usable_area_physical_for_output};
+
+    // Regression coverage for the class of bug behind the "black bar under
+    // waybar" fix (commit `4291e55`): a *physical*-pixel value silently fed
+    // into an API that required a genuinely *logical* one, invisible at
+    // scale 1.0 and only surfacing as a doubled offset/size at real
+    // (non-1.0) scale. These exercise the two pure conversion functions the
+    // whole `usable_area*`/`real_output_geometry*` family now shares
+    // (`usable_area_physical_for_output`/`usable_area_logical_for_output`/
+    // `real_output_geometry_for_output`) directly, without needing a whole
+    // `State` — so a future accidental swap of which one a call site reaches
+    // for gets caught here instead of requiring a live HiDPI rebuild+retest.
+
+    #[test]
+    fn physical_and_logical_usable_area_agree_at_scale_one() {
+        let output = synthetic_output("test", (1920, 1080), 1.0);
+        assert_eq!(usable_area_physical_for_output(&output), (0, 0, 1920, 1080));
+        assert_eq!(usable_area_logical_for_output(&output), (0, 0, 1920, 1080));
+    }
+
+    #[test]
+    fn physical_usable_area_is_the_real_pixel_mode_size_at_fractional_scale() {
+        // A real HiDPI setup (this codebase's own `ilama` host): the
+        // output's *mode* is already expressed in real physical pixels —
+        // `usable_area_physical_for_output` must report that size back
+        // unchanged (modulo an as-yet-unreserved exclusive zone, i.e. none
+        // here), not divide it down by `scale` a second time.
+        let output = synthetic_output("test", (3840, 2160), 2.0);
+        assert_eq!(usable_area_physical_for_output(&output), (0, 0, 3840, 2160));
+    }
+
+    #[test]
+    fn logical_usable_area_is_the_physical_size_divided_by_scale() {
+        // The exact invariant the waybar bug violated: logical must be
+        // physical / scale, not physical fed through unconverted (which is
+        // what `sync_main_window_space` used to silently receive, doubling
+        // every downstream `to_physical` conversion at scale 2.0).
+        let output = synthetic_output("test", (3840, 2160), 2.0);
+        assert_eq!(usable_area_logical_for_output(&output), (0, 0, 1920, 1080));
+    }
+
+    #[test]
+    fn real_output_geometry_is_also_scale_divided_not_raw_physical() {
+        let output = synthetic_output("test", (3840, 2160), 2.0);
+        let geo = real_output_geometry_for_output(&output).expect("mode was set");
+        assert_eq!((geo.loc.x, geo.loc.y, geo.size.w, geo.size.h), (0, 0, 1920, 1080));
+    }
+
+    #[test]
+    fn odd_fractional_scale_stays_consistent_between_physical_and_logical() {
+        // A non-integer scale (1.5, e.g. a 2880px-wide HiDPI panel at
+        // 150%) is the case most likely to silently break again via a
+        // rounding-direction mismatch between the physical and logical
+        // variants — assert they're still each other's inverse under
+        // rounding, not just for the clean *2/ 2 case above.
+        let output = synthetic_output("test", (2880, 1620), 1.5);
+        assert_eq!(usable_area_physical_for_output(&output), (0, 0, 2880, 1620));
+        assert_eq!(usable_area_logical_for_output(&output), (0, 0, 1920, 1080));
+    }
 }
