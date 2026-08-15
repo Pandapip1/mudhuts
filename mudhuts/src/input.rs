@@ -312,11 +312,15 @@ impl State {
     /// which ConsoleHut/tab/pane is now showing — `Action::ToggleTerminal`,
     /// every chrome click (`try_click_chrome`), the instant paths of
     /// `Action::StackNext`/`StackPrev`/`TabNext`/`TabPrev`/`WrapTab`/
-    /// `WrapTile`, and the `stack-hold` release closure's own
-    /// `commit_preview` — a call site that syncs the window but not this
+    /// `WrapTile`, the `stack-hold` release closure's own `commit_preview`,
+    /// `handlers/xdg_shell.rs`'s `toplevel_destroyed` (the focused Hut's
+    /// visible window closing can fall back to another window/the
+    /// terminal), and `handlers/shell.rs`'s `retag` (moving a window
+    /// between Main-Window/Floating/Alert roles can change what's
+    /// visibly mapped) — a call site that syncs the window but not this
     /// used to leave keyboard input going to the old, now-hidden surface
     /// until some unrelated event happened to repair it.
-    fn sync_keyboard_focus_to_view(&mut self) {
+    pub(crate) fn sync_keyboard_focus_to_view(&mut self) {
         let target = if self.showing_terminal_effective() {
             None
         } else {

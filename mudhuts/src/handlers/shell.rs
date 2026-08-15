@@ -275,6 +275,10 @@ fn retag(state: &mut State, tagged_surface: &WlSurface, target: Option<(Role, Wl
 
     if handled {
         state.sync_visible_main_window();
+        // Paired call `sync_keyboard_focus_to_view`'s own doc comment
+        // requires — retagging a window between Main-Window/Floating/
+        // Alert roles can change what's visibly mapped for its Hut.
+        state.sync_keyboard_focus_to_view();
         state.request_redraw();
     } else {
         tracing::warn!("mudhuts_window_role_v1: tagged toplevel not found in any ConsoleHut");

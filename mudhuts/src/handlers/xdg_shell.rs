@@ -147,6 +147,11 @@ impl XdgShellHandler for State {
         }
         if was_focused_hut_visible_window {
             self.sync_visible_main_window();
+            // Paired call `sync_keyboard_focus_to_view`'s own doc
+            // comment requires — the visible window just closed and a
+            // different one (or the terminal) took its place, so
+            // keyboard input has to follow.
+            self.sync_keyboard_focus_to_view();
         }
         self.request_redraw();
     }
