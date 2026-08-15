@@ -488,15 +488,41 @@ impl State {
     /// `.smithay-ref/anvil`'s own `keyboard_key_to_action` reference
     /// behavior).
     fn exclusive_layer_surface(&self) -> Option<WlSurface> {
-        let output = self.output.as_ref()?;
-        let layers = layer_map_for_output(output);
-        layers
-            .layers()
-            .find(|l| {
-                matches!(l.layer(), WlrLayer::Top | WlrLayer::Overlay)
-                    && l.cached_state().keyboard_interactivity == KeyboardInteractivity::Exclusive
-            })
-            .map(|l| l.wl_surface().clone())
+        // Every real output's own layer map, not just the focused one
+        // (`self.output`) — keyboard input is seat-wide, not per-output,
+        // and `handlers/layer_shell.rs`'s own multi-monitor rework
+        // already lets an exclusive-interactivity Top/Overlay surface
+        // map on any output. Scoping this to the focused output alone
+        // meant such a surface on a backgrounded monitor never actually
+        // won the keyboard grab its own doc comment promises. The
+        // focused output is still checked *first*, though, not scanned
+        // in arbitrary Vec order: nothing in the wlr-layer-shell protocol
+        // stops two different clients from each requesting `exclusive` on
+        // two different outputs at once, and every keystroke (including
+        // an on-screen password/PIN entry) has to go to whichever one the
+        // user is actually looking at, not whichever happened to connect
+        // first.
+        fn exclusive_on(output: &smithay::output::Output) -> Option<WlSurface> {
+            layer_map_for_output(output)
+                .layers()
+                .find(|l| {
+                    matches!(l.layer(), WlrLayer::Top | WlrLayer::Overlay)
+                        && l.cached_state().keyboard_interactivity == KeyboardInteractivity::Exclusive
+                })
+                .map(|l| l.wl_surface().clone())
+        }
+        let focused_index = self.stack.focused_output_index();
+        if let Some(slot) = self.stack.outputs().get(focused_index)
+            && let Some(surface) = exclusive_on(&slot.output)
+        {
+            return Some(surface);
+        }
+        self.stack
+            .outputs()
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != focused_index)
+            .find_map(|(_, slot)| exclusive_on(&slot.output))
     }
 
     /// Where every input event goes while `self.locked` (see
