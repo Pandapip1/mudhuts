@@ -962,17 +962,21 @@ impl State {
     }
 
     /// `root`'s absolute physical-pixel rect right now, if it's a Main
-    /// Window currently on screen — composable Hut hierarchy RFC's Open
-    /// Question 3 resolution, generalizing [`Self::active_pane_offset`]
-    /// (which only ever answers for whichever pane is focused) to an
-    /// arbitrary target surface, for `handlers/xdg_shell.rs`'s
-    /// `unconstrain_popup` to anchor a popup to its actual root window
-    /// instead of assuming every Main Window fills the whole output.
-    /// `None` for a Floating Window/Alert root (never Tile-Hut-paned, so
-    /// this doesn't apply to them), or for a Main Window that's currently
-    /// backgrounded or behind an inactive Hut-tab — only the *focused*
-    /// top-level Stack entry is ever actually on screen, matching every
-    /// other render/hit-test call site's scope.
+    /// Window, Floating Window, or Alert currently on screen — composable
+    /// Hut hierarchy RFC's Open Question 3 resolution, generalizing
+    /// [`Self::active_pane_offset`] (which only ever answers for whichever
+    /// pane is focused) to an arbitrary target surface, for
+    /// `handlers/xdg_shell.rs`'s `unconstrain_popup` to anchor a popup to
+    /// its actual root window instead of assuming every Main Window fills
+    /// the whole output. A Floating Window/Alert root resolves via
+    /// [`crate::console_hut::ConsoleHut::floating_or_alert_absolute_rect`]'s
+    /// own tracked position, not this rect's own `area` — see
+    /// `GraphStack::leaf_absolute_rect`'s own doc comment. `None` for a
+    /// Main Window that's currently backgrounded or behind an inactive
+    /// Hut-tab, or a Floating Window/Alert whose own owning Main Window
+    /// entry isn't the active one — only the *focused* top-level Stack
+    /// entry's *active* content is ever actually on screen, matching
+    /// every other render/hit-test call site's scope.
     pub fn focused_leaf_absolute_rect(&self, root: &WlSurface) -> Option<(i32, i32, i32, i32)> {
         self.stack.leaf_absolute_rect(self.stack.focused_top_level(), root, self.focused_usable_area())
     }

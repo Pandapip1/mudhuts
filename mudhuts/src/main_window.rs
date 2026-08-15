@@ -9,6 +9,17 @@ use smithay::utils::{Logical, Point};
 
 use crate::render::{ChangeTracker, LabelCache};
 
+/// Whether `window`'s own toplevel surface is `surface` — the shared body
+/// of [`MainWindowEntry::matches`]/[`FloatingWindow::matches`]/
+/// [`Alert::matches`] (previously three identical copies), also reused by
+/// [`crate::console_hut::ConsoleHut::floating_or_alert_absolute_rect`],
+/// which needs the same check against a bare `Window` it pulls straight
+/// out of `self.space` rather than one of this module's own wrapper
+/// structs.
+pub fn window_matches(window: &Window, surface: &WlSurface) -> bool {
+    window.toplevel().is_some_and(|t| t.wl_surface() == surface)
+}
+
 /// Which screen edge a docked Floating Window is minimized to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Edge {
@@ -60,9 +71,7 @@ impl FloatingWindow {
     }
 
     pub fn matches(&self, surface: &WlSurface) -> bool {
-        self.window
-            .toplevel()
-            .is_some_and(|t| t.wl_surface() == surface)
+        window_matches(&self.window, surface)
     }
 }
 
@@ -90,9 +99,7 @@ impl Alert {
     }
 
     pub fn matches(&self, surface: &WlSurface) -> bool {
-        self.window
-            .toplevel()
-            .is_some_and(|t| t.wl_surface() == surface)
+        window_matches(&self.window, surface)
     }
 }
 
@@ -147,9 +154,7 @@ impl MainWindowEntry {
     }
 
     pub fn matches(&self, surface: &WlSurface) -> bool {
-        self.window
-            .toplevel()
-            .is_some_and(|t| t.wl_surface() == surface)
+        window_matches(&self.window, surface)
     }
 
     /// A commit counter for this tab's background element, bumped only if

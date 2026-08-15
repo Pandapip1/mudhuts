@@ -15,7 +15,7 @@ use smithay::desktop::Window;
 use smithay::desktop::space::Space;
 use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Buffer, Rectangle};
+use smithay::utils::{Buffer, Physical, Rectangle};
 
 use mudhuts_term::{GlyphCache, TermEvent, Terminal};
 use mudhuts_term::palette::Rgb;
@@ -415,6 +415,78 @@ impl ConsoleHut {
     /// method's own history already proved the alternative to be.
     pub fn space(&self) -> &Space<HutSpaceElement> {
         &self.space
+    }
+
+    /// `root`'s real absolute **physical**-pixel rect — matching
+    /// `GraphStack::leaf_absolute_rect`'s own documented contract, the
+    /// same one its Main-Window case already satisfies via
+    /// `usable_area_for` — if it's a currently-mapped Floating Window or
+    /// Alert. `GraphStack::leaf_absolute_rect`'s own fallback for a popup
+    /// root that isn't a bare Main Window (those are always fullscreen,
+    /// hence `area` alone suffices for them; see that function's own doc
+    /// comment). A Floating Window/Alert is neither fullscreen nor
+    /// Hut-usable-area-origin-relative — it floats at its own tracked
+    /// position anywhere on screen — so falling back to the coarse
+    /// whole-output/whole-usable-area rect the way `leaf_absolute_rect`
+    /// used to (there was no other option before this existed) positions
+    /// any popup it opens relative to the wrong origin entirely, off by
+    /// however far the Floating Window/Alert itself is from `(0, 0)`.
+    ///
+    /// Reads straight from `self.space` (kept in sync with the *active*
+    /// Main Window entry's own Floating Windows/Alerts by
+    /// `sync_main_window_space`, which maps each one in at its own tracked
+    /// position — see that function's own doc comment) rather than
+    /// reconstructing the rect by hand from `MainWindowEntry::floating_windows`/
+    /// `alerts`: `Space`'s own `SpaceElement::geometry` is the single
+    /// authoritative source for "where a mapped element actually is,"
+    /// already combining position and the window's own geometry
+    /// size/offset exactly the way rendering and hit-testing already read
+    /// it — hand-deriving the same answer a second way here risks it
+    /// silently drifting from that if either ever changes independently.
+    /// That geometry is genuinely [`Logical`](smithay::utils::Logical)
+    /// though (`self.space`'s own convention — see `sync_main_window_space`'s
+    /// doc comment), so it's converted to physical here via
+    /// `self.space_output`'s own tracked scale (kept in lockstep with the
+    /// real output's — see [`Self::rescale`]'s doc comment) before
+    /// returning: a caught-in-review regression where this used to return
+    /// Logical values that `handlers/xdg_shell.rs`'s `unconstrain_popup`
+    /// then treated as physical and divided by scale a *second* time,
+    /// silently shrinking a Floating Window/Alert's own popups at any
+    /// scale other than 1.0 — the exact bug class this whole file's
+    /// module doc/`sync_main_window_space`'s own doc comment already warn
+    /// about.
+    ///
+    /// `None` if `root` isn't currently mapped at all (not a Floating
+    /// Window/Alert, or one that belongs to a currently-backgrounded Main
+    /// Window entry and so isn't in `space` right now) — the caller's own
+    /// coarser fallback still applies in that case.
+    pub fn floating_or_alert_absolute_rect(&self, root: &WlSurface) -> Option<(i32, i32, i32, i32)> {
+        self.space.elements().find_map(|element| {
+            let HutSpaceElement::Window(window) = element else {
+                return None;
+            };
+            if !crate::main_window::window_matches(window, root) {
+                return None;
+            }
+            // `self.space.element_geometry(element)`, not
+            // `SpaceElement::geometry(element)` called on the element
+            // directly — a real bug caught in review: `Window`'s own
+            // `SpaceElement::geometry` impl is just the window's own
+            // local xdg-surface geometry (origin near `(0, 0)`,
+            // independent of any `Space` it happens to be mapped into),
+            // while `Space::element_geometry` is the one that actually
+            // substitutes in this element's real mapped location (the
+            // `pos`/`area_origin` `sync_main_window_space` mapped it at).
+            // Reading the former left `.loc` silently wrong for any
+            // Floating Window/Alert not sitting exactly at its owning
+            // Hut's own origin — invisible so far only because this
+            // function's one live caller happened to discard `.loc` and
+            // keep just `.size`.
+            let logical = self.space.element_geometry(element)?;
+            let scale = self.space_output.current_scale().fractional_scale();
+            let physical: Rectangle<i32, Physical> = logical.to_physical_precise_round(scale);
+            Some((physical.loc.x, physical.loc.y, physical.size.w, physical.size.h))
+        })
     }
 
     /// This Hut's own `space`, for direct mutation *without* syncing

@@ -462,13 +462,18 @@ impl GraphStack {
     }
 
     /// `root`'s absolute physical-pixel rect right now, if it's a Main
-    /// Window currently on screen under `top` — mirrors
-    /// `Hut::leaf_absolute_rect` exactly (same real-output-absolute
-    /// coordinates convention, computed via the same `hut::pane_rects`
-    /// call `TileNode`'s own `resolve`/`resize_to_pixels` already use,
-    /// so this can never disagree with what's actually rendered/sized).
-    /// Takes `top`/`area` explicitly (not implicitly the focused output)
-    /// — `State::focused_leaf_absolute_rect`/`State::leaf_absolute_rect_for`
+    /// Window, Floating Window, or Alert currently on screen under `top`
+    /// — mirrors `Hut::leaf_absolute_rect` exactly (same real-output-
+    /// absolute coordinates convention, computed via the same
+    /// `hut::pane_rects` call `TileNode`'s own `resolve`/`resize_to_pixels`
+    /// already use, so this can never disagree with what's actually
+    /// rendered/sized, for the Main-Window case). A Floating Window/Alert
+    /// isn't fullscreen like a Main Window, so it can't just reuse `area`
+    /// — resolved instead via
+    /// [`crate::console_hut::ConsoleHut::floating_or_alert_absolute_rect`],
+    /// which already returns this same physical-pixel convention. Takes
+    /// `top`/`area` explicitly (not implicitly the focused output) —
+    /// `State::focused_leaf_absolute_rect`/`State::leaf_absolute_rect_for`
     /// are the "for a particular output" wrappers around this.
     pub fn leaf_absolute_rect(
         &self,
@@ -477,7 +482,16 @@ impl GraphStack {
         area: (i32, i32, i32, i32),
     ) -> Option<(i32, i32, i32, i32)> {
         if let Some(console) = self.graph.downcast::<ConsoleNode>(top) {
-            return console.hut.main_windows().iter().any(|e| e.matches(root)).then_some(area);
+            if console.hut.main_windows().iter().any(|e| e.matches(root)) {
+                return Some(area);
+            }
+            // Not a bare Main Window (always fullscreen, so `area` alone
+            // is correct for one) — check whether it's a Floating Window
+            // or Alert instead, which floats at its own tracked position
+            // and needs its own real rect, not `area`. See
+            // `ConsoleHut::floating_or_alert_absolute_rect`'s own doc
+            // comment for why this wasn't handled before it existed.
+            return console.hut.floating_or_alert_absolute_rect(root);
         }
         if let Some(tab) = self.graph.downcast::<TabNode>(top) {
             let children = self.graph.hut_list_input(top, "children");
@@ -493,10 +507,21 @@ impl GraphStack {
                 .collect();
             for (&child, rect) in children.iter().zip(rects) {
                 let leaf = self.graph.focused_leaf(child);
-                if let Some(console) = self.graph.downcast::<ConsoleNode>(leaf)
-                    && console.hut.main_windows().iter().any(|e| e.matches(root))
-                {
-                    return Some(rect);
+                if let Some(console) = self.graph.downcast::<ConsoleNode>(leaf) {
+                    if console.hut.main_windows().iter().any(|e| e.matches(root)) {
+                        return Some(rect);
+                    }
+                    // Same Floating Window/Alert fallback as the bare
+                    // ConsoleNode branch above — a pane's own ConsoleHut
+                    // can still tag one even though Tile-Hut panes only
+                    // ever *render* their terminal (see this pane's
+                    // `rect`'s own doc comment on `Hut::leaf_absolute_rect`'s
+                    // real-output-absolute convention, which this fallback
+                    // already returns in, same as `floating_or_alert_absolute_rect`
+                    // itself).
+                    if let Some(floating) = console.hut.floating_or_alert_absolute_rect(root) {
+                        return Some(floating);
+                    }
                 }
             }
             return None;
