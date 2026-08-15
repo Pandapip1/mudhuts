@@ -1070,15 +1070,31 @@ fn connector_disconnected(
         for id in removed_hut_ids {
             crate::render::purge_hut_content(id);
         }
-        // After `remove_output`, not before — `state.stack.outputs()` has
-        // to reflect the disconnected output's own removal already, or
-        // `all_confirmed` would still see that (just-purged-from-
-        // `pending_lock_confirmed_outputs`) slot and never pass. Purging
-        // the disconnected output above can be exactly what makes every
-        // *remaining* output already confirmed — nothing else re-checks
-        // that on its own (see `State::confirm_pending_lock_if_ready`'s
-        // doc comment).
-        state.confirm_pending_lock_if_ready();
+        if will_remove_output {
+            // After `remove_output`, not before — `state.stack.outputs()`
+            // has to reflect the disconnected output's own removal
+            // already, or `all_confirmed` would still see that (just-
+            // purged-from-`pending_lock_confirmed_outputs`) slot and
+            // never pass. Purging the disconnected output above can be
+            // exactly what makes every *remaining* output already
+            // confirmed — nothing else re-checks that on its own (see
+            // `State::confirm_pending_lock_if_ready`'s doc comment).
+            state.confirm_pending_lock_if_ready();
+        } else if state.locked && let Some(confirmation) = state.pending_lock.take() {
+            // The very last output — `remove_output` refused to actually
+            // remove it (its stale `OutputSlot` is kept, per that
+            // method's own doc comment), so it stays in `stack.outputs()`
+            // forever with an `Output` that was just purged from
+            // `pending_lock_confirmed_outputs` above and can never be
+            // re-added (its real connector is permanently gone) —
+            // `confirm_pending_lock_if_ready`'s `all_confirmed` check
+            // could never pass again. But there are now zero real
+            // connected displays: nothing could possibly still be
+            // showing pre-lock content, since nothing is being displayed
+            // at all, so a pending confirmation has nothing left to wait
+            // on — confirm immediately instead of hanging forever.
+            confirmation.lock();
+        }
         // Every other surface pointing at a slot index *after* the
         // removed one shifts down by one along with it — mirrors
         // `GraphStack::remove_output`'s own index-shift internally.
