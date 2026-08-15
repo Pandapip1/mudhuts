@@ -293,10 +293,13 @@ impl PointerGrab<State> for MoveSurfaceGrab {
         let redock_edge = nearest_edge_within_threshold(data.output_size_logical_for(output_index), location, size);
         // This Hut's own output's usable area, computed before the
         // re-resolve below — needed for `sync_main_window_space` a few
-        // lines down, and `data.usable_area_for` needs `&data` as a
-        // whole, which the borrow checker won't allow alongside an
-        // active `&mut data.stack` borrow.
-        let (area_x, area_y, _, _) = data.usable_area_for(output_index);
+        // lines down, and `data.usable_area_logical_for` needs `&data` as
+        // a whole, which the borrow checker won't allow alongside an
+        // active `&mut data.stack` borrow. `_logical_for`, not the
+        // physical-pixel `usable_area_for` — see
+        // `State::sync_visible_main_window`'s own doc comment: `space`
+        // requires a genuinely Logical origin.
+        let (area_x, area_y, _, _) = data.usable_area_logical_for(output_index);
         // Re-resolved rather than reusing `hut` above — the borrow
         // checker requires it (an immutable borrow of `data.stack` sits
         // between the two), not because the Hut could plausibly have

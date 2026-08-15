@@ -999,10 +999,32 @@ impl State {
         // `TabPrev`, ...) doesn't stop working just because the pointer
         // also has a grab active.
         if self.dragging_hut_id != Some(self.stack.focused().id) {
-            // Computed before taking `hut`'s mutable borrow below — `focused_usable_area`
-            // needs `&self` as a whole, which the borrow checker won't allow
-            // alongside an active `&mut self.stack` borrow.
-            let (area_x, area_y, _, _) = self.focused_usable_area();
+            // `focused_usable_area_logical`, not `focused_usable_area` —
+            // `ConsoleHut::space` is a real `Space<HutSpaceElement>`, and
+            // `Space::map_element` requires a genuinely Logical point
+            // (Smithay's pinned source: `P: Into<Point<i32, Logical>>`).
+            // Passing the *physical*-pixel origin here type-checks fine
+            // (a bare `(i32, i32)` silently converts to whatever `Point`
+            // kind is needed — nothing catches the mismatch), but doubles
+            // up with the real output's own scale the next time this
+            // position gets converted back to physical for rendering
+            // (`render.rs`'s `content_pieces_to_elements`, which treats
+            // `ContentPiece::Window`'s position as genuinely Logical and
+            // multiplies by scale) — invisible at scale 1.0, but at any
+            // other scale this silently shifts a Main Window down/right
+            // by roughly one *extra* copy of whatever's reserving space
+            // at the output's origin (e.g. a top-anchored status bar's
+            // own exclusive zone), which is exactly what every other real
+            // `map_element` call in this codebase already converts to
+            // Logical first (see `docks.rs`'s `advance_drag`'s own
+            // `pos.to_logical(...)` before its `space_raw_mut().map_element`
+            // call, immediately below this same function's sibling code).
+            //
+            // Computed before taking `hut`'s mutable borrow below —
+            // `focused_usable_area_logical` needs `&self` as a whole,
+            // which the borrow checker won't allow alongside an active
+            // `&mut self.stack` borrow.
+            let (area_x, area_y, _, _) = self.focused_usable_area_logical();
             self.stack.focused_mut().sync_main_window_space((area_x, area_y));
         }
         self.sync_keyboard_focus_to_view();
@@ -1027,7 +1049,10 @@ impl State {
         // currently-dragging Hut skips the resync itself but still falls
         // through to the keyboard-focus resync below.
         if self.dragging_hut_id != Some(hut_id) {
-            let (area_x, area_y, _, _) = self.usable_area_for(output_index);
+            // `usable_area_logical_for`, not `usable_area_for` — see
+            // `sync_visible_main_window`'s own doc comment for why
+            // `ConsoleHut::space` needs a genuinely Logical origin here.
+            let (area_x, area_y, _, _) = self.usable_area_logical_for(output_index);
             if let Some(hut) = self.stack.find_mut(hut_id) {
                 hut.sync_main_window_space((area_x, area_y));
             }

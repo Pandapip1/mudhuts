@@ -933,7 +933,11 @@ pub fn build_frame_elements(
         // in sync at all, and its content isn't cheap to get from
         // anywhere else the way `ConsoleHut::redraw`'s terminal texture
         // already is).
-        let (area_x, area_y, _, _) = state.usable_area_for(output_index);
+        // `_logical_for`, not the physical-pixel `usable_area_for` —
+        // `refresh_hut_content_thumbnail` feeds this into `space_mut`,
+        // which requires a genuinely Logical origin — see
+        // `State::sync_visible_main_window`'s own doc comment.
+        let (area_x, area_y, _, _) = state.usable_area_logical_for(output_index);
         for &entry_top in &top_level {
             // Skips the *focused* entry (`top`, from just above) — unlike
             // every backgrounded entry, it can be the one a real drag

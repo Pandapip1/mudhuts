@@ -410,8 +410,12 @@ pub fn advance_drag(state: &mut State, global_pos: Point<f64, Logical>) {
         // This Hut's own output's usable area — needed for
         // `sync_main_window_space` below; computed before the mutable
         // `hut` borrow for the same borrow-checker reason as `unset`'s
-        // own equivalent line in grabs.rs.
-        let (area_x, area_y, _, _) = state.usable_area_for(output_index);
+        // own equivalent line in grabs.rs. `_logical_for`, not the
+        // physical-pixel `usable_area_for` — see
+        // `State::sync_visible_main_window`'s own doc comment: `space`
+        // is a real `Space<HutSpaceElement>`, which requires a genuinely
+        // Logical origin.
+        let (area_x, area_y, _, _) = state.usable_area_logical_for(output_index);
         // Fast path first (`output_index` was just freshly resolved
         // above, so this is never stale) — falls back to the full
         // graph-wide search only on a miss.
@@ -492,7 +496,10 @@ pub fn finish_drag(state: &mut State) {
         return;
     };
     let redock_edge = nearest_edge_within_threshold(state.output_size_logical_for(output_index), location, size);
-    let (area_x, area_y, _, _) = state.usable_area_for(output_index);
+    // `_logical_for`, not the physical-pixel `usable_area_for` — see
+    // `State::sync_visible_main_window`'s own doc comment: `space`'s
+    // positions (like `location` above) are genuinely Logical.
+    let (area_x, area_y, _, _) = state.usable_area_logical_for(output_index);
     let Some(hut) = state.stack.find_mut(drag.hut_id) else {
         return;
     };

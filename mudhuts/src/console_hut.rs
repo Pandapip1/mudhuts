@@ -308,8 +308,22 @@ impl ConsoleHut {
     /// unmapped (`docks.rs` draws a handle instead), Alerts are mapped
     /// last so they end up on top. `area_origin` is the real usable
     /// area's own `(x, y)` — matters once a layer-shell surface reserves
-    /// part of the output (e.g. a left-anchored panel) — see
-    /// `State::focused_usable_area`'s doc comment.
+    /// part of the output (e.g. a left-anchored panel) — **genuinely
+    /// Logical, not physical**: this is a real `Space<HutSpaceElement>`,
+    /// and `Space::map_element` (which this calls, below) requires a
+    /// Logical point (Smithay's pinned source:
+    /// `P: Into<Point<i32, Logical>>`) — every caller must pass
+    /// `State::focused_usable_area_logical`/`usable_area_logical_for`'s
+    /// own `(x, y)`, *not* `focused_usable_area`/`usable_area_for`'s
+    /// (physical-pixel) one. A bare `(i32, i32)` tuple type-checks either
+    /// way with no compiler warning — a real, previously-shipped bug
+    /// passed the physical value here, invisible at scale 1.0 but
+    /// silently shifting every Main Window down/right by roughly one
+    /// extra copy of whatever's reserving space at the output's origin
+    /// at any other scale (this value gets converted back to physical a
+    /// second time downstream, in `render.rs`'s `content_pieces_to_elements`,
+    /// which — correctly — treats a mapped Window's position as genuinely
+    /// Logical and multiplies by scale once).
     ///
     /// Extracted from `State::sync_visible_main_window`'s old body
     /// (composable Hut hierarchy RFC migration step 5 sub-step 2) so it
