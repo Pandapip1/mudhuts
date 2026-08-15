@@ -57,16 +57,20 @@ pub struct State {
     pub socket_name: OsString,
     pub display_handle: DisplayHandle,
 
-    /// The real, physical `Output`. Every ConsoleHut owns its own
-    /// `Space<HutSpaceElement>` (`ConsoleHut::space`, bound to a *synthetic*
-    /// output sized to its own content — composable Hut hierarchy RFC
-    /// migration step 5 sub-step 2) for actual window composition; this
-    /// field exists for everything that only ever needs to reach the real
-    /// output itself (layer-shell placement, screen capture, `focused_usable_area`'s
-    /// size, ...), never a window. Set once by whichever backend creates
-    /// the output (`winit_backend.rs`/`udev_backend.rs`), never reassigned
-    /// after (mudhuts is single-output, no runtime hot-swap). `None` only
-    /// before the first output exists.
+    /// The real, physical `Output` of whichever output currently has
+    /// focus. Every ConsoleHut owns its own `Space<HutSpaceElement>`
+    /// (`ConsoleHut::space`, bound to a *synthetic* output sized to its
+    /// own content — composable Hut hierarchy RFC migration step 5
+    /// sub-step 2) for actual window composition; this field exists for
+    /// everything that only ever needs to reach the real, focused output
+    /// itself (layer-shell placement, screen capture, `focused_usable_area`'s
+    /// size, ...), never a window. Kept in sync with the focused
+    /// `GraphStack` slot by `sync_focused_output` — real multi-monitor
+    /// support means this *is* reassigned at runtime, both on a genuine
+    /// focus change to a different output and on reconnect (`GraphStack::set_output`
+    /// swaps a slot's own `Output` handle in place, e.g. a single-output
+    /// machine's one connector being unplugged and replugged). `None`
+    /// only before the first output exists.
     pub output: Option<Output>,
     pub loop_signal: LoopSignal,
 
