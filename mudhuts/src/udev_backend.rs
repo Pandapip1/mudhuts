@@ -1269,6 +1269,20 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
                 mark_this_output_confirmed(state);
             }
         }
+        // Deliberately never calls `mark_this_output_confirmed` on this
+        // (or `queue_frame`'s own `Err` arm above) — unlike "no damage,"
+        // a genuine render/queue failure means this output's *actual*
+        // on-screen content is unknown; it could still be showing stale
+        // pre-lock content from whatever last successfully committed.
+        // Confirming here would trade a (safe, fail-closed) stalled lock
+        // confirmation for a real content-disclosure risk on a broken
+        // output — worse than the bug this class of fix is for. A
+        // transient failure still gets retried on the next redraw
+        // (`frame_pending` is only ever set `true` in the success path
+        // above, so this surface isn't blocked from another attempt);
+        // a persistent one legitimately can't have its lock state
+        // verified until it recovers or is unplugged
+        // (`connector_disconnected` purges it either way).
         Err(err) => tracing::warn!("render_frame failed: {err}"),
     }
 
