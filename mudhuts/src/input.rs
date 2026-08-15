@@ -863,8 +863,23 @@ impl State {
                 let Some(output_geo) = self.real_output_geometry() else {
                     return;
                 };
-
-                let pos = event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
+                // Genuinely global (see `handle_pointer_motion`'s own doc
+                // comment on why it needs to be) — `output_geo.loc` is
+                // always `(0, 0)` (`real_output_geometry`'s own doc
+                // comment: local to the focused output, not its real
+                // multi-monitor position), so adding it back wouldn't
+                // rebase anything. An absolute-positioning device
+                // (touchscreen, drawing tablet) isn't winit-only — real
+                // hardware under the udev/libinput backend can emit these
+                // too, on any output, not just one sitting at the virtual
+                // desktop's own `(0, 0)` origin.
+                let output_position = self
+                    .stack
+                    .outputs()
+                    .get(self.stack.focused_output_index())
+                    .map(|slot| slot.position)
+                    .unwrap_or_default();
+                let pos = event.position_transformed(output_geo.size) + output_position.to_f64();
                 self.handle_pointer_motion(pos, event.time_msec());
             }
             InputEvent::PointerButton { event, .. } => {
