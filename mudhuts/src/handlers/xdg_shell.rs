@@ -73,12 +73,12 @@ impl XdgShellHandler for State {
         {
             // Sized to the *usable* area, not the raw output geometry —
             // shrunk by any layer-shell surface's exclusive zone (a
-            // status bar, say) — see `State::usable_area`'s doc comment.
+            // status bar, say) — see `State::focused_usable_area`'s doc comment.
             // Logical, not physical: this is a real `xdg_toplevel`
             // configure, which Wayland always expresses in logical
-            // coordinates — see `State::usable_area_logical`'s doc
+            // coordinates — see `State::focused_usable_area_logical`'s doc
             // comment. Per this window's own owning output, not
-            // `self.usable_area_logical()` (the focused one) — see this
+            // `self.focused_usable_area_logical()` (the focused one) — see this
             // block's own reordering note above.
             let (_, _, usable_w, usable_h) = self.usable_area_logical_for(output_index);
             surface.with_pending_state(|state| {
@@ -385,8 +385,8 @@ impl State {
         // surface" (the same condition `find_window_by_surface`'s own
         // presence check would test) — one scan instead of two.
         //
-        // Also this root window's own output, not `self.real_output_geometry()`/
-        // `self.output_scale()` (the focused output) — a popup's parent
+        // Also this root window's own output, not `self.focused_real_output_geometry()`/
+        // `self.focused_output_scale()` (the focused output) — a popup's parent
         // window doesn't have to be on the focused monitor, and a
         // backgrounded monitor can have a different size/scale entirely.
         let Some(output_index) = self.output_index_for_window_surface(&root) else {

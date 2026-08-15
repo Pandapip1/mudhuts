@@ -121,7 +121,7 @@ pub struct ConsoleHut {
     /// visible view when this ConsoleHut is focused. Per-ConsoleHut so switching Huts
     /// (or Main Window tabs) doesn't disturb what each one was last
     /// showing. Ignored (treated as `true`) while `main_windows` is
-    /// empty — see `State::showing_terminal_effective`. A [`Signal`] —
+    /// empty — see `State::focused_showing_terminal_effective`. A [`Signal`] —
     /// this used to need a manual `State::request_redraw()` right after
     /// every write (and once shipped without one, `Action::ToggleTerminal`
     /// — see `redraw::Signal`'s doc comment), which is no longer possible
@@ -309,7 +309,7 @@ impl ConsoleHut {
     /// last so they end up on top. `area_origin` is the real usable
     /// area's own `(x, y)` — matters once a layer-shell surface reserves
     /// part of the output (e.g. a left-anchored panel) — see
-    /// `State::usable_area`'s doc comment.
+    /// `State::focused_usable_area`'s doc comment.
     ///
     /// Extracted from `State::sync_visible_main_window`'s old body
     /// (composable Hut hierarchy RFC migration step 5 sub-step 2) so it

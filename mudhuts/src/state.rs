@@ -62,7 +62,7 @@ pub struct State {
     /// output sized to its own content — composable Hut hierarchy RFC
     /// migration step 5 sub-step 2) for actual window composition; this
     /// field exists for everything that only ever needs to reach the real
-    /// output itself (layer-shell placement, screen capture, `usable_area`'s
+    /// output itself (layer-shell placement, screen capture, `focused_usable_area`'s
     /// size, ...), never a window. Set once by whichever backend creates
     /// the output (`winit_backend.rs`/`udev_backend.rs`), never reassigned
     /// after (mudhuts is single-output, no runtime hot-swap). `None` only
@@ -173,7 +173,7 @@ pub struct State {
     /// Genuinely [`Logical`] (scale-divided), matching every other value
     /// that flows through `pointer.motion()`/`surface_under()`/a Console
     /// Hut's own `space` — *not* physical output pixels, unlike
-    /// `output_size`/`usable_area()` below. `input.rs`'s
+    /// `output_size`/`focused_usable_area()` below. `input.rs`'s
     /// `handle_pointer_motion` converts to physical once, locally, for
     /// the handful of call sites (chrome/dock hit-testing, terminal
     /// cell math) that need mudhuts' own native pixel space instead —
@@ -374,7 +374,7 @@ pub struct State {
     redraw_ping: Ping,
 }
 
-/// Shared body of [`State::real_output_geometry`]/[`State::real_output_geometry_for`]
+/// Shared body of [`State::focused_real_output_geometry`]/[`State::real_output_geometry_for`]
 /// — the transform-and-scale-divide math itself doesn't care which
 /// `Output` it's given.
 fn real_output_geometry_for_output(output: &Output) -> Option<Rectangle<i32, Logical>> {
@@ -633,7 +633,7 @@ impl State {
     /// would ever need this to be anything other than a fixed value read
     /// fresh from the `Output` each time it's needed, rather than cached
     /// anywhere.
-    pub fn output_scale(&self) -> f64 {
+    pub fn focused_output_scale(&self) -> f64 {
         self.output
             .as_ref()
             .map(|o| o.current_scale().fractional_scale())
@@ -688,7 +688,7 @@ impl State {
         }
     }
 
-    /// [`Self::output_scale`], for a specific output — see
+    /// [`Self::focused_output_scale`], for a specific output — see
     /// [`Self::usable_area_for`]'s doc comment on why real multi-monitor
     /// needs this alongside the focused-output version.
     pub fn output_scale_for(&self, output_index: usize) -> f64 {
@@ -699,7 +699,7 @@ impl State {
             .unwrap_or(1.0)
     }
 
-    /// [`Self::real_output_geometry`], for a specific output.
+    /// [`Self::focused_real_output_geometry`], for a specific output.
     pub fn output_size_for(&self, output_index: usize) -> (i32, i32) {
         self.stack
             .outputs()
@@ -718,12 +718,12 @@ impl State {
     /// `output_geometry`, confirmed against the pinned Smithay checkout),
     /// reproduced here now that `output` is decoupled from any
     /// particular `Space`.
-    pub fn real_output_geometry(&self) -> Option<Rectangle<i32, Logical>> {
+    pub fn focused_real_output_geometry(&self) -> Option<Rectangle<i32, Logical>> {
         let output = self.output.as_ref()?;
         real_output_geometry_for_output(output)
     }
 
-    /// [`Self::real_output_geometry`], for a specific output rather than
+    /// [`Self::focused_real_output_geometry`], for a specific output rather than
     /// implicitly the focused one — same real-multi-monitor need as
     /// [`Self::usable_area_for`].
     pub fn real_output_geometry_for(&self, output_index: usize) -> Option<Rectangle<i32, Logical>> {
@@ -752,20 +752,20 @@ impl State {
     /// physical here so this keeps meaning what its own doc/name always
     /// have, for the ~10 call sites (`render.rs`, `docks.rs`, `input.rs`,
     /// both backends' resize/redraw handlers) that size/hit-test mudhuts'
-    /// own pixel-native rendering against it. [`Self::usable_area_logical`]
+    /// own pixel-native rendering against it. [`Self::focused_usable_area_logical`]
     /// is the *other* half: the same zone, unconverted, for the couple of
     /// call sites that configure real Wayland clients instead.
-    pub fn usable_area(&self) -> (i32, i32, i32, i32) {
+    pub fn focused_usable_area(&self) -> (i32, i32, i32, i32) {
         let Some(output) = self.output.as_ref() else {
             return (0, 0, self.output_size.0, self.output_size.1);
         };
         let zone = layer_map_for_output(output).non_exclusive_zone();
         let physical: smithay::utils::Rectangle<i32, smithay::utils::Physical> =
-            zone.to_physical_precise_round(self.output_scale());
+            zone.to_physical_precise_round(self.focused_output_scale());
         (physical.loc.x, physical.loc.y, physical.size.w, physical.size.h)
     }
 
-    /// [`Self::usable_area`], for a *specific* output rather than
+    /// [`Self::focused_usable_area`], for a *specific* output rather than
     /// implicitly the focused one — real multi-monitor's own need: a
     /// backgrounded (unfocused) monitor's own render pass still has to
     /// size/position its content against *its own* usable area, not the
@@ -775,7 +775,7 @@ impl State {
     /// doc comment) — every real caller only ever asks this for an
     /// output that's already been through `GraphStack::set_output`/
     /// `add_output` with a real connector, so this only actually matters
-    /// in the same brief startup window `usable_area`'s own `None`
+    /// in the same brief startup window `focused_usable_area`'s own `None`
     /// fallback already covers.
     pub fn usable_area_for(&self, output_index: usize) -> (i32, i32, i32, i32) {
         let Some(slot) = self.stack.outputs().get(output_index) else {
@@ -791,7 +791,7 @@ impl State {
         (physical.loc.x, physical.loc.y, physical.size.w, physical.size.h)
     }
 
-    /// [`Self::usable_area`]'s raw, unconverted counterpart — genuinely
+    /// [`Self::focused_usable_area`]'s raw, unconverted counterpart — genuinely
     /// [`Logical`] (scale-divided), for the two call sites
     /// (`handlers/xdg_shell.rs`'s `new_toplevel`,
     /// `winit_backend.rs`'s `WinitEvent::Resized`) that build an
@@ -800,10 +800,10 @@ impl State {
     /// regardless of how many physical pixels mudhuts itself renders a
     /// Main Window's fullscreen content into. Falls back to
     /// `self.output_size` (physical) with no output mapped yet — matches
-    /// `usable_area()`'s identical fallback, and only ever actually
+    /// `focused_usable_area()`'s identical fallback, and only ever actually
     /// matters before the first output exists, when physical and logical
     /// aren't meaningfully different yet anyway.
-    pub fn usable_area_logical(&self) -> (i32, i32, i32, i32) {
+    pub fn focused_usable_area_logical(&self) -> (i32, i32, i32, i32) {
         let Some(output) = self.output.as_ref() else {
             return (0, 0, self.output_size.0, self.output_size.1);
         };
@@ -811,7 +811,7 @@ impl State {
         (zone.loc.x, zone.loc.y, zone.size.w, zone.size.h)
     }
 
-    /// [`Self::usable_area_logical`], for a *specific* output rather than
+    /// [`Self::focused_usable_area_logical`], for a *specific* output rather than
     /// implicitly the focused one — mirrors [`Self::usable_area_for`]'s
     /// own reason for existing: `handlers/layer_shell.rs`'s
     /// `reconfigure_main_windows` must build an `xdg_toplevel` configure
@@ -819,7 +819,7 @@ impl State {
     /// not always the currently-focused one.
     pub fn usable_area_logical_for(&self, output_index: usize) -> (i32, i32, i32, i32) {
         // `(0, 0, 0, 0)`, not `self.output_size` (the *focused* output's
-        // own physical size) — unlike `usable_area_logical`'s identical-
+        // own physical size) — unlike `focused_usable_area_logical`'s identical-
         // looking fallback (which really is about "no output exists
         // anywhere yet," so the focused one and "the" output are the
         // same concept), a bad `output_index` here means a *specific,
@@ -843,15 +843,15 @@ impl State {
     /// output's size" in the *same* space — see `grabs.rs`'s `unset` and
     /// `docks.rs`'s `finish_drag`, both computing whether a drop point is
     /// near an edge. Falls back to `self.output_size` with no output
-    /// mapped yet, same reasoning as `usable_area_logical`.
-    pub fn output_size_logical(&self) -> (i32, i32) {
-        match self.real_output_geometry() {
+    /// mapped yet, same reasoning as `focused_usable_area_logical`.
+    pub fn focused_output_size_logical(&self) -> (i32, i32) {
+        match self.focused_real_output_geometry() {
             Some(geo) => (geo.size.w, geo.size.h),
             None => self.output_size,
         }
     }
 
-    /// [`Self::output_size_logical`], for a specific output — needed
+    /// [`Self::focused_output_size_logical`], for a specific output — needed
     /// wherever a genuinely-Logical size has to be compared against
     /// something scoped to a *particular* output rather than whichever
     /// one currently has input focus (`grabs.rs`'s `MoveSurfaceGrab::unset`,
@@ -861,7 +861,7 @@ impl State {
         // `(0, 0)`, not `self.output_size` — see
         // `usable_area_logical_for`'s identical fallback fix and its own
         // doc comment for why a *specific*-output accessor can't reuse
-        // `output_size_logical`'s "no output exists at all yet" fallback
+        // `focused_output_size_logical`'s "no output exists at all yet" fallback
         // for "this particular output_index doesn't exist."
         match self.real_output_geometry_for(output_index) {
             Some(geo) => (geo.size.w, geo.size.h),
@@ -872,7 +872,7 @@ impl State {
     /// Whether the focused ConsoleHut's terminal (vs. its active Main Window)
     /// should currently be the visible view — `ConsoleHut::showing_terminal`,
     /// but forced true when that ConsoleHut has no Main Windows to toggle to.
-    pub fn showing_terminal_effective(&self) -> bool {
+    pub fn focused_showing_terminal_effective(&self) -> bool {
         self.stack.shows_terminal_effective(self.stack.focused_top_level())
     }
 
@@ -881,7 +881,7 @@ impl State {
     }
 
     /// Screen-space offset of whichever pane currently has effective
-    /// focus — always at least [`Self::usable_area`]'s own origin (`(0.0,
+    /// focus — always at least [`Self::focused_usable_area`]'s own origin (`(0.0,
     /// 0.0)` unless a layer-shell surface reserves part of the output),
     /// plus the Tile-Hut pane offset on top of that if the focused
     /// top-level Hut is one (see `render.rs`'s Tile-Hut
@@ -891,7 +891,7 @@ impl State {
     /// computed against the raw output as if the focused ConsoleHut's terminal
     /// still filled it edge to edge.
     pub fn active_pane_offset(&self) -> (f64, f64) {
-        let area = self.usable_area();
+        let area = self.focused_usable_area();
         self.stack.active_pane_offset(self.stack.focused_top_level(), area)
     }
 
@@ -907,11 +907,11 @@ impl State {
     /// backgrounded or behind an inactive Hut-tab — only the *focused*
     /// top-level Stack entry is ever actually on screen, matching every
     /// other render/hit-test call site's scope.
-    pub fn leaf_absolute_rect(&self, root: &WlSurface) -> Option<(i32, i32, i32, i32)> {
-        self.stack.leaf_absolute_rect(self.stack.focused_top_level(), root, self.usable_area())
+    pub fn focused_leaf_absolute_rect(&self, root: &WlSurface) -> Option<(i32, i32, i32, i32)> {
+        self.stack.leaf_absolute_rect(self.stack.focused_top_level(), root, self.focused_usable_area())
     }
 
-    /// [`Self::leaf_absolute_rect`], for a specific output rather than
+    /// [`Self::focused_leaf_absolute_rect`], for a specific output rather than
     /// whichever one currently has input focus — `unconstrain_popup`'s
     /// popup root doesn't have to be on the focused output, and the
     /// focused-only version's `self.stack.focused_top_level()` would walk
@@ -954,10 +954,10 @@ impl State {
     /// which Hut this call is for, so it's a safe no-op whenever the
     /// visible view it would resync to hasn't actually changed.
     pub fn sync_visible_main_window(&mut self) {
-        // Computed before taking `hut`'s mutable borrow below — `usable_area`
+        // Computed before taking `hut`'s mutable borrow below — `focused_usable_area`
         // needs `&self` as a whole, which the borrow checker won't allow
         // alongside an active `&mut self.stack` borrow.
-        let (area_x, area_y, _, _) = self.usable_area();
+        let (area_x, area_y, _, _) = self.focused_usable_area();
         self.stack.focused_mut().sync_main_window_space((area_x, area_y));
         self.sync_keyboard_focus_to_view();
     }

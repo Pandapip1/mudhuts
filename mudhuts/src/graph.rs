@@ -136,7 +136,7 @@ pub struct OutputPort {
 /// reports `(0, 0)` for its terminal texture; a compositing node
 /// (`TileNode`) translates each child's pieces by that child's own
 /// offset within its own local frame before passing them upward. The one
-/// absolute translation (by the real output's `usable_area()` origin)
+/// absolute translation (by the real output's `focused_usable_area()` origin)
 /// happens exactly once, at the very top of the tree — mirroring
 /// `hut::TileHut::absolute_pane_rects`'s own "local `pane_rects`,
 /// translated by the caller" shape.
@@ -144,7 +144,7 @@ pub struct OutputPort {
 /// **`Window` positions are the one exception — already absolute, not
 /// local-frame-relative.** `ConsoleNode` reads them straight from
 /// `ConsoleHut::space`, whose own elements were mapped with
-/// `usable_area()`'s origin already baked in (`sync_main_window_space`'s
+/// `focused_usable_area()`'s origin already baked in (`sync_main_window_space`'s
 /// `map_element(window, area_origin, ...)` call) — matching exactly how
 /// today's `space_render_elements`-based rendering already positions
 /// them. Whatever ultimately converts a resolved `Vec<ContentPiece>`

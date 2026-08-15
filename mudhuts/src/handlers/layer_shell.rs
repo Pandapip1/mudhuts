@@ -11,7 +11,7 @@
 //! hit-testing, so this module is mostly wiring: map/unmap on
 //! create/destroy, `arrange()` + the initial configure on commit (mirrors
 //! `handlers/xdg_shell.rs`'s `handle_commit` for ordinary toplevels), and
-//! `State::usable_area()` (`state.rs`) exposing the resulting
+//! `State::focused_usable_area()` (`state.rs`) exposing the resulting
 //! exclusive-zone-shrunk rect to everything that sizes/positions normal
 //! content (`render.rs`, `handlers/xdg_shell.rs`, `stack.rs`).
 //!
@@ -202,7 +202,7 @@ pub fn handle_commit(state: &mut State, surface: &WlSurface) {
     let mut map = layer_map_for_output(&output);
     // Arranging can change the exclusive zone, which everything sizing
     // *mudhuts' own* content (the terminal, a Main Window's on-screen
-    // *position*) reads live via `State::usable_area()` every frame — the
+    // *position*) reads live via `State::focused_usable_area()` every frame — the
     // caller (`compositor.rs`) already calls `request_redraw()`
     // unconditionally on every commit, so that part is picked up
     // automatically. A mapped Wayland client's own *buffer size* is not:

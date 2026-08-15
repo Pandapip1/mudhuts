@@ -467,6 +467,9 @@ impl GraphStack {
     /// coordinates convention, computed via the same `hut::pane_rects`
     /// call `TileNode`'s own `resolve`/`resize_to_pixels` already use,
     /// so this can never disagree with what's actually rendered/sized).
+    /// Takes `top`/`area` explicitly (not implicitly the focused output)
+    /// — `State::focused_leaf_absolute_rect`/`State::leaf_absolute_rect_for`
+    /// are the "for a particular output" wrappers around this.
     pub fn leaf_absolute_rect(
         &self,
         top: NodeId,

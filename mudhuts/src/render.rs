@@ -197,7 +197,7 @@ type Element = OutputRenderElements<GlesRenderer, HutSpaceRenderElement>;
 
 /// Convert a graph node's resolved `Vec<`[`crate::graph::ContentPiece`]`>`
 /// into real frame elements — migration step 4's render bridge. `origin`
-/// is `State::usable_area()`'s own `(x, y)`, applied to `Texture` pieces
+/// is `State::focused_usable_area()`'s own `(x, y)`, applied to `Texture` pieces
 /// only (they arrive local-frame-relative — see `ContentPiece`'s own doc
 /// comment); `Window` pieces arrive already-absolute (`ConsoleNode`
 /// reads them straight from `ConsoleHut::space`, whose own elements were
@@ -354,7 +354,7 @@ fn with_normal_content_damage<T>(output_index: usize, f: impl FnOnce(&mut Damage
 /// changed.
 ///
 /// Rebuilt only when `size`/`scale` genuinely change (output resize/
-/// rescale — rare, effectively never at runtime per `State::output_scale`'s
+/// rescale — rare, effectively never at runtime per `State::focused_output_scale`'s
 /// own doc comment) rather than every call, the same way the real output
 /// and `ConsoleHut::space_output` already avoid rebuilding themselves every
 /// frame.
@@ -590,7 +590,7 @@ pub fn resolve_frame_content(state: &mut State, output_index: usize) -> Vec<crat
 /// *before* `renderer` was ever borrowed — see that function's doc
 /// comment) into real frame elements, in the same real-output-*absolute*
 /// physical coordinates every branch always used pre-graph: `Texture`
-/// pieces arrive local-frame-relative and get `usable_area()`'s own
+/// pieces arrive local-frame-relative and get `focused_usable_area()`'s own
 /// origin applied here (matching `State::active_pane_offset()`'s
 /// identical assumption for mouse routing); `Window` pieces arrive
 /// already-absolute and don't (see `graph::ContentPiece`'s own doc
@@ -661,7 +661,7 @@ fn content_elements(
 /// Composite [`content_elements`]'s current output into one offscreen
 /// texture sized to `size` — the *real, full output* size (physical
 /// pixels; the same `size` `build_frame_elements` itself already receives
-/// from its caller), **not** just `State::usable_area()`'s smaller one.
+/// from its caller), **not** just `State::focused_usable_area()`'s smaller one.
 /// This matters for correctness, not just consistency: `content_elements`'s
 /// branches (`ConsoleHut::space`'s Main Window mapping via
 /// `State::sync_visible_main_window`, `TileHut::absolute_pane_rects`) all
@@ -671,9 +671,9 @@ fn content_elements(
 /// absolute — so the offscreen canvas they're rendered into has to span
 /// the same coordinate range those positions assume, or content silently
 /// clips/misplaces itself the moment a layer-shell surface reserves any
-/// part of the output (`usable_area()`'s origin stops being `(0, 0)`).
+/// part of the output (`focused_usable_area()`'s origin stops being `(0, 0)`).
 /// `build_frame_elements` maps the finished texture at `(0, 0)` in the
-/// real output's own `Space` accordingly — not `usable_area()`'s origin —
+/// real output's own `Space` accordingly — not `focused_usable_area()`'s origin —
 /// for the same reason.
 ///
 /// The "normal content" child `build_frame_elements` maps into a `Space`
@@ -1028,8 +1028,8 @@ pub fn build_frame_elements(
     // frame) — layer-shell surfaces still need to render on their own in
     // that case, exactly like they always have.
     //
-    // `size` (the real, full output size), not `usable_area()`'s smaller
-    // one, and mapped at `(0, 0)`, not `usable_area()`'s own origin — see
+    // `size` (the real, full output size), not `focused_usable_area()`'s smaller
+    // one, and mapped at `(0, 0)`, not `focused_usable_area()`'s own origin — see
     // `composite_normal_content`'s own doc comment on why: the content
     // inside it is already positioned in real-output-absolute coordinates,
     // so the canvas it's rendered onto (and where that canvas then lands)

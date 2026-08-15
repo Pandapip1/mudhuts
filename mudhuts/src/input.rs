@@ -158,11 +158,11 @@ impl State {
     /// or anything already headed into `self.surface_under`/`pointer.motion`)
     /// into mudhuts' own physical-pixel rendering space — the space
     /// `try_click_chrome`, `docks::start_drag`, and the terminal's
-    /// `pixel_to_cell` all expect, matching `output_size`/`usable_area()`.
+    /// `pixel_to_cell` all expect, matching `output_size`/`focused_usable_area()`.
     /// See `handle_pointer_motion`'s doc comment for why both spaces are
     /// needed at once rather than picking just one.
     fn to_physical(&self, pos: Point<f64, Logical>) -> Point<f64, Physical> {
-        pos.to_physical(Scale::from(self.output_scale()))
+        pos.to_physical(Scale::from(self.focused_output_scale()))
     }
 
     /// Shared tail of pointer-motion handling, called from both
@@ -174,7 +174,7 @@ impl State {
     /// either way.
     ///
     /// `pos` is genuinely Logical (both callers now derive it from
-    /// `State::real_output_geometry`/its own scale-divided bounds — see
+    /// `State::focused_real_output_geometry`/its own scale-divided bounds — see
     /// `InputEvent::PointerMotionAbsolute`/`PointerMotion` below), which
     /// is what `self.surface_under`/`pointer.motion` need: Smithay's own
     /// `Space`/layer-shell hit-testing, and the position a client's
@@ -183,12 +183,12 @@ impl State {
     /// hit-testing (the terminal's `pixel_to_cell`, `docks::advance_drag`)
     /// — those get a locally-converted physical copy instead of Logical
     /// `pos` directly, rather than picking just one space for everything
-    /// (see `State::usable_area`'s doc comment on why physical is what
+    /// (see `State::focused_usable_area`'s doc comment on why physical is what
     /// mudhuts' own rendering needs).
     fn handle_pointer_motion(&mut self, pos: smithay::utils::Point<f64, smithay::utils::Logical>, time: u32) {
         // `pos` arrives genuinely global (`State::pointer_location`'s own
         // doc comment — real multi-monitor's shared compositor space):
-        // `PointerMotionAbsolute` derives it from `real_output_geometry`,
+        // `PointerMotionAbsolute` derives it from `focused_real_output_geometry`,
         // always `(0, 0)`-rooted since winit is genuinely single-output
         // there (global and local coincide); `PointerMotion` derives it
         // from `GraphStack::virtual_bounding_box`, genuinely global for
@@ -253,7 +253,7 @@ impl State {
             docks::advance_drag(self, global_pos);
         }
 
-        if self.showing_terminal_effective() {
+        if self.focused_showing_terminal_effective() {
             let (ox, oy) = self.active_pane_offset();
             let (col, row, left_half) = self
                 .stack
@@ -299,7 +299,7 @@ impl State {
 
     /// Keyboard focus has to follow the visible view: clients only get
     /// key events via `set_focus`, and the terminal only gets them via
-    /// `showing_terminal_effective()` itself (see `process_input_event`),
+    /// `focused_showing_terminal_effective()` itself (see `process_input_event`),
     /// so the window needs *no* stale focus lingering while it's hidden,
     /// and *does* need focus the moment it's shown.
     ///
@@ -321,7 +321,7 @@ impl State {
     /// separate `keyboard.set_focus(...)` call instead of using this —
     /// removed once folding this in made it fully redundant.
     pub(crate) fn sync_keyboard_focus_to_view(&mut self) {
-        let target = if self.showing_terminal_effective() {
+        let target = if self.focused_showing_terminal_effective() {
             None
         } else {
             self.stack
@@ -355,7 +355,7 @@ impl State {
     ///
     /// `pos` is physical — every rect this checks against (tile panes,
     /// Hut/ConsoleHut tab strips) is mudhuts' own drawn chrome, sized
-    /// against `usable_area()`/`output_size`, not a real Wayland surface
+    /// against `focused_usable_area()`/`output_size`, not a real Wayland surface
     /// Smithay tracks in Logical space. The caller converts from the
     /// seat's Logical position before calling this.
     fn try_click_chrome(&mut self, pos: Point<f64, Physical>) -> bool {
@@ -368,7 +368,7 @@ impl State {
         // disagreeing with what's actually drawn, whenever a layer-shell
         // surface reserves part of the output, since there's only one
         // place left to get that wrong.
-        let area = self.usable_area();
+        let area = self.focused_usable_area();
         let top = self.stack.focused_top_level();
         if let Some(tile) = self.stack.graph().downcast::<crate::graph_nodes::TileNode>(top) {
             let children = self.stack.graph().hut_list_input(top, "children");
@@ -400,7 +400,7 @@ impl State {
 
         let cell_w = self.stack.focused().glyphs.cell_width().max(1);
         let cell_h = self.stack.focused().glyphs.cell_height().max(1) as i32;
-        let scale = self.output_scale();
+        let scale = self.focused_output_scale();
 
         if village_chrome::handle_click(
             self.stack.graph_mut(),
@@ -602,7 +602,7 @@ impl State {
                 // No-op with nothing to toggle to (matches the original
                 // "except when there are no windows open" rule) — checked
                 // via the un-forced `showing_terminal` field, not
-                // `showing_terminal_effective()`, since that would always
+                // `focused_showing_terminal_effective()`, since that would always
                 // report true here and this toggle would never do
                 // anything. Per-ConsoleHut now (Phase 4): toggling in one ConsoleHut
                 // doesn't disturb what any other ConsoleHut was last showing.
@@ -831,7 +831,7 @@ impl State {
                             }
                         }
 
-                        if !data.showing_terminal_effective() {
+                        if !data.focused_showing_terminal_effective() {
                             // A client window is the active view; let it
                             // receive the key via its own wl_keyboard
                             // (focus was set on click).
@@ -917,12 +917,12 @@ impl State {
                 self.handle_pointer_motion(new_location, event.time_msec());
             }
             InputEvent::PointerMotionAbsolute { event, .. } => {
-                let Some(output_geo) = self.real_output_geometry() else {
+                let Some(output_geo) = self.focused_real_output_geometry() else {
                     return;
                 };
                 // Genuinely global (see `handle_pointer_motion`'s own doc
                 // comment on why it needs to be) — `output_geo.loc` is
-                // always `(0, 0)` (`real_output_geometry`'s own doc
+                // always `(0, 0)` (`focused_real_output_geometry`'s own doc
                 // comment: local to the focused output, not its real
                 // multi-monitor position), so adding it back wouldn't
                 // rebase anything. An absolute-positioning device
@@ -964,7 +964,7 @@ impl State {
                     // `composite_normal_content`), so they're checked
                     // before the terminal/window branches below for this
                     // press.
-                } else if self.showing_terminal_effective() {
+                } else if self.focused_showing_terminal_effective() {
                     // Physical, like `active_pane_offset()`/`pixel_to_cell`
                     // — mudhuts' own terminal grid, not a real surface.
                     let pos = self.to_physical(pointer.current_location());
@@ -1113,7 +1113,7 @@ impl State {
                     }
                 }
 
-                if self.showing_terminal_effective() && vertical_amount != 0.0 {
+                if self.focused_showing_terminal_effective() && vertical_amount != 0.0 {
                     if self.stack.focused().terminal.wants_mouse_reports() {
                         // Accumulate raw `vertical_amount` (the same
                         // physical-pixel-ish unit libinput/Wayland's

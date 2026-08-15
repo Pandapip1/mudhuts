@@ -118,7 +118,7 @@ impl SessionLockHandler for State {
         if let Some(mode) = out.current_mode() {
             // Logical, not the mode's raw physical pixel size — this is a
             // real client-facing configure, same reasoning as
-            // `handlers/xdg_shell.rs`'s `new_toplevel`/`State::usable_area_logical`.
+            // `handlers/xdg_shell.rs`'s `new_toplevel`/`State::focused_usable_area_logical`.
             let logical: smithay::utils::Size<i32, smithay::utils::Logical> = mode
                 .size
                 .to_f64()

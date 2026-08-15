@@ -38,7 +38,7 @@ pub fn init_winit(
     // Real detection, not hardcoded: the host window's own DPI scale
     // (winit already tracks this for us — the same value a native
     // toolkit app running directly on the host would see). Read once at
-    // startup and never revisited — see `State::output_scale`'s doc
+    // startup and never revisited — see `State::focused_output_scale`'s doc
     // comment on why mudhuts has no live-rescale mechanism to hook a
     // later `WinitEvent::Resized { scale_factor, .. }` change into (the
     // nested window being dragged to a different-DPI monitor mid-session
@@ -113,8 +113,8 @@ pub fn init_winit(
                     // `xdg_toplevel` configure is client-facing protocol
                     // state, always logical regardless of how many
                     // physical pixels mudhuts itself renders into — see
-                    // `State::usable_area_logical`'s doc comment.
-                    let (_, _, usable_w, usable_h) = state.usable_area_logical();
+                    // `State::focused_usable_area_logical`'s doc comment.
+                    let (_, _, usable_w, usable_h) = state.focused_usable_area_logical();
                     let usable_logical = smithay::utils::Size::<i32, smithay::utils::Logical>::from((usable_w, usable_h));
                     xdg_shell::resize_all_main_windows(&state.stack, usable_logical);
                     // Nothing else re-pushes capture buffer constraints on
@@ -133,7 +133,7 @@ pub fn init_winit(
                     let mut backend = backend.borrow_mut();
                     let size = backend.window_size();
                     state.output_size = (size.w, size.h);
-                    let (_, _, usable_w, usable_h) = state.usable_area();
+                    let (_, _, usable_w, usable_h) = state.focused_usable_area();
                     state.stack.resize_all(usable_w, usable_h);
 
                     // KNOWN GAP: unlike `udev_backend.rs`, this backend has

@@ -406,7 +406,7 @@ impl Node<RenderEnv> for ConsoleNode {
         // translation and `hut::TileHut::absolute_pane_rects` already
         // use: a node's own `content` output is in its *own* local
         // frame, translated by whatever composes it further up the tree
-        // (ultimately the real output's `usable_area()` origin, applied
+        // (ultimately the real output's `focused_usable_area()` origin, applied
         // once at the very top, not baked in here).
         if *self.hut.showing_terminal || self.hut.main_window_count() == 0 {
             let Some(renderer_rc) = graph.env.renderer.as_ref() else {
@@ -432,7 +432,7 @@ impl Node<RenderEnv> for ConsoleNode {
         // `area_origin` directly into the mapped positions, but this
         // function's own convention above is everything staying in a
         // node-local `(0, 0)` frame, translated once at the top of the
-        // tree — passing the real, possibly-nonzero `usable_area()`
+        // tree — passing the real, possibly-nonzero `focused_usable_area()`
         // origin here would double-apply it. Left as an open question,
         // not fixed: whether `space` genuinely ever holds node-local
         // positions for this path, or whether this and

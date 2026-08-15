@@ -271,7 +271,7 @@ impl PointerGrab<State> for MoveSurfaceGrab {
         let size = self.window.geometry().size;
         // `location`/`size` are genuinely Logical (from the owning
         // Console Hut's own `space`) — compared against *that Hut's own
-        // output's* Logical size, not `data.output_size_logical()`
+        // output's* Logical size, not `data.focused_output_size_logical()`
         // (which is the *focused* output, possibly a different one by
         // now — see this method's own doc comment), to keep the
         // distance check meaningful for the output the window is

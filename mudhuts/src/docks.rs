@@ -302,7 +302,7 @@ pub fn start_drag(state: &mut State, pos: Point<f64, Physical>) -> bool {
     let handles = DockHandles {
         hut: state.stack.focused(),
         output_size: state.output_size,
-        scale: state.output_scale(),
+        scale: state.focused_output_scale(),
     };
     let point = Point::from((pos.x.round() as i32, pos.y.round() as i32));
     let Some(Hit::DockHandle(surface)) = handles.hit_test(point) else {
@@ -447,7 +447,7 @@ pub fn finish_drag(state: &mut State) {
     let size = window.geometry().size;
     // `location`/`size` come from the drag's own owning Hut's `space`,
     // so they're genuinely Logical — compared against *that Hut's own
-    // output's* Logical size, not `state.output_size_logical()` (the
+    // output's* Logical size, not `state.focused_output_size_logical()` (the
     // focused output, possibly a different one by now), to keep the
     // distance check meaningful for the output the window is actually
     // being dropped on.

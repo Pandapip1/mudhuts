@@ -69,7 +69,7 @@ pub struct CompositedTexture {
 
 impl CompositedTexture {
     /// `scale` is the real output scale (the same fractional value
-    /// `State::output_scale()` reports), rounded to the nearest integer
+    /// `State::focused_output_scale()` reports), rounded to the nearest integer
     /// buffer-scale internally via `render::texture_buffer_scale` —
     /// matching every other texture element in this codebase. Getting this
     /// wrong (e.g. hardcoding `1`, as an earlier prototype version of this

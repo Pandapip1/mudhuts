@@ -709,7 +709,7 @@ fn rescan_connectors(state: &mut State, inner: &Rc<RefCell<Inner>>, handle: &Loo
 /// overwhelmingly the common real case — including this backend's own
 /// motivating hardware target, Apple Silicon's built-in Retina panel.
 /// Computed once at connector-connect time and never revisited: mudhuts
-/// has no live-rescale mechanism (see `State::output_scale`'s doc
+/// has no live-rescale mechanism (see `State::focused_output_scale`'s doc
 /// comment), and a real monitor's physical size/pixel count can't change
 /// without a fresh connector-connect event of its own anyway.
 fn detect_output_scale(phys_size_mm: (i32, i32), pixels: (i32, i32)) -> f64 {
@@ -1139,7 +1139,7 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
     // `ConsoleHut::spawn`'s tiny 80x24-cell placeholder grid. Sized to the
     // *usable* area, not the raw output — shrinks automatically whenever
     // a layer-shell surface's exclusive zone changes (see
-    // `State::usable_area`'s doc comment). This crtc's own output only —
+    // `State::focused_usable_area`'s doc comment). This crtc's own output only —
     // real multi-monitor: two outputs can have genuinely different modes
     // (see `GraphStack::resize_output`'s own doc comment).
     let (_, _, usable_w, usable_h) = state.usable_area_for(output_index);
@@ -1513,7 +1513,7 @@ fn build_cursor_elements(
         state.cursor_status = CursorImageStatus::default_named();
     }
 
-    // This crtc's own output, not `state.output_scale()` (the focused
+    // This crtc's own output, not `state.focused_output_scale()` (the focused
     // one) — `output_position` a few lines below already resolves
     // per-output via `output_index`; the cursor's own size/hotspot/
     // render scale need to match.
