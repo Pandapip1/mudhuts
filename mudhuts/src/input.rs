@@ -304,23 +304,111 @@ impl State {
     /// and *does* need focus the moment it's shown.
     ///
     /// Called automatically from `state.rs`'s `sync_visible_main_window`/
-    /// `sync_hut_space` themselves now, not left as a separate call every
-    /// mutation site has to remember to pair with those — across several
-    /// rounds of review, real call sites kept turning up that synced the
-    /// visible window but not this, leaving keyboard input going to the
-    /// old, now-hidden surface until some unrelated event happened to
-    /// repair it; a hand-followed convention with no compiler backing was
-    /// never going to stop that from recurring. Keyboard focus is
-    /// seat-wide while `sync_hut_space` is per-Hut, so folding it in
-    /// unconditionally does mean this can run for a Hut that isn't the
-    /// focused one — harmless, since this method only ever touches
-    /// keyboard focus for `self.stack.focused()`'s own current view
-    /// regardless of which Hut's `space` just changed, so it's a no-op
-    /// whenever the Hut that actually changed wasn't the focused one.
-    /// `handlers/xdg_shell.rs`'s `new_toplevel` used to hand-roll its own
-    /// separate `keyboard.set_focus(...)` call instead of using this —
-    /// removed once folding this in made it fully redundant.
+    /// `sync_hut_space` themselves (immediate correction right at the
+    /// mutation site), *and*, more importantly, unconditionally from
+    /// `render.rs`'s `build_frame_elements` on every real redraw pass —
+    /// the single point both backends' otherwise-separate redraw paths
+    /// converge on, so no mutation path can skip it the way several
+    /// turned up missing the first two call sites across review rounds
+    /// (most recently `GraphStack::remove_exited` — a shell exit
+    /// shifting/collapsing focus; see its own doc comment). Called for
+    /// *every* output that reaches `build_frame_elements` on a given
+    /// redraw pass, not deduplicated to just one — a per-crtc bail (the
+    /// udev backend's own `frame_pending` check, see `render_surface`'s
+    /// doc comment) means not every output necessarily reaches it on
+    /// every tick, so "only once, however that's chosen" can't safely
+    /// assume any specific output reliably does; redundant calls are
+    /// cheap (see below) so there's no real cost to just always doing it.
+    ///
+    /// **This must NOT unconditionally force-set focus to "the terminal or
+    /// the active Main Window" every time it runs** — an earlier version
+    /// of this method did exactly that, and running it on every redraw
+    /// (rather than only at a specific mutation site) turned a rare stomp
+    /// into a near-guaranteed one, caught in review: this method only
+    /// knows how to compute *two* targets (terminal, or the focused Hut's
+    /// Main Window), but real keyboard focus can legitimately be a
+    /// Floating Window/Alert (`this file`'s click-to-focus, a few lines
+    /// away) or a mapped layer-shell surface (`try_click_layer_surface`,
+    /// also this file) — neither of which this method's own `target`
+    /// below ever produces. Force-setting anyway reverted a just-clicked
+    /// Floating Window or a just-focused panel/launcher back to the Main
+    /// Window on the very next redraw (which a click's own
+    /// `request_redraw()`, or even just the newly-focused surface's own
+    /// commit in response to its `Enter` event, triggers almost
+    /// immediately) — making it functionally impossible to keep keyboard
+    /// focus on anything this method doesn't itself know about. Fixed by
+    /// checking whether the *current* real focus is already a legitimate
+    /// target first, and leaving it alone if so; only a focus that's
+    /// neither — genuinely stale, pointing at something that isn't part
+    /// of the current view at all — gets reset to this method's own
+    /// fallback. (NOT session-lock's own PIN entry — that uses a
+    /// completely separate `ext-session-lock`/`LockSurface` role, never a
+    /// `wlr-layer-shell` one, and stays correct for an unrelated reason:
+    /// `process_locked_input_event` re-asserts `keyboard.set_focus` on
+    /// every single locked keystroke, a wholly separate mechanism this
+    /// method never runs alongside — `build_frame_elements` returns
+    /// early, before this call, whenever `state.locked` is set.)
+    ///
+    /// "Legitimate" means one of:
+    /// - a real, *currently mapped* layer-shell surface — checked via
+    ///   `layer_map_for_output` across every output, not just whether the
+    ///   surface's data map has ever held `LayerSurfaceData` (assigned
+    ///   once at role-creation and never removed again, even after
+    ///   `layer_destroyed`'s `unmap_layer` — checking presence alone
+    ///   would treat a real-but-unmapped former layer surface as
+    ///   permanently exempt from ever being corrected again);
+    /// - anything currently mapped as a `Window` in the *focused* Hut's
+    ///   own `space` (Main Window, Floating Windows, and Alerts are all
+    ///   mapped there together — see `sync_main_window_space`'s own doc
+    ///   comment).
+    ///
+    /// Two known, accepted limitations of the second check, neither new
+    /// (both predate this method existing at all, in the sense that
+    /// nothing before this checked `space` for a stale-focus repair
+    /// either — this method's whole *reason* for existing is a stronger
+    /// guarantee than "nothing", not a weaker one than some prior
+    /// mechanism):
+    /// - `space()` (not the self-syncing `space_mut`, deliberately — see
+    ///   its own doc comment on why forcing a sync in a read path this
+    ///   frequent risks discarding a live in-progress drag) can itself be
+    ///   stale if some future mutation site changes what should be
+    ///   focused without also syncing `space` for that Hut first — the
+    ///   same "mutation site forgot the pairing" class of bug this method
+    ///   exists to catch elsewhere, just one level further down. Not
+    ///   fixable here without reintroducing the forced-sync hazard.
+    /// - When a Main Window entry has *multiple* Floating Windows/Alerts
+    ///   mapped simultaneously, this only asks "is the current focus
+    ///   *some* element of `space`", not "is it *the* one that should
+    ///   presently hold focus" — it can't distinguish between them. Only
+    ///   actually matters for a mutation path that changes which one
+    ///   *should* be focused without itself calling `keyboard.set_focus`
+    ///   for the new one — `handlers/shell.rs`'s `retag` (tagging a
+    ///   toplevel as a Floating Window/Alert via `mudhuts_shell_v1`) is
+    ///   exactly this, caught in review (this method's earlier claim here
+    ///   that "no such path exists" was simply wrong) and fixed at the
+    ///   source: `retag` now explicitly focuses its own newly-tagged
+    ///   window itself, the same way this method can't. Any *future*
+    ///   mutation path that forgets to do the same would hit this exact
+    ///   limitation again — this method still can't be the backstop for
+    ///   that specific case, only for "focus points at something no
+    ///   longer part of the view at all."
     pub(crate) fn sync_keyboard_focus_to_view(&mut self) {
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
+        if let Some(current) = keyboard.current_focus() {
+            let is_mapped_layer_shell_surface = self
+                .stack
+                .outputs()
+                .iter()
+                .any(|slot| layer_map_for_output(&slot.output).layers().any(|l| l.wl_surface() == &current));
+            if is_mapped_layer_shell_surface {
+                return;
+            }
+            if crate::space_element::window_in_space(self.stack.focused().space(), &current).is_some() {
+                return;
+            }
+        }
         let target = if self.focused_showing_terminal_effective() {
             None
         } else {
@@ -330,9 +418,7 @@ impl State {
                 .and_then(|w| w.toplevel())
                 .map(|t| t.wl_surface().clone())
         };
-        if let Some(keyboard) = self.seat.get_keyboard() {
-            keyboard.set_focus(self, target, SERIAL_COUNTER.next_serial());
-        }
+        keyboard.set_focus(self, target, SERIAL_COUNTER.next_serial());
     }
 
     /// Try to handle a left-click as a chrome interaction — a
@@ -583,18 +669,9 @@ impl State {
                 // `state.rs`'s `surface_under`'s own doc comment on why
                 // forcing a sync risks discarding a live in-progress
                 // drag write elsewhere in the same Hut's `space`.
-                let window = self
-                    .stack
-                    .focused()
-                    .space()
-                    .elements()
-                    .filter_map(|e| match e {
-                        crate::space_element::HutSpaceElement::Window(w) => Some(w),
-                        crate::space_element::HutSpaceElement::Composited(_) => None,
-                    })
-                    .find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == &focused))
-                    .cloned();
-                if let Some(toplevel) = window.and_then(|w| w.toplevel().cloned()) {
+                let toplevel = crate::space_element::window_in_space(self.stack.focused().space(), &focused)
+                    .and_then(|w| w.toplevel().cloned());
+                if let Some(toplevel) = toplevel {
                     toplevel.send_close();
                 }
             }

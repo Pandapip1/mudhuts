@@ -901,6 +901,42 @@ pub fn build_frame_elements(
         return elements;
     }
 
+    // Every output that reaches this point, every real redraw pass, on
+    // both backends (this function is the one place
+    // `winit_backend.rs`/`udev_backend.rs`'s otherwise-separate redraw
+    // paths converge — see this function's own doc comment) — not left
+    // as a call every focus-changing mutation site has to remember to
+    // pair with `sync_hut_space`/`sync_visible_main_window`. Those two
+    // *also* still call it themselves (immediate correction at mutation
+    // time, not just at the next redraw), but this is what actually
+    // closes the bug class: a mutation path that changes which entry is
+    // focused *without* going through either of them
+    // (`GraphStack::remove_exited`, a shell exit shifting/collapsing
+    // focus, was exactly this — fixed ad hoc by adding a call there, but
+    // the next such gap would repeat the same bug) can no longer leave
+    // real keyboard focus stale for long, because nothing becomes visible
+    // without a redraw, and no redraw skips this.
+    //
+    // Deliberately NOT deduplicated to just `output_index == 0` (an
+    // earlier version of this call did exactly that, caught in review):
+    // the udev backend's own `render_surface` bails out *before* ever
+    // reaching `build_frame_elements` for a specific crtc whenever that
+    // crtc's own previous commit hasn't vblank'd yet
+    // (`SurfaceData::frame_pending`, see its own doc comment) — a
+    // per-crtc condition, independent across outputs on a multi-monitor
+    // session. Output 0's own crtc being the one pending on a given tick
+    // while another output's isn't would silently skip the sync entirely
+    // for that tick while that *other* output's content still became
+    // visible, which a fixed "always output 0" gate can't detect or
+    // route around. Calling this for every output that actually gets
+    // here instead means at least one call happens on every tick that
+    // renders anything at all. See `sync_keyboard_focus_to_view`'s own
+    // doc comment for why calling it redundantly is safe/cheap: it only
+    // ever *repairs* a genuinely stale focus, never force-overrides a
+    // still-legitimate one (a clicked Floating Window/Alert, a mapped
+    // layer-shell surface).
+    state.sync_keyboard_focus_to_view();
+
     let show_terminal = state.showing_terminal_effective_for(output_index);
     let top = state.stack.focused_top_level_for(output_index);
     let is_tile = state.stack.graph().downcast::<crate::graph_nodes::TileNode>(top).is_some()

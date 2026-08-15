@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, DataInit, DisplayHandle, New, Resource};
+use smithay::utils::SERIAL_COUNTER;
 use smithay::wayland::{Dispatch2, GlobalData, GlobalDispatch2};
 
 use mudhuts_protocols::server::mudhuts_shell_authority_v1::{self, Error as AuthorityError, MudhutsShellAuthorityV1};
@@ -227,7 +228,48 @@ fn retag(state: &mut State, tagged_surface: &WlSurface, target: Option<(Role, Wl
     // State` themselves, so they're called after the loop's borrow has
     // ended rather than from inside it.
     let mut handled_hut_id = None;
+    // Whether this retag actually produced a Floating Window/Alert (as
+    // opposed to a bare Main Window, or the "target not found" fallback
+    // that also treats it as a bare Main Window) — see this function's
+    // own resync below for why this matters: neither
+    // `sync_hut_space`/`sync_keyboard_focus_to_view` ever focuses
+    // anything but a Hut's *Main Window*, so without an explicit
+    // `keyboard.set_focus` call here, a newly-tagged Alert/Floating
+    // Window becomes visible on screen but silently never receives
+    // keyboard input — caught in review of an unrelated change to
+    // `sync_keyboard_focus_to_view` (see its own doc comment), but a
+    // real, pre-existing gap in this function specifically, not
+    // introduced by that change.
+    let mut tagged_floating_or_alert = false;
     for hut in state.stack.all_huts_mut() {
+        // Captured *before* removal — `take_bare_main_window` shifts/
+        // clamps `active_main_window` the moment it removes anything
+        // (`shift_active_index_on_removal`), which for a 2+-tab Hut can
+        // leave it pointing at a *different* surviving tab, not "none" —
+        // so checking "was this the active tab" only makes sense against
+        // the *pre*-removal state. `false` for a nested Floating
+        // Window/Alert being promoted (its owning Main Window entry is a
+        // different `Window` than `tagged_surface` itself, so this never
+        // matches there) — correct, since promoting one of those is
+        // always a genuinely new tab, not a re-insertion of one that was
+        // already active.
+        let was_active = hut.active_main_window_entry().is_some_and(|e| e.matches(tagged_surface));
+        // Which removal path succeeded matters for `make_active` below,
+        // so this can no longer just be `.or_else(...)`'d away into a
+        // single `Option` the way it started — a *bare* Main Window
+        // being re-tagged (e.g. a redundant `SetMain`, or a `SetFloating`
+        // whose target didn't resolve, see the fallback arm below) is a
+        // fundamentally different case from a *nested* Floating
+        // Window/Alert being promoted to a bare Main Window: only the
+        // former should ever be judged against `was_active`/"Hut already
+        // has other tabs" at all — the latter (`SetMain` on something
+        // that was Floating/Alert) is always a deliberate "bring this to
+        // the front" action, and always making it active is the original,
+        // correct behavior there (caught in review: an earlier version of
+        // this fix applied the bare-Main-Window formula to *both* cases,
+        // silently backgrounding a freshly-un-floated/un-alerted window
+        // instead of showing it).
+        let was_bare = hut.has_bare_main_window(tagged_surface);
         let Some(window) = hut
             .take_bare_main_window(tagged_surface)
             .or_else(|| hut.take_nested_window(tagged_surface))
@@ -239,6 +281,24 @@ fn retag(state: &mut State, tagged_surface: &WlSurface, target: Option<(Role, Wl
         // isn't necessarily the focused one (see this function's own
         // resync below).
         handled_hut_id = Some(hut.id);
+        // Whether the retagged window should become/stay this Hut's
+        // active tab once re-inserted as a bare Main Window (`None`
+        // below, or the "target not found" fallback). For `was_bare`:
+        // mirrors `handlers/xdg_shell.rs`'s `new_toplevel` (see
+        // `push_main_window`'s own doc comment on the bug this avoids)
+        // for "the Hut already has other tabs open", plus `was_active`
+        // for "this window *was itself* the active tab being removed and
+        // reinserted" — `new_toplevel` never has to handle that (it only
+        // ever deals with a genuinely brand-new `Window`, never one
+        // round-tripping through remove-then-reinsert within the same Hut
+        // it came from); without it, a redundant re-tag of an
+        // already-active bare Main Window would silently flip the user's
+        // view to whatever sibling tab the active-index clamp happened to
+        // land on. For `!was_bare` (a nested Floating Window/Alert being
+        // promoted): unconditionally `true` — promoting one to Main is
+        // always a deliberate "show this now" action, regardless of
+        // whether the Hut has other tabs open.
+        let make_active = if was_bare { was_active || hut.main_window_count() == 0 } else { true };
 
         match &target {
             None => {
@@ -246,7 +306,7 @@ fn retag(state: &mut State, tagged_surface: &WlSurface, target: Option<(Role, Wl
                 let foreign_handle = state
                     .foreign_toplevel_list_state
                     .new_toplevel::<State>(&crate::chrome::window_title(&window), &crate::chrome::window_app_id(&window));
-                hut.push_main_window(window, true, foreign_handle);
+                hut.push_main_window(window, make_active, foreign_handle);
             }
             Some((role, main_surface)) => match hut.find_main_window_mut(main_surface) {
                 Some(entry) => {
@@ -254,6 +314,7 @@ fn retag(state: &mut State, tagged_surface: &WlSurface, target: Option<(Role, Wl
                         Role::Floating => entry.floating_windows.push(FloatingWindow::new(window)),
                         Role::Alert => entry.alerts.push(Alert::new(window)),
                     }
+                    tagged_floating_or_alert = true;
                     tracing::debug!(
                         "mudhuts_window_role_v1: retagged as {}",
                         match role {
@@ -270,7 +331,7 @@ fn retag(state: &mut State, tagged_surface: &WlSurface, target: Option<(Role, Wl
                         &crate::chrome::window_title(&window),
                         &crate::chrome::window_app_id(&window),
                     );
-                    hut.push_main_window(window, true, foreign_handle);
+                    hut.push_main_window(window, make_active, foreign_handle);
                 }
             },
         }
@@ -284,6 +345,62 @@ fn retag(state: &mut State, tagged_surface: &WlSurface, target: Option<(Role, Wl
         // `finish_drag`): the retagged window's Hut isn't necessarily
         // the focused one, since the loop above searches every output.
         state.sync_hut_space(hut_id);
+        // Explicit keyboard focus for a freshly-tagged Alert (in
+        // practice — see below for why a fresh Floating Window never
+        // actually reaches this) — `sync_hut_space` (called just above)
+        // only ever resolves keyboard focus to a Hut's *Main Window* (or
+        // `None`), never a Floating Window/Alert, so without this the new
+        // dialog would render on screen and simply never receive a
+        // keystroke.
+        //
+        // A fresh Floating Window (`Role::Floating`, above) never
+        // actually passes the `window_in_space` check below, only an
+        // Alert does — not a bug, just this gate correctly doing its job:
+        // `FloatingWindow::new` starts every one `Dock::Docked` (see its
+        // own doc comment), and `sync_main_window_space` deliberately
+        // never maps a *docked* Floating Window into `space` at all — a
+        // docked one isn't a real composited surface yet (`docks.rs`
+        // draws a small handle instead), so there's genuinely nothing to
+        // focus until the user drags it out to float. `tagged_floating_or_alert`'s
+        // name still covers both roles correctly (it only gates whether
+        // this whole block is even worth checking), just don't expect the
+        // `set_focus` call itself to ever actually fire for the
+        // `Role::Floating` arm specifically.
+        //
+        // `hut_id == state.stack.focused().id` alone isn't enough — a
+        // Main Window can have several tabs, and `mudhuts_shell_authority_v1`'s
+        // target resolution isn't restricted to the *active* one, so the
+        // tagged window's owning Hut can be focused while the specific
+        // Main Window it just got attached to is a *backgrounded* tab (or
+        // the Hut is currently showing its terminal instead of any Main
+        // Window at all) — caught in review. `sync_main_window_space`
+        // (just run, via `sync_hut_space` above) only ever maps the
+        // *active* entry's own Floating Windows/Alerts into `space`, so
+        // checking whether `tagged_surface` actually ended up there is
+        // the real "is this genuinely visible right now" answer, not
+        // just "is it in the right Hut" — reusing the same
+        // `window_in_space` helper `sync_keyboard_focus_to_view` itself
+        // uses for the identical question.
+        //
+        // Known narrow gap, not fixed: `sync_hut_space` (above) skips
+        // `sync_main_window_space` while `state.dragging_hut_id ==
+        // Some(hut_id)` (a live dock-drag in progress on this exact Hut —
+        // see `sync_hut_space`'s own doc comment), so a retag landing on
+        // that same Hut mid-drag would find the new window not yet in
+        // `space` and skip focusing it here, with nothing re-checking
+        // once the drag ends. Requires a real drag and a retag racing on
+        // the *same* Hut at the *same* moment; accepted rather than
+        // adding cross-module coordination for it, matching this
+        // codebase's existing tolerance for similarly narrow staleness
+        // windows elsewhere (see `sync_keyboard_focus_to_view`'s own doc
+        // comment on `space()`'s identical residual risk).
+        if tagged_floating_or_alert
+            && hut_id == state.stack.focused().id
+            && crate::space_element::window_in_space(state.stack.focused().space(), tagged_surface).is_some()
+            && let Some(keyboard) = state.seat.get_keyboard()
+        {
+            keyboard.set_focus(state, Some(tagged_surface.clone()), SERIAL_COUNTER.next_serial());
+        }
         state.request_redraw();
     } else {
         tracing::warn!("mudhuts_window_role_v1: tagged toplevel not found in any ConsoleHut");

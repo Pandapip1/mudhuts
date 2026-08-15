@@ -160,6 +160,24 @@ pub enum HutSpaceElement {
     Composited(CompositedTexture),
 }
 
+/// `surface`'s own [`Window`], if it's currently mapped in `space` — the
+/// shared body of what `input.rs`'s `Action::CloseFocused` and
+/// `sync_keyboard_focus_to_view` (previously two separate, near-identical
+/// scans over `space.elements()`, caught in review) both need: "is this
+/// surface a Main Window, Floating Window, or Alert that's actually
+/// visible right now for whichever Hut owns `space`." Never matches a
+/// `Composited` element (nothing else in this codebase looks a real
+/// `WlSurface` up against one of those).
+pub fn window_in_space<'a>(
+    space: &'a smithay::desktop::space::Space<HutSpaceElement>,
+    surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+) -> Option<&'a Window> {
+    space.elements().find_map(|e| match e {
+        HutSpaceElement::Window(w) if w.toplevel().is_some_and(|t| t.wl_surface() == surface) => Some(w),
+        _ => None,
+    })
+}
+
 impl IsAlive for HutSpaceElement {
     fn alive(&self) -> bool {
         match self {
