@@ -116,14 +116,19 @@ impl XdgShellHandler for State {
         if should_show_now {
             *self.stack.focused_mut().showing_terminal = false;
         }
-        // Also gives the new window real keyboard input immediately, not
-        // only after the user clicks it (`sync_visible_main_window` now
-        // always resyncs keyboard focus too — see its own doc comment):
-        // matters especially for the `should_show_now` case, where there
-        // was never an existing window to click away from focus in the
-        // first place. A hand-rolled `keyboard.set_focus` call used to
-        // live here instead, doing the same thing by hand.
-        self.sync_visible_main_window();
+        // This window's own owning Hut, not `self.sync_visible_main_window()`
+        // (focused-output-only) — a window pushed into a *backgrounded*
+        // Hut's model above (`push_main_window`) needs that Hut's own
+        // `space` remapped too, same fix/reasoning as `toplevel_destroyed`/
+        // `handlers/shell.rs`'s `retag`. Also gives the new window real
+        // keyboard input immediately when it's the focused Hut, not only
+        // after the user clicks it (`sync_hut_space` now always resyncs
+        // keyboard focus too — see its own doc comment): matters
+        // especially for the `should_show_now` case, where there was
+        // never an existing window to click away from focus in the first
+        // place. A hand-rolled `keyboard.set_focus` call used to live
+        // here instead, doing the same thing by hand.
+        self.sync_hut_space(owning_hut_id);
         self.request_redraw();
     }
 
