@@ -96,27 +96,24 @@ pub struct DockDrag {
     /// *that* output instead of the drag's real owner would silently
     /// migrate it into an unrelated Hut/output.
     hut_id: u64,
-    /// `hut_id`'s output at drag-start time — a fast-path hint for
-    /// `advance_drag`'s hot loop (driven by every pointer-motion sample
-    /// during a drag), same tradeoff as `grabs.rs`'s
-    /// `MoveSurfaceGrab::output_index`: an output unplug/renumber
-    /// mid-drag can make it stale, so [`advance_drag`]'s Hut lookup
-    /// falls back to a full search rather than ever trusting a miss here
-    /// as "the Hut exited" (its scale lookup, less critical, just
-    /// tolerates staying stale for that one rare case).
-    output_index: usize,
-    /// The real `Output` `output_index` named at drag-start — checked
-    /// against whatever's actually at that index before trusting it for
-    /// [`advance_drag`]'s own position/scale rebase math (unlike the
-    /// Hut lookup above, a *bounds-valid-but-wrong* index here doesn't
-    /// fail gracefully: it would silently rebase against a real but
-    /// different output's scale/position instead of erroring, corrupting
-    /// the drag instead of just missing it). An earlier output being
-    /// unplugged mid-drag shifts every later index down
-    /// (`GraphStack::remove_output`'s own doc comment) without changing
-    /// what's actually *at* the drag's own (now different) index — a
-    /// plain bounds check alone can't catch that, only comparing real
-    /// `Output` identity (`Output`'s own `PartialEq`, `Arc::ptr_eq`) can.
+    /// The real `Output` this drag's Hut lives on, captured at drag-start
+    /// — resolved back to a live index fresh on every use
+    /// (`GraphStack::output_index_for`, an O(outputs) scan — cheap at
+    /// realistic monitor counts) rather than caching an index at all.
+    /// An earlier round cached `output_index: usize` alongside this same
+    /// `Output` as a fast-path hint, checking the two against each other
+    /// before trusting the index — but a cached index buys nothing
+    /// `output_index_for` doesn't already give for free every time, and
+    /// the two-source-of-truth setup was itself a bug: nothing enforced
+    /// them staying in sync, and forgetting a bounds-vs-identity check on
+    /// one path silently rebased position/scale math against a real but
+    /// wrong output. Storing only the stable `Output` handle makes that
+    /// class of bug structurally impossible — there's no second, staler
+    /// value to disagree with. `GraphStack::remove_output` also always
+    /// destroys a removed output's own Huts together with it (Huts never
+    /// migrate outputs while alive), so `output_index_for` failing here
+    /// already implies `hut_id`'s Hut is gone too — no separate
+    /// Hut-existence fallback needed for this specific resolution.
     output: Output,
 }
 
@@ -311,13 +308,14 @@ pub fn start_drag(state: &mut State, pos: Point<f64, Physical>) -> bool {
     let Some(Hit::DockHandle(surface)) = handles.hit_test(point) else {
         return false;
     };
-    let output_index = state.stack.focused_output_index();
-    // Checked, not `state.stack.outputs()[output_index]` — always
-    // in-bounds today per `focused_output_index()`'s own invariants, but
-    // an unchecked index is a new panic surface the project's no-panics
-    // rule doesn't allow, and every sibling accessor added alongside
-    // `DockDrag::output` already degrades gracefully instead.
-    let Some(output) = state.stack.outputs().get(output_index).map(|slot| slot.output.clone()) else {
+    // Checked, not `state.stack.outputs()[state.stack.focused_output_index()]`
+    // — always in-bounds today per `focused_output_index()`'s own
+    // invariants, but an unchecked index is a new panic surface the
+    // project's no-panics rule doesn't allow, and every sibling accessor
+    // already degrades gracefully instead.
+    let Some(output) =
+        state.stack.outputs().get(state.stack.focused_output_index()).map(|slot| slot.output.clone())
+    else {
         return false;
     };
     let mut drag = DockDrag {
@@ -326,7 +324,6 @@ pub fn start_drag(state: &mut State, pos: Point<f64, Physical>) -> bool {
         detached: false,
         redraw: None,
         hut_id: state.stack.focused().id,
-        output_index,
         output,
     };
     drag.attach_redraw_handle(state.redraw_handle());
@@ -339,8 +336,8 @@ pub fn start_drag(state: &mut State, pos: Point<f64, Physical>) -> bool {
 /// crosses [`DETACH_THRESHOLD`], then just repositions it directly on
 /// every motion after that. `global_pos` is genuinely global Logical
 /// (`State::pointer_location`'s own doc comment) — rebased below to
-/// Physical, local to the *drag's own* output (`drag.output_index`),
-/// not whichever output currently has focus: this runs on every
+/// Physical, local to the *drag's own* output (`drag.output`), not
+/// whichever output currently has focus: this runs on every
 /// pointer-motion sample for the whole drag, and a mid-drag
 /// focus-follows-mouse switch (the pointer crossing onto another
 /// monitor while the handle is still held) would otherwise corrupt
@@ -358,37 +355,11 @@ pub fn advance_drag(state: &mut State, global_pos: Point<f64, Logical>) {
     let start = drag.start;
     let detached = drag.detached;
     let hut_id = drag.hut_id;
-    let drag_output = drag.output.clone();
-    // The drag's own owning output, not `state.output_scale()`/the
-    // focused one — see [`DockDrag::output_index`]'s doc comment. Cached
-    // rather than re-resolved every call (this runs on every
-    // pointer-motion sample during a drag) — but re-resolved *here*,
-    // specifically, rather than trusted blindly: `output_scale_for`/
-    // `outputs().get(...)` both fall back to a neutral default
-    // (`1.0`/`(0, 0)`) for an out-of-range index rather than panicking
-    // or erroring, so a stale index from an output unplugged mid-drag
-    // would otherwise silently rebase `pos` against those bogus
-    // defaults instead of the drag's real output — producing a garbage
-    // position that `find_mut_for_hint`'s own full-search fallback would
-    // then dutifully apply to the (still very much real) Hut it finds,
-    // making the dragged handle/window jump instead of tracking the
-    // pointer. A plain bounds check alone isn't enough: an *earlier*
-    // output being unplugged shifts every later index down without
-    // changing what's actually at the drag's own (now different) index
-    // — only comparing real `Output` identity (`DockDrag::output`'s own
-    // doc comment) catches that. Falls back to
-    // `state.stack.output_index_for_hut(hut_id)` (still correct, just
-    // not the fast path) rather than either trusting a stale index or
-    // aborting the drag outright.
-    let output_index = match state.stack.outputs().get(drag.output_index) {
-        Some(slot) if slot.output == drag_output => drag.output_index,
-        _ => {
-            let Some(resolved) = state.stack.output_index_for_hut(hut_id) else {
-                // The owning Hut exited mid-drag too — nothing left to update.
-                return;
-            };
-            resolved
-        }
+    // Resolved fresh, not cached — see [`DockDrag::output`]'s own doc
+    // comment on why. `output_index_for` failing here means this
+    // output (and, with it, this drag's own Hut) was unplugged mid-drag.
+    let Some(output_index) = state.stack.output_index_for(&drag.output) else {
+        return;
     };
     let scale = state.output_scale_for(output_index);
     let output_position = state.stack.output_position(output_index);
@@ -405,8 +376,9 @@ pub fn advance_drag(state: &mut State, global_pos: Point<f64, Logical>) {
         // `hut` borrow for the same borrow-checker reason as `unset`'s
         // own equivalent line in grabs.rs.
         let (area_x, area_y, _, _) = state.usable_area_for(output_index);
-        // Fast path first (see `output_index`'s doc comment) — falls
-        // back to the full graph-wide search only on a miss.
+        // Fast path first (`output_index` was just freshly resolved
+        // above, so this is never stale) — falls back to the full
+        // graph-wide search only on a miss.
         let Some(hut) = state.stack.find_mut_for_hint(output_index, hut_id) else {
             // The owning Hut exited mid-drag — nothing left to update.
             return;
@@ -434,7 +406,7 @@ pub fn advance_drag(state: &mut State, global_pos: Point<f64, Logical>) {
     };
     if let Some(window) = hut.floating_window_mut(&surface).map(|sub| sub.window.clone()) {
         let logical = pos.to_logical(Scale::from(scale)).to_i32_round();
-        hut.space
+        hut.space_raw_mut()
             .map_element(crate::space_element::HutSpaceElement::Window(window), logical, true);
     }
 }
@@ -467,7 +439,7 @@ pub fn finish_drag(state: &mut State) {
         return;
     };
     let Some(location) =
-        hut.space
+        hut.space()
             .element_location(&crate::space_element::HutSpaceElement::Window(window.clone()))
     else {
         return;
