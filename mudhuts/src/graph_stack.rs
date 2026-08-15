@@ -596,6 +596,20 @@ impl GraphStack {
     /// mid-drag — so callers on a hot path should fall back to
     /// [`Self::find_mut`] before concluding the Hut actually exited.
     pub fn find_mut_for(&mut self, output_index: usize, id: u64) -> Option<&mut ConsoleHut> {
+        // Bounds-checked, not `top_level_entries_for`'s own unchecked
+        // `out_at` — every other `_for(output_index)` accessor in this
+        // file is called with an index resolved fresh within the same
+        // call, but this one's hot-path callers (`grabs.rs`'s
+        // `MoveSurfaceGrab`, `docks.rs`'s `DockDrag`, both via
+        // `find_mut_for_hint`) cache `output_index` *across* multiple
+        // event-loop turns — an output unplugged mid-drag can shift
+        // later indices down (`GraphStack::remove_output`'s own doc
+        // comment) and leave a cached index pointing past the end of
+        // `self.outputs`, which `out_at`'s unchecked indexing would
+        // panic on.
+        if output_index >= self.outputs.len() {
+            return None;
+        }
         let node_id = self
             .top_level_entries_for(output_index)
             .copied()
@@ -621,8 +635,14 @@ impl GraphStack {
         // one `&mut self` resolution at the very end — so the common
         // (found-via-hint) case pays for the scoped search exactly once,
         // matching the cost of the 3 call sites this consolidates.
-        let node_id = self
-            .top_level_entries_for(output_index)
+        //
+        // Bounds-checked before touching `top_level_entries_for` (whose
+        // own `out_at` indexes unchecked) — see `find_mut_for`'s
+        // identical guard/doc comment: `output_index` is cached across
+        // event-loop turns by every hot-path caller here, and can go
+        // stale/out-of-bounds if an output is unplugged mid-drag.
+        let hint = self.outputs.get(output_index).into_iter().flat_map(|slot| slot.top_level_entries());
+        let node_id = hint
             .copied()
             .find_map(|top| self.find_console_node(top, id))
             .or_else(|| self.all_top_level_entries().copied().find_map(|top| self.find_console_node(top, id)))?;
@@ -1510,6 +1530,25 @@ mod tests {
         let some_id = stack.all_huts().map(|h| h.id).find(|&id| Some(id) != nested_id).unwrap();
         assert!(stack.find_mut(some_id).is_some());
         assert!(stack.find_mut(999_999).is_none());
+    }
+
+    #[test]
+    fn find_mut_for_and_find_mut_for_hint_never_panic_on_a_stale_output_index() {
+        // Regression case: `MoveSurfaceGrab`/`DockDrag` cache an
+        // output_index across multiple event-loop turns (a drag hot-path
+        // fast path); an output unplugged mid-drag can shift later
+        // indices down or shrink the outputs list entirely, leaving that
+        // cached index pointing past the end of `self.outputs`. Both
+        // methods used to index unchecked via `out_at`, which would
+        // panic instead of gracefully treating an out-of-range index as
+        // "not found there."
+        let mut stack = new_stack();
+        let id = stack.focused().id;
+        let out_of_bounds = 5;
+        assert!(stack.find_mut_for(out_of_bounds, id).is_none());
+        // `find_mut_for_hint` still finds it via its full-search fallback.
+        assert_eq!(stack.find_mut_for_hint(out_of_bounds, id).map(|h| h.id), Some(id));
+        assert!(stack.find_mut_for_hint(out_of_bounds, 999_999).is_none());
     }
 
     #[test]
