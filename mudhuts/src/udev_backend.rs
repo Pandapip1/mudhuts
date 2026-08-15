@@ -130,6 +130,7 @@ use smithay::backend::renderer::ImportDma;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{self, UdevBackend, UdevEvent};
+use smithay::desktop::layer_map_for_output;
 use smithay::input::pointer::{CursorIcon, CursorImageAttributes, CursorImageStatus};
 use smithay::output::{Mode as WlMode, Output, PhysicalProperties, Scale as OutputScale};
 use smithay::reexports::calloop::ping::PingSource;
@@ -1331,6 +1332,19 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
         }
     });
     space.refresh();
+    // Same gap this whole block's doc comment already describes for a
+    // Main Window's own `wl_surface`, just for `layer_map_for_output`'s
+    // surfaces instead of a `Space`'s — a layer-shell client (a status
+    // bar, a launcher) that paces its own redraws off `wl_surface.frame`
+    // (effectively every GTK/Qt client, including waybar) draws once and
+    // then stalls forever without this. Every layer on this output, not
+    // just the visible ones — mirrors `send_frames_surface_tree`'s own
+    // "every subsurface that requested it" scope, and layers in every
+    // `Layer` (Background/Bottom/Top/Overlay) still need to keep pacing
+    // their own redraws even while occluded by normal content.
+    layer_map_for_output(&output).layers().for_each(|layer| {
+        layer.send_frame(&output, elapsed, Some(std::time::Duration::ZERO), |_, _| Some(output.clone()));
+    });
     state.popups.cleanup();
     // `session_destroyed` only removes mudhuts' own owned `Session`s
     // (`state.image_copy_sessions`) — it doesn't touch `ImageCopyCaptureState`'s

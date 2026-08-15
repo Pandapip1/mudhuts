@@ -4,6 +4,7 @@ use std::rc::Rc;
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::winit::{self, WinitEvent};
+use smithay::desktop::layer_map_for_output;
 use smithay::input::keyboard::KeyboardSource;
 use smithay::output::{Mode, Output, PhysicalProperties, Scale as OutputScale, Subpixel};
 use smithay::reexports::calloop::EventLoop;
@@ -245,6 +246,16 @@ pub fn init_winit(
                         }
                     });
                     space.refresh();
+                    // See `udev_backend.rs`'s identical fix and its own
+                    // doc comment: a layer-shell client pacing its own
+                    // redraws off `wl_surface.frame` (waybar, most
+                    // GTK/Qt clients) never got one from this backend
+                    // either, so it drew once and stalled forever.
+                    layer_map_for_output(&output).layers().for_each(|layer| {
+                        layer.send_frame(&output, elapsed, Some(std::time::Duration::ZERO), |_, _| {
+                            Some(output.clone())
+                        });
+                    });
                     state.popups.cleanup();
                     // `session_destroyed` only removes mudhuts' own owned
                     // `Session`s (`state.image_copy_sessions`) — it doesn't
