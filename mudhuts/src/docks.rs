@@ -445,6 +445,9 @@ pub fn advance_drag(state: &mut State, global_pos: Point<f64, Logical>) {
 /// with no other effect if the drag never actually detached (a plain
 /// click on a handle does nothing — there's no defined behavior for it
 /// yet).
+///
+/// KNOWN DUPLICATION with `grabs.rs`'s `MoveSurfaceGrab::unset` — see its
+/// own doc comment, not repeated here.
 pub fn finish_drag(state: &mut State) {
     let Some(drag) = state.dock_drag.take() else {
         return;

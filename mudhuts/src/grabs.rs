@@ -231,6 +231,20 @@ impl PointerGrab<State> for MoveSurfaceGrab {
     /// focus/visibility change. Without this, the very next such sync
     /// would snap the window right back to wherever it was before the
     /// drag.
+    ///
+    /// KNOWN DUPLICATION, not yet addressed: this method's own resolve-
+    /// Hut / read-location / resolve-output_index / compute-redock-edge /
+    /// re-resolve-Hut / persist-dock-state sequence is near-identical to
+    /// `docks.rs`'s `finish_drag`, copy-pasted across the two files
+    /// rather than shared. A future change to the redock/persist policy
+    /// (a different threshold, added logging, a bug fix in the edge-
+    /// snapping math) has to be made in both places by hand or the two
+    /// drag types will silently diverge. Not extracted yet since the two
+    /// call sites' surrounding types differ enough (`Window`+`surface`
+    /// here vs. `WlSurface` there) that a shared helper's signature
+    /// wasn't obviously worth the indirection at the time this was
+    /// written — worth revisiting if a third near-identical drag type
+    /// ever shows up, or if the two are caught drifting.
     fn unset(&mut self, data: &mut State) {
         // The dragged window's real owning Hut, not `data.stack.focused()`
         // — see [`MoveSurfaceGrab::hut_id`]'s own doc comment: the

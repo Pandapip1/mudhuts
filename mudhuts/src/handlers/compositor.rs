@@ -96,6 +96,22 @@ impl FractionalScaleHandler for State {
         // `new_toplevel` picks a default Hut for a brand-new surface: via
         // the client's process ancestry, falling back to the focused
         // output only if that doesn't resolve to a known Hut.
+        //
+        // KNOWN TRADEOFF, not yet addressed: `find_owning_hut`'s ancestry
+        // walk can do blocking `/proc/<pid>/{environ,stat}` reads, and
+        // most modern toolkits request a fractional-scale object for
+        // nearly every surface (toplevels, popups, subsurfaces, cursor
+        // surfaces) — a client creating many surfaces in a burst (e.g.
+        // session restore) pays repeated synchronous I/O on this single-
+        // threaded event loop, uncached, duplicating the identical walk
+        // `handlers/xdg_shell.rs`'s `new_toplevel` already does for the
+        // same client. Deliberately not cached here: a naive
+        // PID-keyed cache would return a *wrong* Hut for an unrelated
+        // later client if the OS recycles that PID after the original
+        // process exits, and there's no existing per-client cleanup hook
+        // to invalidate it safely. Worth a real fix (e.g. keyed by
+        // `Client` identity instead of raw PID, with cleanup on client
+        // disconnect) if this ever shows up as real, measured latency.
         let output_index = surface
             .client()
             .and_then(|client| client.get_credentials(&self.display_handle).ok())

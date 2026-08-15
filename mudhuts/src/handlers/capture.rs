@@ -154,6 +154,15 @@ impl State {
             .get::<WeakOutput>()
             .and_then(WeakOutput::upgrade)
             .ok_or(FailureReason::Unknown)?;
+        // KNOWN TRADEOFF, not yet addressed: `output_index_for` is an
+        // O(outputs) linear scan, paid on every captured frame (an active
+        // screencast/screen-share is typically 30-60fps) where the old
+        // single-output code just read `self.output` directly. Left
+        // as-is: realistic output counts (a handful of monitors) make
+        // this a small constant-factor cost, unlike the graph-wide scans
+        // this codebase's other hot-path perf fixes targeted — not worth
+        // the complexity of caching an output_index on the session
+        // without a clear invalidation story for hotplug/renumbering.
         let output_index = self.stack.output_index_for(&output).ok_or(FailureReason::Unknown)?;
         let mode = output.current_mode().ok_or(FailureReason::Unknown)?;
         let size = (mode.size.w, mode.size.h);

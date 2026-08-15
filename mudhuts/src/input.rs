@@ -320,6 +320,24 @@ impl State {
     /// visibly mapped) — a call site that syncs the window but not this
     /// used to leave keyboard input going to the old, now-hidden surface
     /// until some unrelated event happened to repair it.
+    ///
+    /// KNOWN DESIGN RISK, not addressed: this pairing is a hand-followed
+    /// convention, not something the compiler (or anything else)
+    /// enforces — `handlers/xdg_shell.rs`'s `new_toplevel` already
+    /// reaches for its own hand-rolled `keyboard.set_focus(...)` instead
+    /// of calling this, and multiple call sites listed above were
+    /// themselves found missing this pairing across several rounds of
+    /// review, not caught in one pass. Every *new* visibility-changing
+    /// call site added anywhere is just as easy to forget as the ones
+    /// already fixed. A structural fix (e.g. folding this call into
+    /// `sync_visible_main_window`/`sync_hut_space` itself, so the two
+    /// can't be called independently) wasn't done because keyboard focus
+    /// is seat-wide while those two are per-Hut — pairing them
+    /// unconditionally would resync keyboard focus even when a
+    /// *non-focused* Hut's space changed, which is harmless (a no-op,
+    /// per this method's own focused-Hut-only logic) but was judged not
+    /// obviously worth the coupling. Revisit if another call site is
+    /// found missing this.
     pub(crate) fn sync_keyboard_focus_to_view(&mut self) {
         let target = if self.showing_terminal_effective() {
             None
