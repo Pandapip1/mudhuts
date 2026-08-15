@@ -1069,13 +1069,19 @@ impl GraphStack {
             self.graph.remove_node(node_id);
             let out = &mut self.outputs[output_index];
             out.huts.remove(top_index);
-            if top_index < out.current {
-                out.current -= 1;
-            }
-            if let Some(preview) = &mut out.preview
-                && top_index < *preview
-            {
-                *preview -= 1;
+            let new_len = out.huts.len();
+            // Not the final answer for either field — the unconditional
+            // clamp a few lines below this whole `if`/`else` still has to
+            // run regardless, since `spawn_and_insert_for` can also
+            // change `touched_output`'s length in between. Using the
+            // shared helper here anyway keeps this in sync with
+            // `remove_child`'s identical-shaped `TabNode`/`TileNode`
+            // logic and `ConsoleHut`'s own `active_main_window` handling
+            // — see [`crate::hut::shift_active_index_on_removal`]'s own
+            // doc comment for why a plain clamp alone isn't enough.
+            out.current = crate::hut::shift_active_index_on_removal(out.current, top_index, new_len);
+            if let Some(preview) = out.preview {
+                out.preview = Some(crate::hut::shift_active_index_on_removal(preview, top_index, new_len));
             }
             output_index
         } else {
