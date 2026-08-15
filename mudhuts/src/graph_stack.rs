@@ -1150,16 +1150,13 @@ impl GraphStack {
                 // child's cached label/`Id`/background from then on,
                 // and the arrays only ever grew, never shrank, across a
                 // long session of repeated tab open/close.
-                let max_index = children.len().saturating_sub(1);
+                let new_len = children.len();
                 let _ = self.graph.set_hut_list(parent, "children", children);
-                // Shift `active` left by one if the removed child sat
-                // before it (so it keeps pointing at the same surviving
-                // child, which has now slid down one index), otherwise
-                // just clamp — a plain `.min(max_index)` alone would
-                // leave `active` pointing at the *next* child over
-                // whenever the removed one was before it, silently
-                // changing which tab/pane reads as focused.
-                let shift_active = |old: usize| if removed_index < old { old - 1 } else { old.min(max_index) };
+                // Shift/clamp `active` — see `hut::shift_active_index_on_removal`'s
+                // own doc comment for why a plain clamp alone isn't
+                // enough (it would leave `active` pointing at the *next*
+                // child over whenever the removed one was before it,
+                // silently changing which tab/pane reads as focused).
                 if let Some(tab) = self.graph.downcast_mut::<TabNode>(parent) {
                     if removed_index < tab.label_cache.len() {
                         tab.label_cache.remove(removed_index);
@@ -1170,12 +1167,12 @@ impl GraphStack {
                     if removed_index < tab.bg_tracker.len() {
                         tab.bg_tracker.remove(removed_index);
                     }
-                    *tab.active = shift_active(*tab.active);
+                    *tab.active = crate::hut::shift_active_index_on_removal(*tab.active, removed_index, new_len);
                 } else if let Some(tile) = self.graph.downcast_mut::<TileNode>(parent) {
                     if removed_index < tile.fracs.len() {
                         tile.fracs.remove(removed_index);
                     }
-                    *tile.active = shift_active(*tile.active);
+                    *tile.active = crate::hut::shift_active_index_on_removal(*tile.active, removed_index, new_len);
                 }
             }
             return;

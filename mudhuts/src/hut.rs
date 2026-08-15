@@ -43,6 +43,53 @@ pub(crate) fn wrapping_step(len: usize, active: usize, dir: Direction) -> usize 
     }
 }
 
+/// The new value an "active index into a Vec" should have after removing
+/// the item at `removed_index` from it — shifts left by one if the
+/// removed item sat *before* `active` (so `active` keeps pointing at the
+/// same surviving item, now one slot earlier), otherwise just clamps to
+/// the shrunk Vec's new bounds. A plain clamp alone only happens to give
+/// the right answer when the removed item was the active one itself or
+/// came after it — removing anything *before* `active` needs the shift
+/// too, or `active` silently ends up pointing at the *next* item over
+/// instead of the one that was actually selected. This exact bug shape
+/// was found and fixed independently in two different places
+/// (`graph_stack::GraphStack::remove_child`'s `TabNode`/`TileNode`
+/// active index, `console_hut::ConsoleHut`'s own `active_main_window`)
+/// before being pulled out here — one implementation to keep correct
+/// instead of two (or more, later) copies that could silently diverge.
+///
+/// `new_len` is the Vec's length *after* removal (i.e. `old_len - 1`).
+pub(crate) fn shift_active_index_on_removal(active: usize, removed_index: usize, new_len: usize) -> usize {
+    let max_index = new_len.saturating_sub(1);
+    if removed_index < active { active - 1 } else { active.min(max_index) }
+}
+
+#[cfg(test)]
+mod shift_active_index_tests {
+    use super::shift_active_index_on_removal;
+
+    #[test]
+    fn shifts_left_when_the_removed_item_sat_before_active() {
+        // 4 items, active at index 2; removing index 0 should leave
+        // active at index 1 (still the same surviving item), not clamped
+        // (and wrong) at index 2.
+        assert_eq!(shift_active_index_on_removal(2, 0, 3), 1);
+    }
+
+    #[test]
+    fn clamps_when_the_removed_item_was_the_active_one_or_after_it() {
+        // Removing the active item itself: clamps into the new bounds.
+        assert_eq!(shift_active_index_on_removal(2, 2, 2), 1);
+        // Removing something after active: active doesn't move at all.
+        assert_eq!(shift_active_index_on_removal(1, 2, 2), 1);
+    }
+
+    #[test]
+    fn clamps_to_zero_when_the_vec_becomes_empty() {
+        assert_eq!(shift_active_index_on_removal(0, 0, 0), 0);
+    }
+}
+
 /// Compute each of a tiled container's pane rectangles (`x, y, width,
 /// height`, in whatever pixel space `size` itself is — physical or
 /// logical, the caller's choice) from its axis and fractions, splitting

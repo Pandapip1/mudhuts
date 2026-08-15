@@ -420,12 +420,8 @@ impl ConsoleHut {
     pub fn take_bare_main_window(&mut self, surface: &WlSurface) -> Option<Window> {
         let idx = self.main_windows.iter().position(|e| e.matches(surface))?;
         let entry = self.main_windows.remove(idx);
-        if idx < *self.active_main_window {
-            *self.active_main_window -= 1;
-        }
-        *self.active_main_window = self
-            .active_main_window
-            .min(self.main_windows.len().saturating_sub(1));
+        *self.active_main_window =
+            crate::hut::shift_active_index_on_removal(*self.active_main_window, idx, self.main_windows.len());
         Some(entry.window)
     }
 
@@ -479,12 +475,8 @@ impl ConsoleHut {
     pub fn remove_window(&mut self, surface: &WlSurface) -> bool {
         if let Some(idx) = self.main_windows.iter().position(|e| e.matches(surface)) {
             self.main_windows.remove(idx);
-            if idx < *self.active_main_window {
-                *self.active_main_window -= 1;
-            }
-            *self.active_main_window = self
-                .active_main_window
-                .min(self.main_windows.len().saturating_sub(1));
+            *self.active_main_window =
+                crate::hut::shift_active_index_on_removal(*self.active_main_window, idx, self.main_windows.len());
             if self.main_windows.is_empty() {
                 *self.showing_terminal = true;
             }
