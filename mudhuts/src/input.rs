@@ -250,7 +250,13 @@ impl State {
         let serial = SERIAL_COUNTER.next_serial();
 
         if self.dock_drag.is_some() {
-            docks::advance_drag(self, pos_physical);
+            // Genuinely global (`self.pointer_location`, not the
+            // just-rebased-local `pos`/`pos_physical`) — `advance_drag`
+            // itself rebases to Physical local to the *drag's own*
+            // output, which can differ from whichever output currently
+            // has focus mid-drag. See its own doc comment.
+            let global_pos = self.pointer_location;
+            docks::advance_drag(self, global_pos);
         }
 
         if self.showing_terminal_effective() {

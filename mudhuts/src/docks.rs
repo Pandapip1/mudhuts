@@ -40,7 +40,7 @@ use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::utils::{CommitCounter, DamageSnapshot};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Buffer, Physical, Point, Rectangle, Scale, Size, Transform};
+use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use crate::State;
 use crate::chrome::{to_color32f, window_title};
@@ -313,12 +313,20 @@ pub fn start_drag(state: &mut State, pos: Point<f64, Physical>) -> bool {
 /// Advance an in-progress handle drag on pointer motion: flips the
 /// Floating Window to floating and maps it for the first time once the drag
 /// crosses [`DETACH_THRESHOLD`], then just repositions it directly on
-/// every motion after that. `pos` is physical (see [`start_drag`]) —
-/// converted to genuinely Logical right before it's written anywhere
-/// `ConsoleHut::space` will read it back from ([`Dock::Floating`],
-/// `map_element`), since those are Smithay's own contract, not this
-/// module's.
-pub fn advance_drag(state: &mut State, pos: Point<f64, Physical>) {
+/// every motion after that. `global_pos` is genuinely global Logical
+/// (`State::pointer_location`'s own doc comment) — rebased below to
+/// Physical, local to the *drag's own* output (`drag.output_index`),
+/// not whichever output currently has focus: this runs on every
+/// pointer-motion sample for the whole drag, and a mid-drag
+/// focus-follows-mouse switch (the pointer crossing onto another
+/// monitor while the handle is still held) would otherwise corrupt
+/// [`DockDrag::start`]-relative deltas by roughly the distance between
+/// the two outputs the instant that happened — same bug class,
+/// `grabs.rs`'s `MoveSurfaceGrab::start_global_location` fixes it via an
+/// explicit global reference; pinning `pos` itself to the drag's own
+/// output achieves the same thing here without needing one, since
+/// [`DockDrag::start`] was already captured local to that same output.
+pub fn advance_drag(state: &mut State, global_pos: Point<f64, Logical>) {
     let Some(drag) = &state.dock_drag else {
         return;
     };
@@ -326,12 +334,34 @@ pub fn advance_drag(state: &mut State, pos: Point<f64, Physical>) {
     let start = drag.start;
     let detached = drag.detached;
     let hut_id = drag.hut_id;
-    let output_index = drag.output_index;
     // The drag's own owning output, not `state.output_scale()`/the
     // focused one — see [`DockDrag::output_index`]'s doc comment. Cached
     // rather than re-resolved every call (this runs on every
-    // pointer-motion sample during a drag).
+    // pointer-motion sample during a drag) — but re-resolved *here*,
+    // specifically, rather than trusted blindly: `output_scale_for`/
+    // `outputs().get(...)` both fall back to a neutral default
+    // (`1.0`/`(0, 0)`) for an out-of-range index rather than panicking
+    // or erroring, so a stale index from an output unplugged mid-drag
+    // would otherwise silently rebase `pos` against those bogus
+    // defaults instead of the drag's real output — producing a garbage
+    // position that `find_mut_for_hint`'s own full-search fallback would
+    // then dutifully apply to the (still very much real) Hut it finds,
+    // making the dragged handle/window jump instead of tracking the
+    // pointer. Falls back to `state.stack.output_index_for_hut(hut_id)`
+    // (still correct, just not the fast path) rather than either
+    // trusting a stale index or aborting the drag outright.
+    let output_index = if state.stack.outputs().get(drag.output_index).is_some() {
+        drag.output_index
+    } else {
+        let Some(resolved) = state.stack.output_index_for_hut(hut_id) else {
+            // The owning Hut exited mid-drag too — nothing left to update.
+            return;
+        };
+        resolved
+    };
     let scale = state.output_scale_for(output_index);
+    let output_position = state.stack.outputs().get(output_index).map(|slot| slot.position).unwrap_or_default();
+    let pos = (global_pos - output_position.to_f64()).to_physical(Scale::from(scale));
 
     if !detached {
         let delta = pos - start;
