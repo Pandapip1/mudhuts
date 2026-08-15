@@ -39,6 +39,7 @@ use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::utils::{CommitCounter, DamageSnapshot};
+use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
@@ -104,6 +105,19 @@ pub struct DockDrag {
     /// as "the Hut exited" (its scale lookup, less critical, just
     /// tolerates staying stale for that one rare case).
     output_index: usize,
+    /// The real `Output` `output_index` named at drag-start — checked
+    /// against whatever's actually at that index before trusting it for
+    /// [`advance_drag`]'s own position/scale rebase math (unlike the
+    /// Hut lookup above, a *bounds-valid-but-wrong* index here doesn't
+    /// fail gracefully: it would silently rebase against a real but
+    /// different output's scale/position instead of erroring, corrupting
+    /// the drag instead of just missing it). An earlier output being
+    /// unplugged mid-drag shifts every later index down
+    /// (`GraphStack::remove_output`'s own doc comment) without changing
+    /// what's actually *at* the drag's own (now different) index — a
+    /// plain bounds check alone can't catch that, only comparing real
+    /// `Output` identity (`Output`'s own `PartialEq`, `Arc::ptr_eq`) can.
+    output: Output,
 }
 
 impl Redrawable for DockDrag {
@@ -297,13 +311,23 @@ pub fn start_drag(state: &mut State, pos: Point<f64, Physical>) -> bool {
     let Some(Hit::DockHandle(surface)) = handles.hit_test(point) else {
         return false;
     };
+    let output_index = state.stack.focused_output_index();
+    // Checked, not `state.stack.outputs()[output_index]` — always
+    // in-bounds today per `focused_output_index()`'s own invariants, but
+    // an unchecked index is a new panic surface the project's no-panics
+    // rule doesn't allow, and every sibling accessor added alongside
+    // `DockDrag::output` already degrades gracefully instead.
+    let Some(output) = state.stack.outputs().get(output_index).map(|slot| slot.output.clone()) else {
+        return false;
+    };
     let mut drag = DockDrag {
         surface,
         start: pos,
         detached: false,
         redraw: None,
         hut_id: state.stack.focused().id,
-        output_index: state.stack.focused_output_index(),
+        output_index,
+        output,
     };
     drag.attach_redraw_handle(state.redraw_handle());
     state.dock_drag = Some(drag);
@@ -334,6 +358,7 @@ pub fn advance_drag(state: &mut State, global_pos: Point<f64, Logical>) {
     let start = drag.start;
     let detached = drag.detached;
     let hut_id = drag.hut_id;
+    let drag_output = drag.output.clone();
     // The drag's own owning output, not `state.output_scale()`/the
     // focused one — see [`DockDrag::output_index`]'s doc comment. Cached
     // rather than re-resolved every call (this runs on every
@@ -347,20 +372,26 @@ pub fn advance_drag(state: &mut State, global_pos: Point<f64, Logical>) {
     // position that `find_mut_for_hint`'s own full-search fallback would
     // then dutifully apply to the (still very much real) Hut it finds,
     // making the dragged handle/window jump instead of tracking the
-    // pointer. Falls back to `state.stack.output_index_for_hut(hut_id)`
-    // (still correct, just not the fast path) rather than either
-    // trusting a stale index or aborting the drag outright.
-    let output_index = if state.stack.outputs().get(drag.output_index).is_some() {
-        drag.output_index
-    } else {
-        let Some(resolved) = state.stack.output_index_for_hut(hut_id) else {
-            // The owning Hut exited mid-drag too — nothing left to update.
-            return;
-        };
-        resolved
+    // pointer. A plain bounds check alone isn't enough: an *earlier*
+    // output being unplugged shifts every later index down without
+    // changing what's actually at the drag's own (now different) index
+    // — only comparing real `Output` identity (`DockDrag::output`'s own
+    // doc comment) catches that. Falls back to
+    // `state.stack.output_index_for_hut(hut_id)` (still correct, just
+    // not the fast path) rather than either trusting a stale index or
+    // aborting the drag outright.
+    let output_index = match state.stack.outputs().get(drag.output_index) {
+        Some(slot) if slot.output == drag_output => drag.output_index,
+        _ => {
+            let Some(resolved) = state.stack.output_index_for_hut(hut_id) else {
+                // The owning Hut exited mid-drag too — nothing left to update.
+                return;
+            };
+            resolved
+        }
     };
     let scale = state.output_scale_for(output_index);
-    let output_position = state.stack.outputs().get(output_index).map(|slot| slot.position).unwrap_or_default();
+    let output_position = state.stack.output_position(output_index);
     let pos = (global_pos - output_position.to_f64()).to_physical(Scale::from(scale));
 
     if !detached {
