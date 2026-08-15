@@ -29,8 +29,10 @@
 //! (`new_popup` is a no-op) — not expected to matter for the common
 //! panel/launcher/notification cases this is aimed at.
 
+use std::cell::RefCell;
+
 use smithay::desktop::{LayerSurface, WindowSurfaceType, layer_map_for_output};
-use smithay::output::Output;
+use smithay::output::{Output, WeakOutput};
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::Size;
@@ -61,6 +63,28 @@ impl WlrLayerShellHandler for State {
             tracing::warn!("new layer surface but no output exists yet, dropping it");
             return;
         };
+        // Stashed once here, in a `RefCell` so a later call can
+        // *overwrite* it (see below) — the same `WeakOutput` pattern
+        // `handlers/capture.rs`'s `output_source_created` uses for a
+        // plain, never-reassigned source, but a `wl_surface` can
+        // legitimately get a *new* `zwlr_layer_surface_v1` role more
+        // than once in its lifetime (destroy the old one, `get_layer_surface`
+        // again — Smithay's own role-reuse handling treats requesting
+        // the same role string twice as a silent no-op success, not an
+        // error), possibly bound to a *different* output the second
+        // time. `insert_if_missing` alone would leave the first call's
+        // stash stuck forever, pointing `handle_commit`/`layer_destroyed`
+        // at the wrong output permanently — this surface would never
+        // configure/map again, and closing it would leak its entry in
+        // its real output's `LayerMap`.
+        with_states(surface.wl_surface(), |states| {
+            match states.data_map.get::<RefCell<WeakOutput>>() {
+                Some(cell) => *cell.borrow_mut() = output.downgrade(),
+                None => {
+                    states.data_map.insert_if_missing(|| RefCell::new(output.downgrade()));
+                }
+            }
+        });
         if let Err(err) = layer_map_for_output(&output).map_layer(&LayerSurface::new(surface, namespace)) {
             tracing::warn!("failed to map layer surface: {err}");
         }
@@ -70,21 +94,30 @@ impl WlrLayerShellHandler for State {
     }
 
     fn layer_destroyed(&mut self, surface: smithay::wayland::shell::wlr_layer::LayerSurface) {
-        // Search every real output's own layer map, not just the focused
-        // one (`self.output`) — a layer surface can be mapped on any
-        // output (see `new_layer_surface`'s explicit `wl_output`
-        // handling), so a status bar closing on a backgrounded monitor
-        // must still be found and unmapped from *its own* map. Iterates
-        // borrowed `&Output`s rather than cloning every output up front
-        // into a throwaway `Vec` — only the one actually found (if any)
-        // ever needs cloning.
-        let found = self.stack.outputs().iter().find_map(|slot| {
-            let layer = layer_map_for_output(&slot.output)
-                .layers()
-                .find(|l| l.layer_surface() == &surface)
-                .cloned();
-            layer.map(|l| (slot.output.clone(), l))
+        // Recover the owning output via the `WeakOutput` `new_layer_surface`
+        // already stashed — O(1), not a scan over every output's own
+        // `LayerMap` (a status bar can be mapped on any output, not just
+        // the focused one, so this can't just assume `self.output`).
+        // Falls back to a full scan only if the stash is somehow missing
+        // (shouldn't happen — every surface reaching `layer_destroyed`
+        // went through `new_layer_surface` first) or its `Output` has
+        // since been dropped entirely, rather than silently doing
+        // nothing for a surface that really does need unmapping.
+        let stashed_output = with_states(surface.wl_surface(), |states| {
+            states.data_map.get::<RefCell<WeakOutput>>().and_then(|cell| cell.borrow().upgrade())
         });
+        let found = if let Some(output) = stashed_output {
+            let layer = layer_map_for_output(&output).layers().find(|l| l.layer_surface() == &surface).cloned();
+            layer.map(|l| (output, l))
+        } else {
+            self.stack.outputs().iter().find_map(|slot| {
+                let layer = layer_map_for_output(&slot.output)
+                    .layers()
+                    .find(|l| l.layer_surface() == &surface)
+                    .cloned();
+                layer.map(|l| (slot.output.clone(), l))
+            })
+        };
         if let Some((output, layer)) = found {
             // `unmap_layer` re-`arrange()`s internally too — same
             // before/after zone comparison as `handle_commit`, and the
@@ -126,16 +159,22 @@ pub fn handle_commit(state: &mut State, surface: &WlSurface) {
     // by Smithay's own layer-shell wiring when `new_layer_surface` maps
     // it), so checking for that first avoids the full per-output scan
     // below entirely for every other kind of commit.
-    let initial_configure_sent = with_states(surface, |states| {
-        states
-            .data_map
-            .get::<LayerSurfaceData>()
-            .map(|data| match data.lock() {
-                Ok(guard) => guard.initial_configure_sent,
-                Err(_) => true,
-            })
+    let resolved = with_states(surface, |states| {
+        let initial_configure_sent = states.data_map.get::<LayerSurfaceData>().map(|data| match data.lock() {
+            Ok(guard) => guard.initial_configure_sent,
+            Err(_) => true,
+        })?;
+        // Recover the owning output via the `WeakOutput` `new_layer_surface`
+        // already stashed on this same surface — O(1), not a scan over
+        // every output's own `LayerMap` (locking each one's `Mutex` in
+        // turn) on every single commit for the rest of this surface's
+        // life. `None` here (stash missing or its `Output` since
+        // dropped) falls back to the full scan below, same as
+        // `layer_destroyed`.
+        let stashed_output = states.data_map.get::<RefCell<WeakOutput>>().and_then(|cell| cell.borrow().upgrade());
+        Some((initial_configure_sent, stashed_output))
     });
-    let Some(initial_configure_sent) = initial_configure_sent else {
+    let Some((initial_configure_sent, stashed_output)) = resolved else {
         return;
     };
 
@@ -146,14 +185,17 @@ pub fn handle_commit(state: &mut State, surface: &WlSurface) {
     // configure, and never render. Iterates borrowed `&Output`s (see
     // `layer_destroyed`'s identical reasoning) rather than cloning every
     // output into a throwaway `Vec` first.
-    let Some(output) = state
-        .stack
-        .outputs()
-        .iter()
-        .map(|slot| &slot.output)
-        .find(|o| layer_map_for_output(o).layer_for_surface(surface, WindowSurfaceType::TOPLEVEL).is_some())
-        .cloned()
-    else {
+    let output = match stashed_output {
+        Some(output) => Some(output),
+        None => state
+            .stack
+            .outputs()
+            .iter()
+            .map(|slot| &slot.output)
+            .find(|o| layer_map_for_output(o).layer_for_surface(surface, WindowSurfaceType::TOPLEVEL).is_some())
+            .cloned(),
+    };
+    let Some(output) = output else {
         return;
     };
 
