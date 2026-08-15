@@ -90,12 +90,7 @@ impl PointerGrab<State> for MoveSurfaceGrab {
         // to the same global frame before comparing against it, fresh
         // every call, since a mid-drag focus change can make even *this*
         // rebase target a different output than the previous call's.
-        let event_output_position = data
-            .stack
-            .outputs()
-            .get(data.stack.focused_output_index())
-            .map(|slot| slot.position)
-            .unwrap_or_default();
+        let event_output_position = data.stack.output_position(data.stack.focused_output_index());
         let event_global_location = event.location + event_output_position.to_f64();
         let delta = event_global_location - self.start_global_location;
         let new_location = self.initial_window_location.to_f64() + delta;
