@@ -475,9 +475,8 @@ fn refresh_hut_content_thumbnail(
     if size.0 <= 0 || size.1 <= 0 {
         return;
     }
-    let space_output = hut.space_output.clone();
-    let space = hut.space_mut(area_origin);
-    let elements = match space_render_elements::<_, HutSpaceElement, _>(renderer, [&*space], &space_output, 1.0) {
+    hut.space_mut(area_origin);
+    let elements = match space_render_elements::<_, HutSpaceElement, _>(renderer, [hut.space()], &hut.space_output, 1.0) {
         Ok(elements) => elements,
         Err(err) => {
             tracing::warn!("failed to collect space elements for Alt-Tab thumbnail: {err}");
