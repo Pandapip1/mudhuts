@@ -233,7 +233,7 @@ impl State {
         // sitting at global `(0, 0)` — hit-tested/mapped every one of
         // these against coordinates far outside that output's own real
         // bounds, breaking clicks/hover/selection there entirely.
-        let output_position = self.stack.outputs().get(output_index).map(|slot| slot.position).unwrap_or_default();
+        let output_position = self.stack.output_position(output_index);
         let pos = pos - output_position.to_f64();
         let pos_physical = self.to_physical(pos);
         // Under winit this is a no-op ping (the host draws the cursor,
@@ -881,17 +881,45 @@ impl State {
                 new_location.y = new_location.y.clamp(bounds.loc.y, (bounds.loc.y + bounds.size.h).max(bounds.loc.y));
                 // `bounds` is only a bounding *hull*, not a true union
                 // (see `GraphStack::virtual_bounding_box`'s doc comment)
-                // — clamp a second time, into whichever output this
-                // resolves to's own real rect, so a "dead zone" between
-                // two different-height outputs can never leave `pos`
-                // somewhere `output_index_at` reports as one output while
-                // not actually being contained by that output's own rect
-                // (which would otherwise get rebased in `handle_pointer_motion`
-                // as if it were safely inside).
-                let output_index = self.stack.output_index_at(new_location);
-                if let Some(rect) = self.stack.output_rect(output_index) {
-                    new_location.x = new_location.x.clamp(rect.loc.x, (rect.loc.x + rect.size.w).max(rect.loc.x));
-                    new_location.y = new_location.y.clamp(rect.loc.y, (rect.loc.y + rect.size.h).max(rect.loc.y));
+                // — clamp a second time, into whichever real output's rect
+                // is geometrically *nearest*, so a "dead zone" between two
+                // different-height outputs can never leave `new_location`
+                // somewhere not actually contained by any real output's
+                // rect (which would otherwise get rebased in
+                // `handle_pointer_motion` as if it were safely inside).
+                // Deliberately not `output_index_at(new_location)` here:
+                // that falls back to whichever output is *currently
+                // focused* for an unowned point, which could be a
+                // completely different, geometrically distant monitor —
+                // snapping into it from a dead zone would teleport the
+                // cursor across the whole virtual desktop instead of
+                // stopping at the nearest real edge.
+                // Cheap common-case check first — `output_index_at`'s own
+                // fallback-to-focused isn't trustworthy for this (see
+                // above), but its underlying rect-contains scan is: if
+                // `new_location` is already genuinely inside some real
+                // output's rect (the overwhelming majority of motion
+                // samples), this is a no-op and the expensive per-output
+                // nearest-point search below never runs at all.
+                let already_contained = (0..self.stack.outputs().len())
+                    .any(|i| self.stack.output_rect(i).is_some_and(|rect| rect.contains(new_location)));
+                if !already_contained {
+                    let nearest = self
+                        .stack
+                        .outputs()
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, _)| {
+                            let rect = self.stack.output_rect(i)?;
+                            let cx = new_location.x.clamp(rect.loc.x, (rect.loc.x + rect.size.w).max(rect.loc.x));
+                            let cy = new_location.y.clamp(rect.loc.y, (rect.loc.y + rect.size.h).max(rect.loc.y));
+                            let dist = (cx - new_location.x).hypot(cy - new_location.y);
+                            Some((dist, Point::from((cx, cy))))
+                        })
+                        .min_by(|(a, _), (b, _)| a.total_cmp(b));
+                    if let Some((_, clamped)) = nearest {
+                        new_location = clamped;
+                    }
                 }
                 self.handle_pointer_motion(new_location, event.time_msec());
             }
@@ -909,12 +937,7 @@ impl State {
                 // hardware under the udev/libinput backend can emit these
                 // too, on any output, not just one sitting at the virtual
                 // desktop's own `(0, 0)` origin.
-                let output_position = self
-                    .stack
-                    .outputs()
-                    .get(self.stack.focused_output_index())
-                    .map(|slot| slot.position)
-                    .unwrap_or_default();
+                let output_position = self.stack.output_position(self.stack.focused_output_index());
                 let pos = event.position_transformed(output_geo.size) + output_position.to_f64();
                 self.handle_pointer_motion(pos, event.time_msec());
             }
