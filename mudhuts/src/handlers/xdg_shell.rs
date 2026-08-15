@@ -135,22 +135,30 @@ impl XdgShellHandler for State {
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         let wl_surface = surface.wl_surface();
-        let was_focused_hut_visible_window = self
-            .stack
-            .focused()
-            .active_window()
-            .is_some_and(|w| w.toplevel().is_some_and(|t| t.wl_surface() == wl_surface));
+        // Checked per-Hut, not just the focused one — `all_huts_mut()`
+        // below reaches every output's own Huts, and a window closing on
+        // a backgrounded output's own visible Hut needs that Hut's
+        // `space` remapped just as much as the focused one would.
+        let mut visible_window_hut_id = None;
         for hut in self.stack.all_huts_mut() {
+            let was_visible =
+                hut.active_window().is_some_and(|w| w.toplevel().is_some_and(|t| t.wl_surface() == wl_surface));
             if hut.remove_window(wl_surface) {
+                if was_visible {
+                    visible_window_hut_id = Some(hut.id);
+                }
                 break;
             }
         }
-        if was_focused_hut_visible_window {
-            self.sync_visible_main_window();
-            // Paired call `sync_keyboard_focus_to_view`'s own doc
-            // comment requires — the visible window just closed and a
-            // different one (or the terminal) took its place, so
-            // keyboard input has to follow.
+        if let Some(hut_id) = visible_window_hut_id {
+            // This Hut's own space, not `self.sync_visible_main_window()`
+            // (focused-output-only) — same fix/reasoning as
+            // `handlers/shell.rs`'s `retag`.
+            self.sync_hut_space(hut_id);
+            // Keyboard focus is seat-wide, not per-output — a no-op
+            // unless `hut_id` was also the globally-focused Hut, but
+            // still required per `sync_keyboard_focus_to_view`'s own doc
+            // comment for the case where it was.
             self.sync_keyboard_focus_to_view();
         }
         self.request_redraw();
@@ -213,8 +221,7 @@ impl XdgShellHandler for State {
         // — `start_data.location` alone is local to *this* output, not
         // necessarily whatever output focus is on by the time `motion()`
         // runs later.
-        let start_output_position =
-            self.stack.outputs().get(output_index).map(|slot| slot.position).unwrap_or_default();
+        let start_output_position = self.stack.output_position(output_index);
         let start_global_location = start_data.location + start_output_position.to_f64();
 
         let Some(window) = self.find_window_by_surface(&wl_surface) else {
