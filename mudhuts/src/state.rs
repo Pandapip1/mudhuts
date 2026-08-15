@@ -818,8 +818,18 @@ impl State {
     /// size against the output a change actually happened on, which is
     /// not always the currently-focused one.
     pub fn usable_area_logical_for(&self, output_index: usize) -> (i32, i32, i32, i32) {
+        // `(0, 0, 0, 0)`, not `self.output_size` (the *focused* output's
+        // own physical size) — unlike `usable_area_logical`'s identical-
+        // looking fallback (which really is about "no output exists
+        // anywhere yet," so the focused one and "the" output are the
+        // same concept), a bad `output_index` here means a *specific,
+        // possibly different* output doesn't exist — mislabeling some
+        // unrelated output's size as this one's would be actively
+        // misleading, not just imprecise. Matches
+        // [`Self::output_size_for`]/[`Self::usable_area_for`]'s own
+        // neutral-zero fallback.
         let Some(slot) = self.stack.outputs().get(output_index) else {
-            return (0, 0, self.output_size.0, self.output_size.1);
+            return (0, 0, 0, 0);
         };
         let zone = layer_map_for_output(&slot.output).non_exclusive_zone();
         (zone.loc.x, zone.loc.y, zone.size.w, zone.size.h)
@@ -848,9 +858,14 @@ impl State {
     /// which persists a drag against the window's real owning output,
     /// not necessarily the focused one by the time the drag ends).
     pub fn output_size_logical_for(&self, output_index: usize) -> (i32, i32) {
+        // `(0, 0)`, not `self.output_size` — see
+        // `usable_area_logical_for`'s identical fallback fix and its own
+        // doc comment for why a *specific*-output accessor can't reuse
+        // `output_size_logical`'s "no output exists at all yet" fallback
+        // for "this particular output_index doesn't exist."
         match self.real_output_geometry_for(output_index) {
             Some(geo) => (geo.size.w, geo.size.h),
-            None => self.output_size,
+            None => (0, 0),
         }
     }
 
