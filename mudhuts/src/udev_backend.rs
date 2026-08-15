@@ -1305,8 +1305,22 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
     // non-focused output never received a `wl_surface.frame` callback at
     // all from *its own* output's render pass, so a well-behaved client
     // pacing redraws off that callback drew once and then stalled.
+    // `space()`, deliberately NOT the self-syncing `space_mut` — this
+    // runs on *every* rendered frame (far more often than the discrete
+    // pointer-motion samples that drive a drag), and `grabs.rs`'s
+    // `MoveSurfaceGrab::motion`/`docks.rs`'s `advance_drag` write a live,
+    // in-progress drag position directly into this same Hut's `space`
+    // via `space_raw_mut`. Forcing a sync here — caught by review before
+    // landing — would resync from the stale pre-drag model on the very
+    // next frame after any drag motion, snapping the window back toward
+    // its last confirmed position and/or discarding `raise_element`'s
+    // z-order adjustment (`input.rs`'s click-to-focus) the same way.
+    // Reading raw is also the *correct* behavior here regardless: frame
+    // callbacks and `refresh()` should reflect whatever's actually,
+    // currently being displayed, live-drag positions included.
     let hut = state.stack.focused_mut_for(output_index);
-    hut.space.elements().for_each(|element| {
+    let space = hut.space_raw_mut();
+    space.elements().for_each(|element| {
         if let crate::space_element::HutSpaceElement::Window(window) = element {
             window.send_frame(
                 &output,
@@ -1316,7 +1330,7 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
             );
         }
     });
-    hut.space.refresh();
+    space.refresh();
     state.popups.cleanup();
     // `session_destroyed` only removes mudhuts' own owned `Session`s
     // (`state.image_copy_sessions`) — it doesn't touch `ImageCopyCaptureState`'s

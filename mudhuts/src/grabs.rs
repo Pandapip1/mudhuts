@@ -103,7 +103,7 @@ impl PointerGrab<State> for MoveSurfaceGrab {
             // dragged window) — nothing left to update.
             return;
         };
-        hut.space.map_element(
+        hut.space_raw_mut().map_element(
             crate::space_element::HutSpaceElement::Window(self.window.clone()),
             new_location.to_i32_round(),
             true,
@@ -255,7 +255,7 @@ impl PointerGrab<State> for MoveSurfaceGrab {
             return;
         };
         let Some(location) =
-            hut.space.element_location(&crate::space_element::HutSpaceElement::Window(self.window.clone()))
+            hut.space().element_location(&crate::space_element::HutSpaceElement::Window(self.window.clone()))
         else {
             return;
         };

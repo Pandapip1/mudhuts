@@ -1042,10 +1042,22 @@ impl State {
             }
         }
 
+        // `space()`, deliberately NOT the self-syncing `space_mut` —
+        // `docks.rs`'s `advance_drag`/`grabs.rs`'s `MoveSurfaceGrab::motion`
+        // write a live, in-progress drag position directly into this
+        // same focused Hut's `space` via `space_raw_mut` earlier in the
+        // very same `handle_pointer_motion` call (`input.rs`) that calls
+        // this. A forced sync here — caught by review before landing —
+        // would rebuild from the still-stale pre-drag model and
+        // immediately discard that live write before a frame ever
+        // renders it, breaking dragging entirely. Reading raw also
+        // happens to be the *more correct* behavior anyway: hit-testing
+        // during a drag should see the window where it currently,
+        // visibly is, not a resynced model position.
         if let Some(hit) = self
             .stack
             .focused()
-            .space
+            .space()
             .element_under(pos)
             .and_then(|(element, location)| match element {
                 HutSpaceElement::Window(window) => window

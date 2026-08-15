@@ -425,9 +425,22 @@ impl Node<RenderEnv> for ConsoleNode {
             }]);
         }
 
+        // `space()`, not `space_mut(...)` — this reads whatever an
+        // earlier reactive sync last put there, not freshly rebuilt here.
+        // Deliberately not upgraded to the self-healing `space_mut` while
+        // fixing the resync-gap bug class elsewhere: `space_mut` bakes
+        // `area_origin` directly into the mapped positions, but this
+        // function's own convention above is everything staying in a
+        // node-local `(0, 0)` frame, translated once at the top of the
+        // tree — passing the real, possibly-nonzero `usable_area()`
+        // origin here would double-apply it. Left as an open question,
+        // not fixed: whether `space` genuinely ever holds node-local
+        // positions for this path, or whether this and
+        // `sync_visible_main_window`'s real-origin sync are quietly
+        // inconsistent with each other, needs its own investigation.
         let pieces = self
             .hut
-            .space
+            .space()
             .elements()
             .filter_map(|element| {
                 let crate::space_element::HutSpaceElement::Window(window) = element else {
@@ -436,7 +449,7 @@ impl Node<RenderEnv> for ConsoleNode {
                     // `state.rs::surface_under`'s identical comment.
                     return None;
                 };
-                let mapped_at = self.hut.space.element_location(element)?;
+                let mapped_at = self.hut.space().element_location(element)?;
                 // Matches `Space::render_elements_for_region`'s own
                 // `render_location()` formula exactly (checked against
                 // Smithay's pinned source: `self.location -

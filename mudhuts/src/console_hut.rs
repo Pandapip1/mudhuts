@@ -154,12 +154,22 @@ pub struct ConsoleHut {
     /// scoped per-instance instead. Bound to [`Self::space_output`], a
     /// synthetic output sized to [`Self::pixel_size`] (kept in sync by
     /// [`Self::resize_to_pixels`]), not the real one — see
-    /// `docs/rfcs/composable-hut-hierarchy.md`'s Q1. Populated by
-    /// `State::sync_visible_main_window` whenever this is the focused
-    /// ConsoleHut, and read by `render.rs`'s `content_elements`,
-    /// `State::surface_under`, `input.rs`'s click routing, and
-    /// `docks.rs`/`grabs.rs`'s drag handling.
-    pub space: Space<HutSpaceElement>,
+    /// `docs/rfcs/composable-hut-hierarchy.md`'s Q1.
+    ///
+    /// Private on purpose: across several rounds of code review, real
+    /// bugs kept turning up where a Hut's window model was mutated (a
+    /// window opened/closed/retagged) on some Hut *other* than the
+    /// focused one — a backgrounded output's own Hut, say — and the
+    /// reactive `sync_main_window_space` call that should have followed
+    /// it was missed, leaving `space` stale until something unrelated
+    /// happened to trigger a resync. A raw `pub` field made every one of
+    /// those a silent, easy-to-miss mistake at the *mutation* site — one
+    /// among many call sites across several files, all easy to add a new
+    /// one to and just as easy to forget. Flipped instead: nothing
+    /// outside this module can reach `space` directly at all, so there's
+    /// no mutation-site discipline to remember in the first place — see
+    /// [`Self::space_mut`]/[`Self::space`]/[`Self::space_raw_mut`].
+    space: Space<HutSpaceElement>,
     pub(crate) space_output: Output,
 }
 
@@ -340,6 +350,71 @@ impl ConsoleHut {
         for (window, pos) in alerts {
             self.space.map_element(HutSpaceElement::Window(window), pos, false);
         }
+    }
+
+    /// This Hut's own `space`, freshly rebuilt from the current logical
+    /// window model before being returned — [`Self::sync_main_window_space`]
+    /// is cheap and idempotent (pure `Vec`/`Space` bookkeeping, no
+    /// renderer/GPU/IO involved), so calling it unconditionally here is
+    /// deliberate, not a shortcut: it's what makes `space` impossible to
+    /// read stale after a *specific, known* model mutation — the reason
+    /// this exists at all is real bugs, across several rounds of review,
+    /// from a mutation call site forgetting to sync reactively for the
+    /// right Hut afterward.
+    ///
+    /// NOT a blanket "always use this to read/write `space`" accessor,
+    /// though — an earlier version of this doc comment claimed exactly
+    /// that, and wiring it into every read site (`State::surface_under`,
+    /// `input.rs`'s click routing, `udev_backend.rs`/`winit_backend.rs`'s
+    /// per-frame callback sweep) broke dragging and `raise_element`'s
+    /// z-order entirely: those paths run interleaved with (or more
+    /// often than) `grabs.rs`/`docks.rs`'s live, not-yet-in-the-model
+    /// drag writes via [`Self::space_raw_mut`], and a forced sync
+    /// discards whatever a live write hasn't persisted back to the model
+    /// yet. Reach for this specifically after a mutation you just made
+    /// (`render.rs`'s `refresh_hut_content_thumbnail`, `State::sync_visible_main_window`/
+    /// `sync_hut_space`), not as the default way to *read* `space` for
+    /// rendering/hit-testing/frame callbacks — see [`Self::space`]'s own
+    /// doc comment for that.
+    pub fn space_mut(&mut self, area_origin: (i32, i32)) -> &mut Space<HutSpaceElement> {
+        self.sync_main_window_space(area_origin);
+        &mut self.space
+    }
+
+    /// This Hut's own `space`, read-only and *without* syncing first —
+    /// whatever was last written there, stale or not. This is the normal
+    /// way to *read* `space` for rendering/hit-testing/frame callbacks
+    /// (`State::surface_under`, `input.rs`'s click routing,
+    /// `udev_backend.rs`/`winit_backend.rs`'s frame-callback sweep,
+    /// `handlers/xdg_shell.rs`'s `move_request`, `grabs.rs`/`docks.rs`'s
+    /// own live in-progress drag position reads) — see
+    /// [`Self::space_mut`]'s own doc comment for why forcing a sync at
+    /// these particular call sites is actively wrong, not just
+    /// unnecessary: reading whatever's *actually* currently there
+    /// (live-drag positions and `raise_element`'s z-order included) is
+    /// the behavior these callers want anyway, not a model-derived
+    /// rebuild. Genuine staleness (a mutation site that forgot to call
+    /// [`Self::space_mut`]/[`Self::sync_main_window_space`] for the Hut
+    /// it actually changed) is a real risk this doesn't protect
+    /// against — but that's a smaller, better-understood surface (a
+    /// handful of mutation call sites, not every read site) than this
+    /// method's own history already proved the alternative to be.
+    pub fn space(&self) -> &Space<HutSpaceElement> {
+        &self.space
+    }
+
+    /// This Hut's own `space`, for direct mutation *without* syncing
+    /// first — exists only for `grabs.rs`'s `MoveSurfaceGrab::motion`/
+    /// `docks.rs`'s `advance_drag` (a live, in-progress drag position,
+    /// written on every pointer-motion sample, deliberately not yet
+    /// reflected in the logical window model until the drag actually
+    /// ends) and `input.rs`'s click-to-focus `raise_element` call (a
+    /// z-order change that isn't part of the logical model at all).
+    /// Calling [`Self::space_mut`] at either call site instead would
+    /// rebuild from the model and discard exactly the thing being
+    /// written — see its own doc comment.
+    pub fn space_raw_mut(&mut self) -> &mut Space<HutSpaceElement> {
+        &mut self.space
     }
 
     /// The "Terminal" tab's text-label texture and a damage snapshot for

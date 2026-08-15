@@ -227,8 +227,14 @@ pub fn init_winit(
                     }
 
                     let elapsed = state.start_time.elapsed();
+                    // `space()`, deliberately NOT the self-syncing
+                    // `space_mut` — see `udev_backend.rs`'s identical fix
+                    // and its own doc comment for why forcing a sync in
+                    // this per-frame sweep would corrupt a live in-progress
+                    // drag/raise-element z-order.
                     let hut = state.stack.focused_mut();
-                    hut.space.elements().for_each(|element| {
+                    let space = hut.space_raw_mut();
+                    space.elements().for_each(|element| {
                         if let crate::space_element::HutSpaceElement::Window(window) = element {
                             window.send_frame(
                                 &output,
@@ -238,7 +244,7 @@ pub fn init_winit(
                             );
                         }
                     });
-                    hut.space.refresh();
+                    space.refresh();
                     state.popups.cleanup();
                     // `session_destroyed` only removes mudhuts' own owned
                     // `Session`s (`state.image_copy_sessions`) — it doesn't
