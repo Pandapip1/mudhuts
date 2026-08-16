@@ -942,6 +942,24 @@ impl GraphStack {
         Redrawable::attach_redraw_handle(&mut node, self.redraw.clone());
         let node_id = self.graph.add_node(Box::new(node));
         self.outputs[output_index].huts.push(node_id);
+        // A newly-inserted top-level entry always needs a redraw
+        // somewhere (at minimum the Alt-Tab popup/tab strip now has an
+        // extra entry, and it can become the immediately-visible one if
+        // `advance_forward` just pushed `pos` onto it) — pinged here
+        // rather than left for every caller to remember, the same
+        // "structural, not hand-followed" fix already applied to
+        // keyboard-focus resync this session: every *internal* caller
+        // today already happens to ping afterward too (`next`/`prev`) —
+        // `wrap_tab`/`wrap_tile` do NOT go through this function at all
+        // (`wrap()` calls `ConsoleHut::spawn` directly and has its own
+        // separate `mark_dirty()` call — don't remove that one thinking
+        // this covers it) — but `autostart.rs`'s direct call to
+        // `spawn_and_insert_with_command` (this method's sibling, same
+        // fix applied there too) did not — invisible only because it
+        // runs before the backend's own first render pass, not because
+        // anything guaranteed it. Idempotent/cheap to call redundantly —
+        // `RedrawHandle::mark_dirty`'s own doc comment.
+        self.redraw.mark_dirty();
         Ok(id)
     }
 
@@ -968,6 +986,12 @@ impl GraphStack {
         Redrawable::attach_redraw_handle(&mut node, self.redraw.clone());
         let node_id = self.graph.add_node(Box::new(node));
         self.out_mut().huts.push(node_id);
+        // See `spawn_and_insert_for`'s identical call/doc comment — this
+        // is that fix's actual motivating caller: `autostart.rs` calls
+        // this directly and, before this, never triggered a redraw of
+        // its own, relying entirely on the coincidence that it runs
+        // before the backend's first render pass.
+        self.redraw.mark_dirty();
         Ok(id)
     }
 

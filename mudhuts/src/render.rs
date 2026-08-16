@@ -221,17 +221,17 @@ type Element = OutputRenderElements<GlesRenderer, HutSpaceRenderElement>;
 pub(crate) fn content_pieces_to_elements(
     pieces: Vec<crate::graph::ContentPiece>,
     renderer: &mut GlesRenderer,
-    origin: (f64, f64),
+    origin: smithay::utils::Point<f64, smithay::utils::Physical>,
     scale: f64,
 ) -> Vec<Element> {
     let mut elements = Vec::new();
     for piece in pieces {
         match piece {
-            crate::graph::ContentPiece::Texture { id, texture, damage, position: (x, y) } => {
+            crate::graph::ContentPiece::Texture { id, texture, damage, position } => {
                 let element = TextureRenderElement::from_texture_with_damage(
                     id,
                     renderer.context_id(),
-                    (origin.0 + x, origin.1 + y),
+                    origin + position,
                     texture,
                     texture_buffer_scale(scale),
                     Transform::Normal,
@@ -611,7 +611,7 @@ fn content_elements(
     let area = state.usable_area_for(output_index);
     let scale = state.output_scale_for(output_index);
     let mut elements =
-        content_pieces_to_elements(content, renderer, (area.loc.x as f64, area.loc.y as f64), scale);
+        content_pieces_to_elements(content, renderer, area.loc.to_f64(), scale);
 
     let top = state.stack.focused_top_level_for(output_index);
     if let Some(tile) = state.stack.graph().downcast::<crate::graph_nodes::TileNode>(top) {

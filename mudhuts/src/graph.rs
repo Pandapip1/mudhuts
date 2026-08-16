@@ -169,7 +169,17 @@ pub enum ContentPiece {
         id: smithay::backend::renderer::element::Id,
         texture: smithay::backend::renderer::gles::GlesTexture,
         damage: smithay::backend::renderer::utils::DamageSnapshot<i32, smithay::utils::Buffer>,
-        position: (f64, f64),
+        // Genuinely `Physical`, not a bare `(f64, f64)` — `render.rs`'s
+        // `content_pieces_to_elements` feeds this straight into
+        // `TextureRenderElement::from_texture_with_damage`, which
+        // requires `impl Into<Point<f64, Physical>>` (Smithay's pinned
+        // source). A bare tuple would type-check regardless of which
+        // coordinate space the numbers actually came from — the same gap
+        // that let a Physical value silently reach a Logical-only API
+        // once already (see `console_hut.rs`'s `sync_main_window_space`
+        // doc comment for the full mechanism); typing this the same way
+        // closes the identical risk here before it ever ships.
+        position: smithay::utils::Point<f64, smithay::utils::Physical>,
     },
     /// A real client `Window`'s own surface(s) — composited by
     /// Smithay's own `space_render_elements`/`AsRenderElements`

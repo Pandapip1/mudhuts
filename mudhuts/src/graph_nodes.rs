@@ -275,8 +275,9 @@ impl<Env> Node<Env> for TileNode {
 /// codebase's convention of degrading rather than guessing.
 fn translate_piece(piece: ContentPiece, dx: i32, dy: i32) -> ContentPiece {
     match piece {
-        ContentPiece::Texture { id, texture, damage, position: (x, y) } => {
-            ContentPiece::Texture { id, texture, damage, position: (x + dx as f64, y + dy as f64) }
+        ContentPiece::Texture { id, texture, damage, position } => {
+            let offset = smithay::utils::Point::<f64, smithay::utils::Physical>::from((dx as f64, dy as f64));
+            ContentPiece::Texture { id, texture, damage, position: position + offset }
         }
         window @ ContentPiece::Window { .. } => window,
     }
@@ -421,7 +422,7 @@ impl Node<RenderEnv> for ConsoleNode {
                 id: self.hut.element_id.clone(),
                 texture,
                 damage,
-                position: (0.0, 0.0),
+                position: smithay::utils::Point::from((0.0, 0.0)),
             }]);
         }
 
