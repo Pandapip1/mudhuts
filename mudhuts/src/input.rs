@@ -202,7 +202,7 @@ impl State {
         let output_index = self.stack.output_index_at(pos);
         if output_index != self.stack.focused_output_index() {
             self.stack.set_focused_output(output_index);
-            self.sync_focused_output();
+            self.sync_focused_output(); // also resets `tab_strip_revealed` — see its own doc comment
             // `sync_visible_main_window`'s own doc comment: call after
             // anything that changes which ConsoleHut is focused. Focus-
             // follows-mouse does exactly that (`self.stack.focused()`
@@ -241,6 +241,9 @@ impl State {
         // all, so the drawn cursor only catches up to its real position
         // whenever something unrelated happens to force one.
         self.request_redraw();
+        if self.chrome_config.auto_hide_tab_strip {
+            self.update_tab_strip_reveal(pos_physical.y);
+        }
         let serial = SERIAL_COUNTER.next_serial();
 
         if self.dock_drag.is_some() {
@@ -421,6 +424,54 @@ impl State {
         keyboard.set_focus(self, target, SERIAL_COUNTER.next_serial());
     }
 
+    /// Auto-hide tab strip (`chrome_config.auto_hide_tab_strip`): called
+    /// from `handle_pointer_motion` with the pointer's own physical-pixel
+    /// Y, already local to the now-focused output's origin (real
+    /// multi-monitor's focus-follows-mouse means that's always the output
+    /// the pointer is actually over — see that function's own doc
+    /// comment). Reveals the combined Hut-level + Main-Window tab strip
+    /// (`render.rs`'s `combined_tab_strip_height`) the instant the
+    /// pointer touches the very top edge of the output, and keeps it
+    /// shown for as long as the pointer stays anywhere within the strip's
+    /// own rect afterward — only actually hiding again once the pointer
+    /// leaves that whole rect, not the moment it moves off the few-pixel
+    /// edge that revealed it in the first place. `self.tab_strip_revealed`
+    /// itself is a plain `bool`, not a `Signal` (see its own doc comment
+    /// on why) — doesn't request its own redraw on a flip, unlike a
+    /// `Signal` write would: `handle_pointer_motion`, this method's only
+    /// caller, already calls `request_redraw()` unconditionally on every
+    /// motion event before reaching here (see that call's own doc
+    /// comment on why it's unconditional), so a second one here would
+    /// only ever be a redundant no-op.
+    ///
+    /// Known narrow gap, not fixed: the hysteresis check below only
+    /// re-evaluates `combined_tab_strip_height` on a pointer-motion
+    /// event, so if the strip's real height shrinks (a tab/Main Window
+    /// closing) while the pointer stays perfectly still, it can stay
+    /// revealed slightly past where its own current rect actually ends
+    /// until the next motion event corrects it — self-healing on the
+    /// very next real one, matching this codebase's existing tolerance
+    /// for similarly narrow staleness windows elsewhere (see
+    /// `sync_keyboard_focus_to_view`'s own doc comment). A fully
+    /// event-driven invalidation (recomputing on every tab-count-changing
+    /// mutation, not just motion) would also happen to remove the
+    /// repeated per-motion-event recomputation this does while hovering
+    /// the revealed strip — not done here as its own thing given how
+    /// cheap that recomputation already is (bounded by the active Tab-Hut
+    /// path's own depth, no I/O).
+    fn update_tab_strip_reveal(&mut self, pointer_y_physical: f64) {
+        const EDGE_REVEAL_PX: f64 = 4.0;
+        let revealed = if pointer_y_physical <= EDGE_REVEAL_PX {
+            true
+        } else if self.tab_strip_revealed {
+            let height = crate::render::combined_tab_strip_height(self, self.stack.focused_output_index());
+            pointer_y_physical <= height as f64
+        } else {
+            false
+        };
+        self.tab_strip_revealed = revealed;
+    }
+
     /// Try to handle a left-click as a chrome interaction — a
     /// Hut-level tab (any nesting level), a ConsoleHut-level Main-Window tab,
     /// or clicking into a Tile-Hut pane — rather than a normal
@@ -456,6 +507,24 @@ impl State {
         // place left to get that wrong.
         let area = self.focused_usable_area();
         let top = self.stack.focused_top_level();
+        // The `if let Some(tile) = ...` below is deliberately its own,
+        // self-contained check rather than a call to
+        // `crate::graph_nodes::is_effectively_tiled` (the shared `bool`
+        // `render.rs`'s `build_frame_elements`/`combined_tab_strip_height`
+        // both use instead — see that function's own doc comment): this
+        // branch needs the real `TileNode` (its `axis`/`fracs`), not just
+        // a yes/no answer, and `downcast::<TileNode>` already hands that
+        // back as a plain, safely-matchable `Option` in one call — no
+        // `.expect()`/`.unwrap()` anywhere in this branch. Calling
+        // `is_effectively_tiled` first and then downcasting *again* to
+        // get `tile` would need one of those on the second call (already
+        // confirmed safe by the first, but not provably so to the
+        // compiler) purely to avoid this one line looking like a
+        // duplicate — not a trade worth making in the input path.
+        // `children.len() >= 2` here is the same condition
+        // `is_effectively_tiled` checks (a 1-child/empty Tile never
+        // actually exists — see its own doc comment), just not a call to
+        // the same function.
         if let Some(tile) = self.stack.graph().downcast::<crate::graph_nodes::TileNode>(top) {
             let children = self.stack.graph().hut_list_input(top, "children");
             if children.len() >= 2 {
@@ -478,6 +547,16 @@ impl State {
                 self.sync_visible_main_window();
                 return true;
             }
+        }
+
+        // `render::tab_strip_visible` — the same function `render.rs`'s
+        // own draw gate calls — so a hidden (not drawn) strip can never
+        // independently end up clickable, or vice versa: a click that
+        // would have hit it just falls through to the normal
+        // terminal/window handling below instead, exactly as if nothing
+        // were there, matching what the user actually sees on screen.
+        if !crate::render::tab_strip_visible(self, self.stack.focused_output_index()) {
+            return false;
         }
 
         let cell_w = self.stack.focused().glyphs.cell_width().max(1);

@@ -857,6 +857,64 @@ fn lock_screen_elements(
     vec![Element::from(background)]
 }
 
+/// The combined Hut-level + Main-Window tab strip's total height for
+/// `output_index`, in physical pixels — `village_chrome::stack_height`
+/// plus `chrome::strip_height`, the same two quantities
+/// `build_frame_elements`'s own tab-strip block below computes
+/// separately (once to draw, this once more for `input.rs`'s
+/// `update_tab_strip_reveal`/`try_click_chrome` to know how far down the
+/// auto-hidden strip's own clickable/hover rect actually extends).
+/// `stack_height` alone already degrades to `0` for a top-level Hut that
+/// isn't a 2+-child Tab-Hut, but `strip_height` does *not* — it's a pure
+/// function of the focused ConsoleHut's own Main-Window count, with no
+/// idea whether that ConsoleHut is currently one pane of a tiled layout
+/// (`crate::graph_nodes::is_effectively_tiled`, the same shared check
+/// `build_frame_elements`'s own `is_tile`/`try_click_chrome` both use) —
+/// without it, a tiled ConsoleHut with Main Windows open would report a
+/// nonzero height nothing actually draws (caught in review — an earlier
+/// version of this function hand-rolled its own, subtly incomplete copy
+/// of the same condition).
+pub(crate) fn combined_tab_strip_height(state: &State, output_index: usize) -> i32 {
+    let top = state.stack.focused_top_level_for(output_index);
+    if crate::graph_nodes::is_effectively_tiled(state.stack.graph(), top) {
+        return 0;
+    }
+    let cell_h = state.stack.focused_for(output_index).glyphs.cell_height().max(1) as i32;
+    let scale = state.output_scale_for(output_index);
+    let village_height = village_chrome::stack_height(state.stack.graph(), top, cell_h, scale);
+    let chrome_height = chrome::strip_height(state.stack.focused_for(output_index), scale);
+    village_height + chrome_height
+}
+
+/// Whether the combined Hut-level + Main-Window tab strip should actually
+/// draw/be clickable for `output_index` right now — the single source of
+/// truth for "auto-hide" (`chrome_config.auto_hide_tab_strip`, on by
+/// default), shared by `build_frame_elements`'s own tab-strip block below
+/// (draw gate) and `input.rs`'s `try_click_chrome` (click gate) so the two
+/// can never independently drift out of sync with each other — a click
+/// hitting something invisible, or a visible strip nothing can click,
+/// would both be real, confusing regressions this exists to rule out by
+/// construction rather than by two call sites agreeing on a formula.
+pub(crate) fn tab_strip_visible(state: &State, output_index: usize) -> bool {
+    !state.chrome_config.auto_hide_tab_strip
+        || (output_index == state.stack.focused_output_index() && state.tab_strip_revealed)
+}
+
+// Deliberate real-multi-monitor consequence, not a bug (raised in
+// review): with `auto_hide_tab_strip` on, a non-focused output's strip
+// stays hidden even while its own Main Windows/Hut tabs are otherwise
+// perfectly normal — only the output the pointer's actually touching the
+// top edge of can ever have its strip revealed, since `tab_strip_revealed`
+// only ever means "revealed for `focused_output_index()`" (see its own
+// doc comment). This matches how auto-hide taskbars behave on every
+// mainstream desktop with multiple monitors: only the display your cursor
+// is near can respond to an edge touch, so every other display's own bar
+// just stays in its default-hidden state until you actually move there.
+// A user who wants a *given* output's strip to stay always-on regardless
+// of hover state already has that: `auto_hide_tab_strip = false` in
+// `config.toml`'s `[chrome]` section restores the pre-this-feature
+// always-visible behavior for every output uniformly.
+
 /// Build one frame's worth of render elements (Alt-Tab popup, tab-strip
 /// chrome, docked-handle chrome, then the "normal content" — a Tile-Hut's
 /// panes, the terminal, or the focused Console Hut's visible Main
@@ -940,8 +998,7 @@ pub fn build_frame_elements(
 
     let show_terminal = state.showing_terminal_effective_for(output_index);
     let top = state.stack.focused_top_level_for(output_index);
-    let is_tile = state.stack.graph().downcast::<crate::graph_nodes::TileNode>(top).is_some()
-        && state.stack.graph().hut_list_input(top, "children").len() >= 2;
+    let is_tile = crate::graph_nodes::is_effectively_tiled(state.stack.graph(), top);
     let scale = state.output_scale_for(output_index);
     let mut elements = Vec::new();
 
@@ -1020,30 +1077,42 @@ pub fn build_frame_elements(
     // (`is_tile`, above) stays as a defensive fallback to the normal
     // pipeline rather than assumed.
     if !is_tile {
-        // Hut-level tab strip(s) (Phase 6) — one per Tab-Hut along
-        // the active path, stacked from the top of the screen, outermost
-        // first (see `village_chrome.rs`'s module doc). Empty unless the
-        // focused top-level Hut actually is a Tab-Hut with 2+
-        // children; `next_y` is unchanged (0) in that case.
-        let cell_w = state.stack.focused_for(output_index).glyphs.cell_width().max(1);
-        let cell_h = state.stack.focused_for(output_index).glyphs.cell_height().max(1) as i32;
-        let (village_tab_elements, next_y) = village_chrome::build(
-            state.stack.graph_mut(),
-            top,
-            renderer,
-            0,
-            cell_w,
-            cell_h,
-            scale,
-            &state.theme,
-        );
-        elements.extend(village_tab_elements);
+        // `tab_strip_visible` (this file, above) is the single source of
+        // truth for the auto-hide draw gate — `input.rs`'s
+        // `try_click_chrome` calls the exact same function for its own
+        // click gate, so the two can't independently drift apart.
+        if tab_strip_visible(state, output_index) {
+            // Hut-level tab strip(s) (Phase 6) — one per Tab-Hut along
+            // the active path, stacked from the top of the screen, outermost
+            // first (see `village_chrome.rs`'s module doc). Empty unless the
+            // focused top-level Hut actually is a Tab-Hut with 2+
+            // children; `next_y` is unchanged (0) in that case.
+            let cell_w = state.stack.focused_for(output_index).glyphs.cell_width().max(1);
+            let cell_h = state.stack.focused_for(output_index).glyphs.cell_height().max(1) as i32;
+            let (village_tab_elements, next_y) = village_chrome::build(
+                state.stack.graph_mut(),
+                top,
+                renderer,
+                0,
+                cell_w,
+                cell_h,
+                scale,
+                &state.theme,
+            );
+            elements.extend(village_tab_elements);
 
-        // Tab-strip chrome (Phase 4) — pushed below any Hut-level strips
-        // above it, still on top of the terminal/window content and still
-        // below the Alt-Tab popup above. Empty when the focused ConsoleHut has no
-        // Main Windows.
-        elements.extend(chrome::build(state.stack.focused_mut_for(output_index), renderer, next_y, scale, &state.theme));
+            // Tab-strip chrome (Phase 4) — pushed below any Hut-level strips
+            // above it, still on top of the terminal/window content and still
+            // below the Alt-Tab popup above. Empty when the focused ConsoleHut has no
+            // Main Windows.
+            elements.extend(chrome::build(
+                state.stack.focused_mut_for(output_index),
+                renderer,
+                next_y,
+                scale,
+                &state.theme,
+            ));
+        }
 
         // Docked Floating Window handles (Phase 5) — same z-order slot as the tab
         // strip, only shown alongside the Main Window they belong to (never

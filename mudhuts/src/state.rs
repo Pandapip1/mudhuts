@@ -144,6 +144,22 @@ pub struct State {
     pub keymap: Keymap,
     pub theme: crate::theme::Theme,
     pub display_config: crate::display_config::DisplayConfig,
+    pub chrome_config: crate::chrome_config::ChromeConfig,
+    /// Whether the combined Hut-level + Main-Window tab strip is
+    /// currently revealed — only meaningful while
+    /// `chrome_config.auto_hide_tab_strip` is on, and only ever true for
+    /// whichever output currently has the pointer (`self.stack.
+    /// focused_output_index()` — real multi-monitor's focus-follows-mouse
+    /// policy means that's always the output the pointer is actually
+    /// over, see `handle_pointer_motion`'s own doc comment). Updated from
+    /// `input.rs`'s `update_tab_strip_reveal`, read from `render.rs`'s
+    /// `build_frame_elements` (gates whether the strip draws at all) and
+    /// `input.rs`'s `try_click_chrome` (gates whether it's clickable) —
+    /// kept as one plain `bool` rather than a `Signal` since it's checked
+    /// on every single pointer motion event regardless of whether it
+    /// actually flips, matching `pointer_location`'s own "plain field,
+    /// manual `request_redraw()`" treatment for the same reason.
+    pub tab_strip_revealed: bool,
     /// The output's current pixel size, tracked here (not just read inside
     /// `winit_backend.rs`'s redraw handler) so newly-focused Huts can be
     /// resized immediately on switch rather than showing a stale grid
@@ -550,6 +566,8 @@ impl State {
             keymap: Keymap::load(),
             theme: crate::theme::Theme::load(),
             display_config: crate::display_config::DisplayConfig::load(),
+            chrome_config: crate::chrome_config::ChromeConfig::load(),
+            tab_strip_revealed: false,
             output_size: (0, 0),
             text_selecting: false,
             text_selection_dragged: false,
@@ -746,11 +764,48 @@ impl State {
     /// under an already-focused index.
     pub fn sync_focused_output(&mut self) {
         let slot = self.stack.outputs().get(self.stack.focused_output_index());
-        self.output = slot.map(|s| s.output.clone());
+        let new_output = slot.map(|s| s.output.clone());
+        // `Output`'s own `PartialEq` (`Arc::ptr_eq` under the hood —
+        // cheap, and correct even in the hypothetical case of two
+        // outputs sharing the same name) — compared against `self.output`
+        // (still the *old* value here, not yet overwritten below) rather
+        // than tracking a separate "previous focused index" field just
+        // for this.
+        let output_changed = self.output != new_output;
+        self.output = new_output;
         self.output_size = slot
             .and_then(|s| s.output.current_mode())
             .map(|mode| (mode.size.w, mode.size.h))
             .unwrap_or((0, 0));
+        // `tab_strip_revealed` only ever means "revealed for
+        // `focused_output_index()`" (see its own doc comment) — reset
+        // whenever *that* genuinely changes (pointer motion crossing
+        // outputs in `input.rs`, or a connector hotplug shifting it in
+        // `udev_backend.rs`'s `connector_connected`/`connector_disconnected`),
+        // so stale reveal state from whichever output used to be focused
+        // never leaks onto the new one — one choke point instead of each
+        // call site having to remember it separately. Conditioned on
+        // `output_changed`, not unconditional: `connector_connected` in
+        // particular calls this on *every* new connector regardless of
+        // whether focus actually moved (plugging in a 2nd monitor while
+        // focus stays on the 1st) — resetting unconditionally there would
+        // have flickered away an already-revealed strip on the still-
+        // focused output for no reason.
+        if output_changed {
+            self.tab_strip_revealed = false;
+            // `input.rs`'s `handle_pointer_motion` (the other writer of
+            // this field) always calls `request_redraw()` unconditionally
+            // right around where it calls this function, so a flip there
+            // never needs its own ping — but `udev_backend.rs`'s
+            // `connector_connected`/`connector_disconnected` (the other
+            // two callers) don't, and the udev backend's render loop is
+            // purely demand-driven (see its own module doc): without
+            // this, a strip that was genuinely revealed on the
+            // now-unfocused output could stay on screen past the hotplug
+            // event until something unrelated happened to trigger the
+            // next frame (caught in review).
+            self.request_redraw();
+        }
     }
 
     /// If a lock is pending and every currently-connected output has

@@ -1,5 +1,6 @@
 mod autostart;
 mod chrome;
+mod chrome_config;
 mod config;
 mod cursor;
 mod display_config;

@@ -31,7 +31,7 @@ use mudhuts_term::TermEvent;
 use crate::State;
 use crate::console_hut::ConsoleHut;
 use crate::graph::{Graph, Node, NodeId};
-use crate::graph_nodes::{ConsoleNode, RenderEnv, TabNode, TileNode, fracs_for};
+use crate::graph_nodes::{ConsoleNode, RenderEnv, TabNode, TileNode, fracs_for, is_effectively_tiled};
 use crate::hut::{Axis, Direction};
 use crate::redraw::{Redrawable, RedrawHandle};
 
@@ -451,7 +451,7 @@ impl GraphStack {
     /// Main Window) is what's currently effectively shown — mirrors
     /// `Hut::shows_terminal_effective` exactly.
     pub fn shows_terminal_effective(&self, top: NodeId) -> bool {
-        if self.graph.downcast::<TileNode>(top).is_some() && self.graph.hut_list_input(top, "children").len() >= 2 {
+        if is_effectively_tiled(&self.graph, top) {
             return true;
         }
         let leaf = self.graph.focused_leaf(top);

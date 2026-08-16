@@ -182,6 +182,27 @@ pub(crate) fn fracs_for(children: &[NodeId], fracs: &HashMap<NodeId, f64>) -> Ve
     children.iter().map(|c| fracs.get(c).copied().unwrap_or(1.0)).collect()
 }
 
+/// Whether `top` is a genuinely tiled layout right now — a `TileNode`
+/// *with 2+ children*, not just a `TileNode` (a 1-child or empty one
+/// never actually exists — `GraphStack::remove_child`'s collapse rule
+/// unwraps it immediately — but checking the count anyway costs nothing
+/// and means this stays correct even if that invariant ever changes).
+/// `render.rs`'s `build_frame_elements`/`combined_tab_strip_height` and
+/// `graph_stack::GraphStack::shows_terminal_effective` all need exactly
+/// this same plain "is there really a tile-pane layout on screen, as
+/// opposed to a Hut-level tab strip / bare ConsoleHut" `bool` — three
+/// independent copies of it already drifted out of sync once (one
+/// omitted the children check — caught in review), which is exactly what
+/// sharing one definition rules out by construction. `input.rs`'s
+/// `try_click_chrome` needs the same condition too but *not* this
+/// function — it needs the actual `TileNode` data alongside the bool
+/// answer, and re-deriving that from a second downcast after calling
+/// this would need an `.expect()` this codebase avoids in the input
+/// path (see its own comment) — it keeps a self-contained copy instead.
+pub(crate) fn is_effectively_tiled(graph: &Graph<RenderEnv>, top: NodeId) -> bool {
+    graph.downcast::<TileNode>(top).is_some() && graph.hut_list_input(top, "children").len() >= 2
+}
+
 /// Graph-native Tile-Hut: shows every child at once, side by side along
 /// `axis` — same semantics as [`crate::hut::TileHut`]. `fracs`, like
 /// [`TabNode::child_chrome`], is keyed by each child's own `NodeId`
