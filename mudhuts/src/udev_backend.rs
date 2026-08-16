@@ -745,7 +745,21 @@ fn detect_output_scale(phys_size_mm: (i32, i32), pixels: (i32, i32)) -> f64 {
 /// the DRM-leasing `non-desktop` check and the adaptive-refresh-rate
 /// `VRR_CAPABLE` check (see the module doc's respective sections) — same
 /// property-enumeration shape, just a different property name.
-fn connector_bool_property(drm_device: &DrmDevice, connector: connector::Handle, name: &str) -> bool {
+///
+/// Generic over `impl control::Device` rather than the concrete
+/// `DrmDevice` every real caller actually passes (`DrmDevice` implements
+/// `control::Device` in smithay itself) — widened specifically so this
+/// module's own `vkms_*` test can exercise it directly against a raw
+/// opened card node, without needing to stand up `DrmDevice`'s own
+/// session/capability-negotiation machinery just to call a handful of
+/// read-only property-enumeration methods that don't actually need any
+/// of it (caught in review: an earlier version of that test skipped this
+/// function entirely for exactly that reason).
+fn connector_bool_property(
+    drm_device: &impl smithay::reexports::drm::control::Device,
+    connector: connector::Handle,
+    name: &str,
+) -> bool {
     drm_device
         .get_properties(connector)
         .ok()
@@ -2387,4 +2401,268 @@ mod tests {
     // the override being *absent* — see `clear_output_scale_override`).
     // Not worth a `serial_test`-style dependency just for this one
     // branch.
+
+    /// Finds a `vkms`-backed DRM card node under `/sys/class/drm`, if one
+    /// is currently loaded (`sudo modprobe vkms`). vkms registers via the
+    /// kernel's "faux device" API, so its own `driver` symlink resolves
+    /// to `faux_driver`, not literally `vkms` — confirmed directly on
+    /// `ilama` (this session's own live machine, which already ships the
+    /// vkms kernel module) that the reliable identifier is `vkms`
+    /// appearing in the real, canonicalized sysfs device path instead
+    /// (`/sys/devices/faux/vkms/drm/cardN`).
+    fn find_vkms_card_path() -> Option<std::path::PathBuf> {
+        for entry in std::fs::read_dir("/sys/class/drm").ok()?.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            // Skip `cardN-<connector>` sysfs entries — only the bare
+            // `cardN` device directory itself has a `device` symlink
+            // worth following.
+            if !name.starts_with("card") || name.contains('-') {
+                continue;
+            }
+            let Ok(real_path) = std::fs::canonicalize(entry.path().join("device")) else {
+                continue;
+            };
+            // vkms's `device` symlink resolves to `/sys/devices/faux/
+            // vkms` (a *faux* platform device, no further path segment
+            // after its own name) — not `.../vkms/drm/cardN`, as an
+            // earlier version of this check assumed by requiring a
+            // trailing `/` after `vkms` (caught the hard way: it never
+            // matched against this session's own real, live vkms card).
+            // `file_name()` (the path's own last component) is the
+            // robust check either way.
+            if real_path.file_name().is_some_and(|n| n == "vkms") {
+                return Some(std::path::PathBuf::from(format!("/dev/dri/{name}")));
+            }
+        }
+        None
+    }
+
+    /// Minimal `drm::Device`/`drm::control::Device` impl over a raw
+    /// opened card node — same shape smithay's own `DrmDevice` wraps
+    /// internally, but without any of its session/seat/GBM machinery,
+    /// which this test deliberately doesn't need: it only ever reads
+    /// connector/mode info, never attempts a real mode-set.
+    struct VkmsCard(std::fs::File);
+
+    impl std::os::fd::AsFd for VkmsCard {
+        fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+            self.0.as_fd()
+        }
+    }
+
+    impl smithay::reexports::drm::Device for VkmsCard {}
+    impl smithay::reexports::drm::control::Device for VkmsCard {}
+
+    /// Shared setup for every `vkms_*` test below: opens the card
+    /// read-only (nothing here ever mode-sets, so no write access is
+    /// needed — an earlier version opened it `.write(true)` regardless,
+    /// caught in review) and picks a real connector to test against,
+    /// preferring one already `Connected` over just taking whichever one
+    /// enumerates first (vkms can register extra non-display connectors,
+    /// e.g. a writeback one if `enable_writeback` is set — enumeration
+    /// order isn't a contract). `DrmDevice`'s own session/capability-
+    /// negotiation machinery (`ClientCapability::UniversalPlanes`/
+    /// `Atomic`, negotiated by every real production call path in this
+    /// file via `LibSeatSession`) is deliberately *not* set up here: this
+    /// only ever reads connector/mode/property info, none of which needs
+    /// it, and standing that up for real is bigger, separate scope (see
+    /// the wishlist's own "genuine infra project" framing) — so this
+    /// suite doesn't catch a regression that only manifests once those
+    /// capabilities are actually negotiated.
+    fn open_vkms_card() -> (VkmsCard, connector::Info) {
+        use smithay::reexports::drm::control::Device as ControlDevice;
+
+        let path = find_vkms_card_path()
+            .expect("no vkms card found under /sys/class/drm — run `sudo modprobe vkms` first");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .unwrap_or_else(|err| panic!("failed to open {path:?}: {err}"));
+        let card = VkmsCard(file);
+
+        let resources = card.resource_handles().expect("failed to get vkms resource handles");
+        let mut infos: Vec<connector::Info> =
+            resources.connectors().iter().filter_map(|&h| card.get_connector(h, true).ok()).collect();
+        // Requires `Connected` *with* real modes, failing right here with
+        // a clear message if nothing qualifies — an earlier version fell
+        // back through several weaker tiers (any `Connected`, then just
+        // index `0`) down to a mode-less connector, which turned a clear
+        // "no usable connector" failure into a confusing out-of-bounds
+        // panic three tests down the line instead (caught in review,
+        // twice: once for the missing modes check, once more for why
+        // silently falling back at all was the wrong shape here).
+        let summary: Vec<_> = infos.iter().map(|i| (i.interface(), i.state(), i.modes().len())).collect();
+        let index = infos
+            .iter()
+            .position(|i| i.state() == connector::State::Connected && !i.modes().is_empty())
+            .unwrap_or_else(|| panic!("vkms should report at least one Connected connector with real modes among: {summary:?}"));
+        let info = infos.swap_remove(index);
+        (card, info)
+    }
+
+    /// `info`'s own preferred mode — shared by every `vkms_*` test below
+    /// that needs one, replacing three copies of the identical
+    /// `is_preferred`/`pick_preferred_mode_index` dance an earlier
+    /// version hand-rolled separately in each (caught in review: exactly
+    /// the kind of duplication a future fix to this logic could update
+    /// in two places and silently miss the third). Panics with a clear
+    /// message on an empty mode list rather than silently returning
+    /// nothing — matches this suite's own "fail loudly, not quietly" for
+    /// a real-hardware precondition that should always hold for vkms.
+    fn preferred_mode_of(info: &connector::Info) -> DrmMode {
+        assert!(!info.modes().is_empty(), "vkms should always report at least one mode");
+        info.modes()[pick_preferred_mode_index(&is_preferred_flags(info))]
+    }
+
+    /// `info`'s own modes, mapped to whether each is flagged
+    /// `ModeTypeFlags::PREFERRED` — the one piece `preferred_mode_of`
+    /// and `vkms_preferred_mode_index_picks_the_flagged_mode` both genuinely
+    /// need (the latter also needs the intermediate flags themselves for
+    /// its own bounds/consistency assertions, not just the final picked
+    /// mode `preferred_mode_of` returns, so it can't just call that
+    /// instead — but the flag computation itself doesn't need
+    /// duplicating for that).
+    fn is_preferred_flags(info: &connector::Info) -> Vec<bool> {
+        info.modes().iter().map(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED)).collect()
+    }
+
+    /// Real exercise of `connector_bool_property` against a genuine
+    /// connector. vkms never sets the `non-desktop` property at all, so
+    /// `non_desktop` here should resolve to that function's own
+    /// documented not-found fallback (`false`) — a real, non-tautological
+    /// check of the property-lookup path itself.
+    ///
+    /// The obvious complementary `is_leasable`-against-real-data check
+    /// (asserting a vkms connector is never leasable) turns out to be
+    /// tautological no matter how it's written: with `non_desktop`
+    /// pinned to `false` by vkms's own real, unchangeable behavior,
+    /// `is_leasable`'s `&&` guarantees `false` regardless of interface —
+    /// an earlier version of this test asserted exactly that anyway,
+    /// which would still pass even with the entire interface-denylist
+    /// clause deleted (caught in review, twice: once for hardcoding
+    /// `non_desktop = false` directly, once more for realizing the *real*
+    /// value is unconditionally `false` too). vkms simply can't produce
+    /// the one input (`non_desktop = true`) that clause exists to guard
+    /// against, so that half of the contract can only ever be exercised
+    /// by the synthetic `built_in_panel_interfaces_are_never_leasable_
+    /// even_if_reported_non_desktop` test above, with hand-crafted data.
+    /// What *can* be checked for real here instead: that vkms's own real
+    /// interface value isn't accidentally in that denylist — genuinely
+    /// exercises the denylist match against real hardware-reported data,
+    /// just crossed with a hypothetical `non_desktop = true` rather than
+    /// vkms's real (always-`false`) one.
+    #[test]
+    #[ignore = "needs a real vkms card (`sudo modprobe vkms`) present under /dev/dri — not portable to arbitrary machines/CI without it"]
+    fn vkms_connector_is_never_leasable() {
+        let (card, info) = open_vkms_card();
+        let non_desktop = connector_bool_property(&card, info.handle(), "non-desktop");
+        assert!(!non_desktop, "vkms doesn't set the non-desktop property, so this should fall back to false");
+
+        assert!(
+            is_leasable(true, info.interface()),
+            "vkms's own real interface ({:?}) must not be in the built-in-panel denylist — a future vkms \
+             reporting non-desktop=true would otherwise be wrongly treated as never-leasable",
+            info.interface()
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a real vkms card (`sudo modprobe vkms`) present under /dev/dri — not portable to arbitrary machines/CI without it"]
+    fn vkms_preferred_mode_index_picks_the_flagged_mode() {
+        let (_card, info) = open_vkms_card();
+        assert!(!info.modes().is_empty(), "vkms should always report at least one mode");
+        let is_preferred = is_preferred_flags(&info);
+        let preferred_index = pick_preferred_mode_index(&is_preferred);
+        // Deliberately *not* also asserting `preferred_index <
+        // info.modes().len()` here — that bound holds by construction
+        // (`pick_preferred_mode_index` is `position(...).unwrap_or(0)`
+        // over a slice built 1:1 from `info.modes()`), so it can never
+        // be false regardless of whether the function is even correct;
+        // an earlier version of this test asserted it anyway, giving a
+        // false sense of coverage (caught in review). The check below is
+        // the only one that actually exercises real selection behavior.
+        if is_preferred.iter().any(|&p| p) {
+            assert!(is_preferred[preferred_index], "a flagged-preferred mode exists, so it must be the one picked");
+        }
+        // The `unwrap_or(0)`-fallback branch (nothing flagged preferred)
+        // isn't exercised here — vkms's own real data does flag one, and
+        // this test can't fabricate different data to force the other
+        // branch; `falls_back_to_the_first_mode_when_nothing_is_flagged_
+        // preferred` above already covers it directly.
+    }
+
+    #[test]
+    #[ignore = "needs a real vkms card (`sudo modprobe vkms`) present under /dev/dri — not portable to arbitrary machines/CI without it"]
+    fn vkms_refresh_rates_convert_to_positive_whole_hertz() {
+        let (_card, info) = open_vkms_card();
+        for mode in info.modes() {
+            let hz = millihertz_to_hz(WlMode::from(*mode).refresh);
+            assert!(hz > 0, "every real vkms mode should report a positive refresh rate, got {hz}");
+        }
+    }
+
+    /// A real exercise of `build_adaptive_refresh_order`'s actual
+    /// sort/dedup contract (not just index-bounds safety, which an
+    /// earlier version of this test settled for — caught in review: a
+    /// broken sort direction or wrong dedup key would still pass a
+    /// bounds-only check) against vkms's own genuine duplicate refresh
+    /// rates at a single resolution — a real case of the exact thing
+    /// `adaptive_refresh_order_sorts_ascending_and_dedups_equal_rates`
+    /// above exercises with hand-crafted data.
+    #[test]
+    #[ignore = "needs a real vkms card (`sudo modprobe vkms`) present under /dev/dri — not portable to arbitrary machines/CI without it"]
+    fn vkms_adaptive_refresh_order_is_really_ascending_and_deduped() {
+        let (_card, info) = open_vkms_card();
+        let preferred_mode = preferred_mode_of(&info);
+
+        let refreshes: Vec<i32> = info
+            .modes()
+            .iter()
+            .filter(|m| m.size() == preferred_mode.size())
+            .map(|m| WlMode::from(*m).refresh)
+            .collect();
+        let preferred_refresh = WlMode::from(preferred_mode).refresh;
+        let Some((order, current)) = build_adaptive_refresh_order(&refreshes, preferred_refresh) else {
+            // Fewer than 2 distinct rates at this resolution on this
+            // particular vkms build/version — a legitimate `None`, not a
+            // failure; nothing further to assert.
+            return;
+        };
+        let refresh_values: Vec<i32> = order.iter().map(|&i| refreshes[i]).collect();
+        assert!(
+            refresh_values.windows(2).all(|w| w[0] < w[1]),
+            "order must be strictly ascending by refresh value with no duplicates, got {refresh_values:?}"
+        );
+        // Bounds alone (`current < order.len()`) would pass even if
+        // `current` always pointed at the wrong entry — every real value
+        // `build_adaptive_refresh_order` can return is already in-bounds
+        // by construction (`Some(pos)` or the explicit `order.len() - 1`
+        // fallback), so that check alone gives no real signal (caught in
+        // review). This instead confirms `current` actually resolves
+        // back to the mode we asked to be preferred, the part of the
+        // contract that bounds-checking alone can't tell apart from a
+        // consistently-wrong index.
+        assert_eq!(
+            refresh_values[current], preferred_refresh,
+            "current must index to the preferred mode's own refresh rate"
+        );
+    }
+
+    /// A real exercise of the degenerate-input guard against vkms's own
+    /// genuine "no physical size reported" connector, not just the
+    /// hand-crafted `(0, 0)` in `detect_output_scale_degenerate_zero_
+    /// size_falls_back_to_1x` above.
+    #[test]
+    #[ignore = "needs a real vkms card (`sudo modprobe vkms`) present under /dev/dri — not portable to arbitrary machines/CI without it"]
+    fn vkms_reports_a_sane_detect_output_scale() {
+        clear_output_scale_override();
+        let (_card, info) = open_vkms_card();
+        let preferred_mode = preferred_mode_of(&info);
+
+        let (phys_w, phys_h) = info.size().unwrap_or((0, 0));
+        let (mode_w, mode_h) = preferred_mode.size();
+        let scale = detect_output_scale((phys_w as i32, phys_h as i32), (mode_w as i32, mode_h as i32));
+        assert!(scale == 1.0 || scale == 2.0, "detect_output_scale should only ever return 1.0 or 2.0, got {scale}");
+    }
 }
