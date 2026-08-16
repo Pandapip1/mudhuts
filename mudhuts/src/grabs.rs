@@ -334,15 +334,14 @@ impl PointerGrab<State> for MoveSurfaceGrab {
 /// within [`REDOCK_THRESHOLD`] — used on release to decide whether a
 /// dragged-out Floating Window snaps back to docked.
 pub(crate) fn nearest_edge_within_threshold(
-    output_size: (i32, i32),
+    output_size: smithay::utils::Size<i32, Logical>,
     location: Point<i32, Logical>,
     size: smithay::utils::Size<i32, Logical>,
 ) -> Option<Edge> {
-    let (output_w, output_h) = output_size;
     let left = location.x;
-    let right = output_w - (location.x + size.w);
+    let right = output_size.w - (location.x + size.w);
     let top = location.y;
-    let bottom = output_h - (location.y + size.h);
+    let bottom = output_size.h - (location.y + size.h);
 
     let candidates = [
         (left, Edge::Left),
@@ -371,20 +370,32 @@ mod tests {
 
     #[test]
     fn picks_the_only_edge_within_threshold() {
-        let edge = nearest_edge_within_threshold((1000, 800), Point::from((10, 300)), smithay::utils::Size::from((200, 200)));
+        let edge = nearest_edge_within_threshold(
+            smithay::utils::Size::from((1000, 800)),
+            Point::from((10, 300)),
+            smithay::utils::Size::from((200, 200)),
+        );
         assert_eq!(edge, Some(Edge::Left));
     }
 
     #[test]
     fn picks_the_closest_of_several_edges_within_threshold() {
         // Near both the left (x=5) and top (y=15) edges — left should win.
-        let edge = nearest_edge_within_threshold((1000, 800), Point::from((5, 15)), smithay::utils::Size::from((200, 200)));
+        let edge = nearest_edge_within_threshold(
+            smithay::utils::Size::from((1000, 800)),
+            Point::from((5, 15)),
+            smithay::utils::Size::from((200, 200)),
+        );
         assert_eq!(edge, Some(Edge::Left));
     }
 
     #[test]
     fn none_when_nothing_is_within_threshold() {
-        let edge = nearest_edge_within_threshold((1000, 800), Point::from((400, 300)), smithay::utils::Size::from((200, 200)));
+        let edge = nearest_edge_within_threshold(
+            smithay::utils::Size::from((1000, 800)),
+            Point::from((400, 300)),
+            smithay::utils::Size::from((200, 200)),
+        );
         assert_eq!(edge, None);
     }
 
@@ -393,7 +404,11 @@ mod tests {
         // Flush against the left edge, but wide enough to overhang the
         // right edge by a lot — `right`'s raw signed distance is a large
         // negative number that must not out-rank `left`'s exact 0.
-        let edge = nearest_edge_within_threshold((1000, 800), Point::from((0, 300)), smithay::utils::Size::from((1400, 200)));
+        let edge = nearest_edge_within_threshold(
+            smithay::utils::Size::from((1000, 800)),
+            Point::from((0, 300)),
+            smithay::utils::Size::from((1400, 200)),
+        );
         assert_eq!(edge, Some(Edge::Left));
     }
 }

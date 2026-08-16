@@ -925,10 +925,10 @@ impl State {
     /// `docks.rs`'s `finish_drag`, both computing whether a drop point is
     /// near an edge. Falls back to `self.output_size` with no output
     /// mapped yet, same reasoning as `focused_usable_area_logical`.
-    pub fn focused_output_size_logical(&self) -> (i32, i32) {
+    pub fn focused_output_size_logical(&self) -> Size<i32, Logical> {
         match self.focused_real_output_geometry() {
-            Some(geo) => (geo.size.w, geo.size.h),
-            None => self.output_size,
+            Some(geo) => geo.size,
+            None => Size::from(self.output_size),
         }
     }
 
@@ -938,15 +938,15 @@ impl State {
     /// one currently has input focus (`grabs.rs`'s `MoveSurfaceGrab::unset`,
     /// which persists a drag against the window's real owning output,
     /// not necessarily the focused one by the time the drag ends).
-    pub fn output_size_logical_for(&self, output_index: usize) -> (i32, i32) {
+    pub fn output_size_logical_for(&self, output_index: usize) -> Size<i32, Logical> {
         // `(0, 0)`, not `self.output_size` — see
         // `usable_area_logical_for`'s identical fallback fix and its own
         // doc comment for why a *specific*-output accessor can't reuse
         // `focused_output_size_logical`'s "no output exists at all yet" fallback
         // for "this particular output_index doesn't exist."
         match self.real_output_geometry_for(output_index) {
-            Some(geo) => (geo.size.w, geo.size.h),
-            None => (0, 0),
+            Some(geo) => geo.size,
+            None => Size::default(),
         }
     }
 
