@@ -29,6 +29,7 @@
 //! construct or resolve.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use smithay::backend::renderer::gles::GlesRenderer;
@@ -48,19 +49,54 @@ const CONTENT_OUTPUT: &[OutputPort] = &[OutputPort { name: "content", kind: Port
 /// with a `children: HutList` input instead of an owned `Vec<Hut>`.
 pub struct TabNode {
     pub active: Signal<usize>,
-    /// Per-child tab-strip chrome caches — mirrors `TabbedHut::
-    /// label_cache`/`tab_ids`/`bg_tracker` exactly (same "parallel array,
-    /// caller keeps it in sync with `children`" convention `TileNode::
-    /// fracs` already uses; see that field's own doc comment). Consumed
-    /// by `village_chrome.rs`'s graph-based tab-strip rendering.
-    pub label_cache: Vec<crate::render::LabelCache<(String, bool)>>,
-    pub tab_ids: Vec<(smithay::backend::renderer::element::Id, smithay::backend::renderer::element::Id)>,
-    pub bg_tracker: Vec<crate::render::ChangeTracker<bool>>,
+    /// Per-child tab-strip chrome cache, keyed by the child's own
+    /// `NodeId` rather than its position in `children` (which lives
+    /// entirely separately, in `Graph::hut_list_refs` — not even a field
+    /// on this struct). An earlier version of this kept 3 separate
+    /// `Vec`s (`label_cache`/`tab_ids`/`bg_tracker`) that had to stay
+    /// index-aligned with `children` by hand, at every single mutation
+    /// site that could change `children`'s length or order — the same
+    /// "hand-followed convention, easy to miss at a new call site" shape
+    /// as bugs already found and fixed elsewhere in this codebase (see
+    /// `GraphStack::remove_exited`'s own doc comment for the keyboard-
+    /// focus analog). Keying by `NodeId` instead makes desync
+    /// structurally impossible: a removed child's entry just becomes
+    /// unreachable (still explicitly pruned in `GraphStack::remove_child`
+    /// for hygiene, but nothing breaks if it weren't — matches this
+    /// codebase's existing tolerance for other never-pruned per-id
+    /// caches, e.g. `render.rs`'s `HUT_CONTENT`), a new child lazily
+    /// gets a fresh entry on first access
+    /// (`village_chrome.rs::build`'s `.entry(id).or_insert_with(...)`),
+    /// and reordering can't desync anything since there's no position
+    /// for the cache to disagree with `children` about.
+    pub child_chrome: HashMap<NodeId, TabChildChrome>,
+}
+
+/// One child's own tab-strip chrome — see [`TabNode::child_chrome`]'s
+/// own doc comment for why this is a `HashMap` value instead of 3
+/// parallel `Vec`s.
+pub struct TabChildChrome {
+    pub label_cache: crate::render::LabelCache<(String, bool)>,
+    pub tab_ids: (smithay::backend::renderer::element::Id, smithay::backend::renderer::element::Id),
+    pub bg_tracker: crate::render::ChangeTracker<bool>,
+}
+
+impl TabChildChrome {
+    pub(crate) fn new() -> Self {
+        Self {
+            label_cache: crate::render::LabelCache::new(),
+            tab_ids: (
+                smithay::backend::renderer::element::Id::new(),
+                smithay::backend::renderer::element::Id::new(),
+            ),
+            bg_tracker: crate::render::ChangeTracker::new(),
+        }
+    }
 }
 
 impl TabNode {
     pub fn new() -> Self {
-        Self { active: Signal::new(0), label_cache: Vec::new(), tab_ids: Vec::new(), bg_tracker: Vec::new() }
+        Self { active: Signal::new(0), child_chrome: HashMap::new() }
     }
 
     /// Meta+Left/Right's own-level step, once nothing deeper had
@@ -134,17 +170,54 @@ impl Redrawable for TabNode {
     }
 }
 
+/// Resolve `children`'s own fractions from `fracs`'s `NodeId`-keyed map,
+/// defaulting a missing entry to `1.0` — shared by [`TileNode`]'s own
+/// `resolve`/`resize_to_pixels` and `GraphStack::leaf_absolute_rect`/
+/// `active_pane_offset`'s identical need (those read a `&TileNode` from
+/// outside this module, so this has to be `pub(crate)`, not private).
+/// See [`TileNode::fracs`]'s own doc comment for why a missing entry
+/// defaulting individually is strictly better than the old whole-`Vec`
+/// fallback it replaced.
+pub(crate) fn fracs_for(children: &[NodeId], fracs: &HashMap<NodeId, f64>) -> Vec<f64> {
+    children.iter().map(|c| fracs.get(c).copied().unwrap_or(1.0)).collect()
+}
+
 /// Graph-native Tile-Hut: shows every child at once, side by side along
-/// `axis` — same semantics as [`crate::hut::TileHut`]. `fracs`/`size`
-/// parallel `children` the same way `TabbedHut::label_cache`/`tab_ids`/
-/// `bg_tracker` already parallel *its* `children` today (kept in sync by
-/// whatever manipulates the list); `size` is this node's own current
-/// pixel size, set by whatever propagates a resize down the tree
-/// (mirroring `Hut::resize_to_pixels`'s existing top-down cascade).
+/// `axis` — same semantics as [`crate::hut::TileHut`]. `fracs`, like
+/// [`TabNode::child_chrome`], is keyed by each child's own `NodeId`
+/// rather than position — see that field's own doc comment for why (this
+/// used to be a positional `Vec<f64>` that had to stay index-aligned
+/// with `children` by hand, the same risk `child_chrome` was fixed for).
+/// A missing entry (a child that's never had a fraction explicitly set)
+/// defaults to `1.0` at the two read sites (`resolve`/`resize_to_pixels`)
+/// — genuinely better than the old whole-`Vec` fallback, not just
+/// differently-shaped: previously, *any* single length mismatch reset
+/// *every* child's fraction back to even, silently discarding custom
+/// pane sizing for children that hadn't changed at all; now only the
+/// genuinely-new child defaults, and every other child's own fraction is
+/// untouched.
+///
+/// **Trap for a new call site to watch for** (caught in review, fixed in
+/// `GraphStack::wrap`/`repoint`): being keyed by `NodeId` means an
+/// *in-place identity swap* — replacing one child's id with a different
+/// one at the same position in `children`, without a real removal —
+/// needs its own explicit `fracs.remove(&old)`/`fracs.insert(new, frac)`
+/// migration. The old positional `Vec<f64>` handled this for free (same
+/// index, so the value just stayed correct automatically); this map
+/// does not, since nothing ties `old`'s entry to `new` unless a caller
+/// explicitly moves it. `GraphStack::wrap` (wrapping a pane in place)
+/// and `repoint` (a Tab/Tile collapsing to its surviving child) are the
+/// two spots that do this today — any *future* code that substitutes a
+/// child's id in place needs the same migration, or a pane's custom
+/// size ratio silently resets to `1.0`.
+///
+/// `size` is this node's own current pixel size, set by whatever
+/// propagates a resize down the tree (mirroring `Hut::resize_to_pixels`'s
+/// existing top-down cascade).
 pub struct TileNode {
     pub axis: Axis,
     pub active: Signal<usize>,
-    pub fracs: Vec<f64>,
+    pub fracs: HashMap<NodeId, f64>,
     pub size: (i32, i32),
     /// Stable identities for the 4 border strips drawn around whichever
     /// pane is `active` — mirrors `TileHut::highlight_ids` exactly (see
@@ -160,7 +233,7 @@ impl TileNode {
         Self {
             axis,
             active: Signal::new(0),
-            fracs: Vec::new(),
+            fracs: HashMap::new(),
             size: (0, 0),
             highlight_ids: [
                 smithay::backend::renderer::element::Id::new(),
@@ -209,20 +282,7 @@ impl<Env> Node<Env> for TileNode {
         // output's absolute position (that final translation happens
         // once, at the top of the tree).
         let children = graph.hut_list_input(self_id, "children");
-        // `self.fracs` is a caller-maintained parallel array (see this
-        // struct's doc comment) — if it's ever out of sync with
-        // `children`'s current length (a caller updated one and forgot
-        // the other), falling back to even fracs here means the real
-        // failure mode is "this pane's share of the tile is wrong until
-        // whatever forgot to update `fracs` is fixed," not "every pane
-        // past the mismatch silently vanishes" (a `zip` against a
-        // shorter `rects` would drop them entirely, an easy-to-miss bug
-        // since nothing panics or logs).
-        let fracs = if self.fracs.len() == children.len() {
-            self.fracs.clone()
-        } else {
-            vec![1.0; children.len()]
-        };
+        let fracs = fracs_for(&children, &self.fracs);
         let rects = crate::hut::pane_rects(self.axis, fracs.into_iter(), self.size);
         let mut pieces = Vec::new();
         for (&child, (px, py, _, _)) in children.iter().zip(rects) {
@@ -249,7 +309,7 @@ impl<Env> Node<Env> for TileNode {
 
     fn resize_to_pixels(&mut self, graph: &mut Graph<Env>, self_id: NodeId, width: i32, height: i32) {
         let children = graph.hut_list_input(self_id, "children");
-        let fracs = if self.fracs.len() == children.len() { self.fracs.clone() } else { vec![1.0; children.len()] };
+        let fracs = fracs_for(&children, &self.fracs);
         self.size = (width, height);
         let rects = crate::hut::pane_rects(self.axis, fracs.into_iter(), (width, height));
         for (child, (_, _, w, h)) in children.into_iter().zip(rects) {
@@ -952,7 +1012,8 @@ mod tests {
         let (a, a_resized) = leaf_with_size_tracking(&mut graph);
         let (b, b_resized) = leaf_with_size_tracking(&mut graph);
         let mut tile = TileNode::new(Axis::Horizontal);
-        tile.fracs = vec![1.0, 1.0];
+        tile.fracs.insert(a, 1.0);
+        tile.fracs.insert(b, 1.0);
         let tile_id = graph.add_node(Box::new(tile));
         graph.set_hut_list(tile_id, "children", vec![a, b]).unwrap();
 

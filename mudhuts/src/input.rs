@@ -459,11 +459,7 @@ impl State {
         if let Some(tile) = self.stack.graph().downcast::<crate::graph_nodes::TileNode>(top) {
             let children = self.stack.graph().hut_list_input(top, "children");
             if children.len() >= 2 {
-                let fracs = if tile.fracs.len() == children.len() {
-                    tile.fracs.clone()
-                } else {
-                    vec![1.0; children.len()]
-                };
+                let fracs = crate::graph_nodes::fracs_for(&children, &tile.fracs);
                 let axis = tile.axis;
                 let rects = crate::hut::pane_rects(axis, fracs.into_iter(), (area.size.w, area.size.h))
                     .into_iter()

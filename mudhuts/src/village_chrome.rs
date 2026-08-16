@@ -15,11 +15,11 @@
 //!
 //! Migration step 4: rewritten against the typed graph
 //! (`docs/rfcs/typed-graph-hut.md`) — operates on `NodeId`/`Graph<
-//! RenderEnv>` instead of `&Hut`/`&mut Hut`. `TabNode`'s own `label_cache`/
-//! `tab_ids`/`bg_tracker` fields play exactly the role `TabbedHut`'s did.
+//! RenderEnv>` instead of `&Hut`/`&mut Hut`. `TabNode`'s own
+//! `child_chrome` map plays exactly the role `TabbedHut`'s
+//! `label_cache`/`tab_ids`/`bg_tracker` did.
 
 use smithay::backend::renderer::Renderer;
-use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::texture::TextureRenderElement;
@@ -29,7 +29,7 @@ use smithay::utils::{Physical, Point, Rectangle, Size, Transform};
 use crate::chrome::{to_color32f, window_title};
 use crate::graph::{Graph, NodeId};
 use crate::graph_nodes::{ConsoleNode, RenderEnv, TabNode};
-use crate::render::{ChangeTracker, LabelCache, OutputRenderElements};
+use crate::render::OutputRenderElements;
 use crate::space_element::HutSpaceRenderElement;
 use crate::theme::Theme;
 
@@ -197,20 +197,16 @@ pub fn build(
             .as_any_mut()
             .downcast_mut::<TabNode>()
             .expect("already confirmed to be a TabNode above");
-
-        // Grow the per-child label cache/ids/bg-tracker lazily to match
-        // `children` — see `TabNode::label_cache`'s doc comment; only
-        // ever grows here (shrinking happens wherever a child is
-        // actually removed from the list).
-        while tab.label_cache.len() < children.len() {
-            tab.label_cache.push(LabelCache::new());
-            tab.tab_ids.push((Id::new(), Id::new()));
-            tab.bg_tracker.push(ChangeTracker::new());
-        }
         active_index = *tab.active;
 
         for TabRect { index: i, rect } in &rects {
             let i = *i;
+            let child_id = children[i];
+            // Lazily creates this child's own chrome entry on first
+            // access — see `TabNode::child_chrome`'s own doc comment for
+            // why this replaced a grow-only `while ... .len() < ...`
+            // loop over 3 separate parallel `Vec`s.
+            let chrome = tab.child_chrome.entry(child_id).or_insert_with(crate::graph_nodes::TabChildChrome::new);
             let active = active_index == i;
             let (fg, bg) = if active {
                 (theme.hut_tab_active_fg, theme.hut_tab_active_bg)
@@ -220,23 +216,23 @@ pub fn build(
             let label = labels[i].clone();
             let key = (label.clone(), active);
 
-            let child_leaf = graph.focused_leaf(children[i]);
+            let child_leaf = graph.focused_leaf(child_id);
             let mut render = |graph: &mut Graph<RenderEnv>| {
                 graph
                     .downcast_mut::<ConsoleNode>(child_leaf)
                     .ok_or_else(|| "no ConsoleHut for this tab".to_string())
                     .and_then(|console| console.hut.render_label(renderer, &label, fg, bg))
             };
-            let texture = if tab.label_cache[i].is_stale(&key) {
-                render(graph).map(|texture| tab.label_cache[i].store(key, texture))
+            let texture = if chrome.label_cache.is_stale(&key) {
+                render(graph).map(|texture| chrome.label_cache.store(key, texture))
             } else {
-                match tab.label_cache[i].cached() {
+                match chrome.label_cache.cached() {
                     Some(cached) => Ok(cached),
-                    None => render(graph).map(|texture| tab.label_cache[i].store(key, texture)),
+                    None => render(graph).map(|texture| chrome.label_cache.store(key, texture)),
                 }
             };
 
-            let (text_id, bg_id) = tab.tab_ids[i].clone();
+            let (text_id, bg_id) = chrome.tab_ids.clone();
             match texture {
                 Ok((texture, snapshot)) => {
                     let text = TextureRenderElement::from_texture_with_damage(
@@ -258,7 +254,7 @@ pub fn build(
                 Err(err) => tracing::warn!("failed to render Hut tab label {label:?}: {err}"),
             }
 
-            let bg_commit = tab.bg_tracker[i].commit(active);
+            let bg_commit = chrome.bg_tracker.commit(active);
             let background =
                 SolidColorRenderElement::new(bg_id, *rect, bg_commit, to_color32f(bg), Kind::Unspecified);
             elements.push(Element::from(background));

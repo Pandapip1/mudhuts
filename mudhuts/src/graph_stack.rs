@@ -31,7 +31,7 @@ use mudhuts_term::TermEvent;
 use crate::State;
 use crate::console_hut::ConsoleHut;
 use crate::graph::{Graph, Node, NodeId};
-use crate::graph_nodes::{ConsoleNode, RenderEnv, TabNode, TileNode};
+use crate::graph_nodes::{ConsoleNode, RenderEnv, TabNode, TileNode, fracs_for};
 use crate::hut::{Axis, Direction};
 use crate::redraw::{Redrawable, RedrawHandle};
 
@@ -500,7 +500,7 @@ impl GraphStack {
         }
         if let Some(tile) = self.graph.downcast::<TileNode>(top) {
             let children = self.graph.hut_list_input(top, "children");
-            let fracs = if tile.fracs.len() == children.len() { tile.fracs.clone() } else { vec![1.0; children.len()] };
+            let fracs = fracs_for(&children, &tile.fracs);
             let rects: Vec<_> = crate::hut::pane_rects(tile.axis, fracs.into_iter(), (area.2, area.3))
                 .into_iter()
                 .map(|(x, y, w, h)| (x + area.0, y + area.1, w, h))
@@ -541,7 +541,7 @@ impl GraphStack {
         if children.len() < 2 {
             return (area.0 as f64, area.1 as f64);
         }
-        let fracs = if tile.fracs.len() == children.len() { tile.fracs.clone() } else { vec![1.0; children.len()] };
+        let fracs = fracs_for(&children, &tile.fracs);
         let rects = crate::hut::pane_rects(tile.axis, fracs.into_iter(), (area.2, area.3));
         let (x, y, _, _) = rects[(*tile.active).min(rects.len().saturating_sub(1))];
         ((area.0 + x) as f64, (area.1 + y) as f64)
@@ -875,7 +875,8 @@ impl GraphStack {
             }
             WrapKind::Tile(axis) => {
                 let mut tile = TileNode::new(axis);
-                tile.fracs = vec![0.5, 0.5];
+                tile.fracs.insert(new_id, 0.5);
+                tile.fracs.insert(focused_leaf, 0.5);
                 *tile.active = 1;
                 Redrawable::attach_redraw_handle(&mut tile, self.redraw.clone());
                 let wrapped_id = self.graph.add_node(Box::new(tile));
@@ -897,13 +898,12 @@ impl GraphStack {
             // the path — at the new wrapper instead. Replacing *in
             // place* at the same list index means the parent's own
             // `active` index (still pointing at that position) stays
-            // correct automatically, no adjustment needed.
+            // correct automatically, no adjustment needed. See
+            // `swap_child_in_place`'s own doc comment for the
+            // `TileNode::fracs`/`TabNode::child_chrome` bookkeeping this
+            // also has to carry along.
             let parent = path[path.len() - 2];
-            let mut children = self.graph.hut_list_input(parent, "children");
-            if let Some(pos) = children.iter().position(|&c| c == focused_leaf) {
-                children[pos] = wrapped_id;
-            }
-            self.graph.set_hut_list(parent, "children", children).map_err(|err| format!("{err:?}"))?;
+            self.swap_child_in_place(parent, focused_leaf, wrapped_id);
         }
 
         self.redraw.mark_dirty();
@@ -1216,9 +1216,7 @@ impl GraphStack {
                 self.graph.remove_node(parent);
             } else {
                 // `parent` survives with a shorter `children` list —
-                // clamp its own `active` index to match, and shrink
-                // whatever parallel per-child arrays it carries at the
-                // same `removed_index`. Without the `active` clamp, a
+                // clamp its own `active` index to match. Without this, a
                 // removal of anything but the *last* child left `active`
                 // pointing past the end of the shrunk list whenever it
                 // had been pointing at (or past) the removed slot:
@@ -1228,14 +1226,6 @@ impl GraphStack {
                 // the next `GraphStack::focused()`/`focused_mut()` (etc.)
                 // call panics trying to downcast that non-`ConsoleNode`
                 // "leaf" — see this codebase's standing no-panics rule.
-                // Without the parallel-array shrink, `TabNode`'s own doc
-                // comment on `label_cache`/`tab_ids`/`bg_tracker`
-                // ("shrinking happens wherever a child is actually
-                // removed from the list") went unfulfilled: every index
-                // after the removed one silently referred to the wrong
-                // child's cached label/`Id`/background from then on,
-                // and the arrays only ever grew, never shrank, across a
-                // long session of repeated tab open/close.
                 let new_len = children.len();
                 let _ = self.graph.set_hut_list(parent, "children", children);
                 // Shift/clamp `active` — see `hut::shift_active_index_on_removal`'s
@@ -1243,21 +1233,18 @@ impl GraphStack {
                 // enough (it would leave `active` pointing at the *next*
                 // child over whenever the removed one was before it,
                 // silently changing which tab/pane reads as focused).
+                // Pruning `target`'s own `child_chrome`/`fracs` entry
+                // isn't load-bearing (see `TabNode::child_chrome`'s doc
+                // comment — a `NodeId`-keyed cache can't desync from a
+                // shorter/reordered `children` the way the old positional
+                // `Vec`s could), just cheap hygiene against unbounded
+                // growth across a long session of repeated tab/pane
+                // open-close.
                 if let Some(tab) = self.graph.downcast_mut::<TabNode>(parent) {
-                    if removed_index < tab.label_cache.len() {
-                        tab.label_cache.remove(removed_index);
-                    }
-                    if removed_index < tab.tab_ids.len() {
-                        tab.tab_ids.remove(removed_index);
-                    }
-                    if removed_index < tab.bg_tracker.len() {
-                        tab.bg_tracker.remove(removed_index);
-                    }
+                    tab.child_chrome.remove(&target);
                     *tab.active = crate::hut::shift_active_index_on_removal(*tab.active, removed_index, new_len);
                 } else if let Some(tile) = self.graph.downcast_mut::<TileNode>(parent) {
-                    if removed_index < tile.fracs.len() {
-                        tile.fracs.remove(removed_index);
-                    }
+                    tile.fracs.remove(&target);
                     *tile.active = crate::hut::shift_active_index_on_removal(*tile.active, removed_index, new_len);
                 }
             }
@@ -1267,7 +1254,11 @@ impl GraphStack {
 
     /// Replace every reference to `old` (a top-level slot, or an entry
     /// in some other node's `children` list) with `new` — the
-    /// "collapse" half of [`Self::remove_child`].
+    /// "collapse" half of [`Self::remove_child`]. `swap_child_in_place`
+    /// (below) is what actually finds and rewrites each node's own
+    /// `children` list — this just tries every node as a candidate
+    /// `parent`, relying on that helper's own no-op-if-`old`-isn't-there
+    /// behavior for the ones that don't reference it.
     fn repoint(&mut self, old: NodeId, new: NodeId) {
         for out in &mut self.outputs {
             for hut in &mut out.huts {
@@ -1277,17 +1268,66 @@ impl GraphStack {
             }
         }
         for parent in self.all_node_ids() {
-            let mut children = self.graph.hut_list_input(parent, "children");
-            let mut changed = false;
-            for child in &mut children {
-                if *child == old {
-                    *child = new;
-                    changed = true;
-                }
+            self.swap_child_in_place(parent, old, new);
+        }
+    }
+
+    /// Replace `old` with `new` at whatever position it currently
+    /// occupies in `parent`'s own `children` list — a no-op if `old`
+    /// isn't actually one of `parent`'s children. Shared by [`Self::wrap`]
+    /// (a pane getting wrapped in a new Tab/Tile, in place) and
+    /// [`Self::repoint`] (a Tab/Tile collapsing to its one surviving
+    /// child) — both are "this child's own identity changed but it's
+    /// still logically the same slot" operations, previously each
+    /// hand-rolling the same `children[pos] = new` swap plus its own
+    /// copy of the `TileNode::fracs`/`TabNode::child_chrome` bookkeeping
+    /// below. Caught in review as its own risk once duplicated: the
+    /// bookkeeping itself is a hand-followed convention no different in
+    /// shape from the parallel-array bug this `NodeId`-keyed design was
+    /// introduced to eliminate — any *third* future in-place-swap call
+    /// site copy-pasting the pattern instead of calling this would be
+    /// just as easy to get wrong as the original bug. Consolidating to
+    /// one call site removes that risk instead of just documenting it.
+    ///
+    /// `TileNode::fracs`'s entry migrates from `old` to `new` (a user-
+    /// chosen pane-size ratio would otherwise be silently lost — see
+    /// that field's own doc comment). `TabNode::child_chrome`'s entry is
+    /// only pruned, not migrated — a render-cache entry regenerating
+    /// fresh under `new`'s id on the next frame is correct, cheap
+    /// behavior, not data loss; leaving `old`'s entry behind instead
+    /// (the original, review-caught gap) would leak a `LabelCache`/two
+    /// `Id`s/a `ChangeTracker` per swap, unboundedly, across a long-lived
+    /// daily-driver session.
+    fn swap_child_in_place(&mut self, parent: NodeId, old: NodeId, new: NodeId) {
+        let mut children = self.graph.hut_list_input(parent, "children");
+        let Some(pos) = children.iter().position(|&c| c == old) else {
+            return;
+        };
+        children[pos] = new;
+        // Not reachable today — `parent` only ever arrives here already
+        // proven to have a valid `children` `HutList` port (both callers
+        // reach it via `focused_path`/`hut_list_input`'s own successful
+        // read a few lines above, which only ever recurses through real
+        // Tab/Tile nodes) — but `wrap`'s own call site used to propagate
+        // this exact failure via `?` before it was folded into this
+        // shared helper (caught in review: silently discarding it would
+        // have been a real, if currently-unreachable, narrowing of that
+        // error contract — `wrap_tab`/`wrap_tile` could report success
+        // while leaving a freshly-spawned ConsoleHut and wrapper node
+        // fully configured but orphaned, unreachable from any parent).
+        // Logged rather than propagated: `repoint`'s own call site (the
+        // other caller) has no `Result` to propagate through, and this
+        // codebase's own no-panics convention prefers "log and continue"
+        // over introducing a new way for either caller to fail.
+        if let Err(err) = self.graph.set_hut_list(parent, "children", children) {
+            tracing::warn!("swap_child_in_place: failed to relink {parent:?}'s children: {err:?}");
+        }
+        if let Some(tile) = self.graph.downcast_mut::<TileNode>(parent) {
+            if let Some(frac) = tile.fracs.remove(&old) {
+                tile.fracs.insert(new, frac);
             }
-            if changed {
-                let _ = self.graph.set_hut_list(parent, "children", children);
-            }
+        } else if let Some(tab) = self.graph.downcast_mut::<TabNode>(parent) {
+            tab.child_chrome.remove(&old);
         }
     }
 }
@@ -1444,6 +1484,80 @@ mod tests {
     }
 
     #[test]
+    fn wrap_focused_migrates_the_tile_pane_fraction_to_the_new_wrapper() {
+        // Regression case caught in review: `TileNode::fracs` is keyed
+        // by `NodeId` (see its own doc comment's "trap for a new call
+        // site" section), and `wrap`'s in-place `children[pos] =
+        // wrapped_id` swap doesn't automatically carry a pane's custom
+        // fraction over to the new id the way the old positional
+        // `Vec<f64>` did for free.
+        let mut stack = new_stack();
+        stack.wrap_tile().unwrap(); // Tile[new_hut, orig], fracs = {new_hut: 0.5, orig: 0.5}
+        let tile_id = stack.focused_top_level();
+        let before = stack.graph().hut_list_input(tile_id, "children");
+        assert_eq!(before.len(), 2);
+        let orig_pane_id = before[1];
+
+        stack.wrap_tab().unwrap(); // wraps the focused (orig) pane into a new Tab node, in place
+
+        let after = stack.graph().hut_list_input(tile_id, "children");
+        assert_eq!(after.len(), 2, "still just the 2 original panes");
+        assert_ne!(after[1], orig_pane_id, "the wrapped pane's own id changed (it's now the new Tab node)");
+        let tile = stack.graph().downcast::<TileNode>(tile_id).unwrap();
+        let fracs = crate::graph_nodes::fracs_for(&after, &tile.fracs);
+        assert_eq!(
+            fracs,
+            vec![0.5, 0.5],
+            "the wrapped pane's custom 50/50 split survived the in-place identity swap, not silently reset to the 1.0 default"
+        );
+    }
+
+    #[test]
+    fn collapsing_a_tab_inside_a_tile_migrates_the_tile_pane_fraction() {
+        // Regression case caught in review, same root cause as `wrap`'s
+        // identical fix: `repoint` (called when a Tab/Tile collapses to
+        // its one surviving child — `remove_child`'s collapse branch)
+        // does the same in-place "swap this child's own id for a
+        // different one, same position" substitution `wrap` does, so an
+        // ancestor `TileNode`'s own `fracs` entry needs the same
+        // explicit migration.
+        let mut stack = new_stack();
+        let b_id = stack.spawn_and_insert().unwrap();
+        stack.spawn_and_insert().unwrap();
+        let node_ids: Vec<NodeId> = stack.outputs[0].huts.drain(..).collect();
+        assert_eq!(node_ids.len(), 3);
+        let (a_node, b_node, c_node) = (node_ids[0], node_ids[1], node_ids[2]);
+
+        // TabNode(b, c)
+        let mut tab = TabNode::new();
+        Redrawable::attach_redraw_handle(&mut tab, stack.redraw.clone());
+        let tab_id = stack.graph.add_node(Box::new(tab));
+        stack.graph.set_hut_list(tab_id, "children", vec![b_node, c_node]).unwrap();
+
+        // TileNode[a, TabNode(b, c)], with a custom 30/70 split.
+        let mut tile = TileNode::new(Axis::Horizontal);
+        tile.fracs.insert(a_node, 0.3);
+        tile.fracs.insert(tab_id, 0.7);
+        Redrawable::attach_redraw_handle(&mut tile, stack.redraw.clone());
+        let tile_id = stack.graph.add_node(Box::new(tile));
+        stack.graph.set_hut_list(tile_id, "children", vec![a_node, tab_id]).unwrap();
+        stack.outputs[0].huts.push(tile_id);
+        stack.outputs[0].current = 0;
+
+        stack.remove_exited(b_id).unwrap(); // b leaves TabNode(b,c), which collapses to c via repoint(tab_id, c_node)
+
+        let children = stack.graph.hut_list_input(tile_id, "children");
+        assert_eq!(children, vec![a_node, c_node], "the collapsed Tab node was replaced by its survivor c");
+        let tile = stack.graph.downcast::<TileNode>(tile_id).unwrap();
+        let fracs = crate::graph_nodes::fracs_for(&children, &tile.fracs);
+        assert_eq!(
+            fracs,
+            vec![0.3, 0.7],
+            "the collapsing Tab's own 0.7 share migrated to its survivor c, not reset to the 1.0 default"
+        );
+    }
+
+    #[test]
     fn cycle_innermost_bubbles_up_and_wraps() {
         let mut stack = new_stack();
         let original_id = stack.focused().id;
@@ -1512,14 +1626,16 @@ mod tests {
     }
 
     #[test]
-    fn remove_child_clamps_active_and_shrinks_tab_node_caches() {
+    fn remove_child_clamps_active_and_prunes_tab_node_cache() {
         // Regression case: closing a non-last tabbed pane used to leave
         // `TabNode::active` pointing past the end of the shrunk
         // `children` list (eventually panicking via `focused()`'s
-        // `ConsoleNode` downcast `.expect()`), and its parallel
-        // `label_cache`/`tab_ids`/`bg_tracker` arrays never shrank at
-        // all, silently misattributing a removed tab's cached chrome to
-        // whichever child slid into its old index.
+        // `ConsoleNode` downcast `.expect()`). `child_chrome` being
+        // `NodeId`-keyed means it can't desync from `children` the way
+        // the old positional `Vec`s could — this now also checks that
+        // the removed child's own cache entry is actually pruned (cheap
+        // hygiene, not load-bearing correctness) and that the survivors'
+        // entries are untouched, not just "the right count remains".
         let mut stack = new_stack();
         let b_id = stack.spawn_and_insert().unwrap();
         stack.spawn_and_insert().unwrap();
@@ -1537,14 +1653,12 @@ mod tests {
         stack.outputs[0].huts.push(tab_id);
         stack.outputs[0].current = 0;
 
-        // Grow the per-child caches to 3 entries, the same way a real
-        // render pass would (village_chrome.rs's own grow loop).
+        // Seed the per-child cache for all 3, the same way a real render
+        // pass would (village_chrome.rs's own `.entry(...).or_insert_with(...)`).
         stack.graph.with_node_mut(tab_id, |node, _graph| {
             let tab = node.as_any_mut().downcast_mut::<TabNode>().unwrap();
-            while tab.label_cache.len() < 3 {
-                tab.label_cache.push(crate::render::LabelCache::new());
-                tab.tab_ids.push((smithay::backend::renderer::element::Id::new(), smithay::backend::renderer::element::Id::new()));
-                tab.bg_tracker.push(crate::render::ChangeTracker::new());
+            for &id in &node_ids {
+                tab.child_chrome.entry(id).or_insert_with(crate::graph_nodes::TabChildChrome::new);
             }
         });
 
@@ -1554,9 +1668,10 @@ mod tests {
         assert_eq!(children, vec![node_ids[0], node_ids[2]], "the middle child (b) is gone, the rest kept its order");
         let tab = stack.graph.downcast::<TabNode>(tab_id).unwrap();
         assert_eq!(*tab.active, 1, "clamped from 2 down to the new last valid index");
-        assert_eq!(tab.label_cache.len(), 2, "shrunk in step with children");
-        assert_eq!(tab.tab_ids.len(), 2);
-        assert_eq!(tab.bg_tracker.len(), 2);
+        assert_eq!(tab.child_chrome.len(), 2, "the removed child's own cache entry was pruned");
+        assert!(tab.child_chrome.contains_key(&node_ids[0]));
+        assert!(tab.child_chrome.contains_key(&node_ids[2]));
+        assert!(!tab.child_chrome.contains_key(&node_ids[1]), "the removed middle child (b)'s own entry is gone");
     }
 
     #[test]

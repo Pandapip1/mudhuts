@@ -615,10 +615,10 @@ fn content_elements(
 
     let top = state.stack.focused_top_level_for(output_index);
     if let Some(tile) = state.stack.graph().downcast::<crate::graph_nodes::TileNode>(top) {
-        let children_len = state.stack.graph().hut_list_input(top, "children").len();
-        if children_len >= 2 {
-            let fracs = if tile.fracs.len() == children_len { tile.fracs.clone() } else { vec![1.0; children_len] };
-            let active = (*tile.active).min(children_len.saturating_sub(1));
+        let children = state.stack.graph().hut_list_input(top, "children");
+        if children.len() >= 2 {
+            let fracs = crate::graph_nodes::fracs_for(&children, &tile.fracs);
+            let active = (*tile.active).min(children.len().saturating_sub(1));
             let highlight_ids = tile.highlight_ids.clone();
             let rects = crate::hut::pane_rects(tile.axis, fracs.into_iter(), (area.size.w, area.size.h));
             if let Some(&(x, y, w, h)) = rects.get(active) {
