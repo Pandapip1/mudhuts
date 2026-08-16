@@ -762,6 +762,82 @@ fn connector_bool_property(drm_device: &DrmDevice, connector: connector::Handle,
         .unwrap_or(false)
 }
 
+/// Whether a connector should be offered for DRM leasing instead of used
+/// as a desktop output — `non_desktop` alone (a real DRM/EDID-reported
+/// property, read by the caller via `connector_bool_property`) plus
+/// defense-in-depth: the built-in panel must never be leasable regardless
+/// of what a driver reports (see the module doc's DRM-leasing section).
+/// Pulled out as a pure function over `connector::Interface` (a plain,
+/// freely-constructible enum — not the FFI-opaque `connector::Info`/
+/// `DrmMode` types this module otherwise deals with) specifically so this
+/// safety-critical rule is unit-testable without a live DRM device.
+fn is_leasable(non_desktop: bool, interface: connector::Interface) -> bool {
+    non_desktop
+        && !matches!(
+            interface,
+            connector::Interface::EmbeddedDisplayPort
+                | connector::Interface::LVDS
+                | connector::Interface::DSI
+                | connector::Interface::DPI
+        )
+}
+
+/// Which index into a connector's own `modes()` list is flagged
+/// `ModeTypeFlags::PREFERRED` — `is_preferred[i]` is that flag for mode
+/// `i`, same order `connector.modes()` itself returns. Falls back to `0`
+/// if nothing is flagged (a driver quirk, not something to panic over —
+/// `connector_connected`'s own caller already treats "no usable modes at
+/// all" as a separate, later failure). Pulled out over a plain `&[bool]`
+/// rather than `&[DrmMode]` since `DrmMode` is FFI-opaque with no public
+/// test constructor, but the actual selection logic never needed
+/// anything but the flag itself.
+fn pick_preferred_mode_index(is_preferred: &[bool]) -> usize {
+    is_preferred.iter().position(|&p| p).unwrap_or(0)
+}
+
+/// The sort/dedup/current-index bookkeeping `connector_connected`'s
+/// adaptive-refresh setup needs, over plain millihertz refresh values
+/// (`smithay::output::Mode::refresh`'s own field type) rather than real
+/// `DrmMode`s (FFI-opaque, no public constructor — the reason this logic
+/// was never testable before). `refreshes` is one value per real mode
+/// already filtered to a single resolution, in `connector.modes()`'s own
+/// order; the caller re-applies the returned index order to the real
+/// `Vec<DrmMode>` it still needs to keep around for the actual
+/// `DrmOutput::use_mode` calls this feeds into later.
+///
+/// Returns `(order, current)` — `order[k]` is the original index of the
+/// mode with the `k`-th smallest distinct refresh rate (ascending,
+/// deduped — same as the old `sort_by_key`+`dedup_by_key` in place),
+/// `current` is which position in `order` corresponds to
+/// `preferred_refresh` (falling back to the highest available rate,
+/// `order.len() - 1`, if that exact value somehow isn't among the
+/// survivors — shouldn't happen, `preferred_refresh` is itself one of
+/// `refreshes`, but a defensible default beats panicking on a driver
+/// quirk). `None` if fewer than 2 distinct rates survive (nothing to
+/// adapt between) — mirrors the real caller's own `modes.len() < 2` bail.
+fn build_adaptive_refresh_order(refreshes: &[i32], preferred_refresh: i32) -> Option<(Vec<usize>, usize)> {
+    let mut order: Vec<usize> = (0..refreshes.len()).collect();
+    order.sort_by_key(|&i| refreshes[i]);
+    order.dedup_by_key(|&mut i| refreshes[i]);
+    if order.len() < 2 {
+        return None;
+    }
+    let current = order.iter().position(|&i| refreshes[i] == preferred_refresh).unwrap_or(order.len() - 1);
+    Some((order, current))
+}
+
+/// Where a newly-hotplugged output slot should sit, real multi-monitor's
+/// side-by-side-to-the-right-of-everything-else layout policy (see
+/// `connector_connected`'s own comment on this) — `existing` is
+/// `(position.x, mode width in pixels, scale)` per already-known output
+/// slot. Pulled out over these primitives rather than the real
+/// `OutputSlot`/`Output` types since neither is the blocker here (both
+/// are freely constructible) — the real blocker is `GraphStack`/`State`,
+/// heavyweight to build just to exercise this one arithmetic fold.
+fn next_output_x(existing: &[(i32, i32, f64)]) -> i32 {
+    existing.iter().map(|&(x, w, scale)| x + (w as f64 / scale).round() as i32).max().unwrap_or(0)
+}
+
 fn connector_connected(
     state: &mut State,
     inner: &Rc<RefCell<Inner>>,
@@ -775,22 +851,12 @@ fn connector_connected(
     // Leasable ("non-desktop") vs. desktop connector — see the module
     // doc's DRM-leasing section. Checked before any desktop `Output`
     // setup below: a leasable connector never gets one at all.
-    let is_leasable = {
+    let non_desktop = {
         let inner_ref = inner.borrow();
         let drm_device = inner_ref.drm_output_manager.device();
-        let non_desktop = connector_bool_property(drm_device, connector.handle(), "non-desktop");
-        // Defense-in-depth: `non-desktop` alone depends on driver/EDID
-        // correctness, and the built-in panel must never be leasable
-        // regardless — see the module doc.
-        non_desktop
-            && !matches!(
-                connector.interface(),
-                connector::Interface::EmbeddedDisplayPort
-                    | connector::Interface::LVDS
-                    | connector::Interface::DSI
-                    | connector::Interface::DPI
-            )
+        connector_bool_property(drm_device, connector.handle(), "non-desktop")
     };
+    let is_leasable = is_leasable(non_desktop, connector.interface());
 
     if is_leasable {
         tracing::info!(
@@ -804,11 +870,9 @@ fn connector_connected(
         return;
     }
 
-    let mode_id = connector
-        .modes()
-        .iter()
-        .position(|mode| mode.mode_type().contains(ModeTypeFlags::PREFERRED))
-        .unwrap_or(0);
+    let is_preferred: Vec<bool> =
+        connector.modes().iter().map(|mode| mode.mode_type().contains(ModeTypeFlags::PREFERRED)).collect();
+    let mode_id = pick_preferred_mode_index(&is_preferred);
     let Some(&drm_mode) = connector.modes().get(mode_id) else {
         tracing::warn!("connector {output_name} has no usable modes, skipping");
         return;
@@ -835,25 +899,13 @@ fn connector_connected(
         if vrr_capable || !state.display_config.adaptive_refresh_rate {
             None
         } else {
-            let mut modes: Vec<DrmMode> =
+            let raw_modes: Vec<DrmMode> =
                 connector.modes().iter().copied().filter(|m| m.size() == drm_mode.size()).collect();
-            modes.sort_by_key(|m| WlMode::from(*m).refresh);
-            modes.dedup_by_key(|m| WlMode::from(*m).refresh);
-            if modes.len() < 2 {
-                None
-            } else {
-                // Wherever the preferred mode we just picked above landed
-                // in the sorted list — falls back to the highest available
-                // rate if that exact refresh somehow isn't in the
-                // deduped list (shouldn't happen: `drm_mode` is itself one
-                // of `connector.modes()`), matching a defensible default
-                // rather than panicking on a driver quirk.
-                let current = modes
-                    .iter()
-                    .position(|m| WlMode::from(*m).refresh == wl_mode.refresh)
-                    .unwrap_or(modes.len() - 1);
-                Some(AdaptiveRefresh { modes, current, frames_since_check: 0, pending: None })
-            }
+            let refreshes: Vec<i32> = raw_modes.iter().map(|m| WlMode::from(*m).refresh).collect();
+            build_adaptive_refresh_order(&refreshes, wl_mode.refresh).map(|(order, current)| {
+                let modes: Vec<DrmMode> = order.iter().map(|&i| raw_modes[i]).collect();
+                AdaptiveRefresh { modes, current, frames_since_check: 0, pending: None }
+            })
         }
     };
 
@@ -923,18 +975,17 @@ fn connector_connected(
         if inner_ref.surfaces.is_empty() {
             0
         } else {
-            let next_x: i32 = state
+            let existing: Vec<(i32, i32, f64)> = state
                 .stack
                 .outputs()
                 .iter()
                 .filter_map(|slot| {
                     let mode = slot.output.current_mode()?;
                     let scale = slot.output.current_scale().fractional_scale();
-                    let w = (mode.size.w as f64 / scale).round() as i32;
-                    Some(slot.position.x + w)
+                    Some((slot.position.x, mode.size.w, scale))
                 })
-                .max()
-                .unwrap_or(0);
+                .collect();
+            let next_x = next_output_x(&existing);
             drop(inner_ref);
             let position = Point::<i32, smithay::utils::Logical>::from((next_x, 0));
             // Real position, not the `(0, 0)` `change_current_state` was
@@ -1493,16 +1544,27 @@ fn check_adaptive_refresh(state: &mut State, inner: &Rc<RefCell<Inner>>) {
     }
 }
 
+/// Whole Hz, not millihertz, since `AdaptiveRefresh::frames_since_check`
+/// is itself only ever an integer-frames-per-second-ish sample — matching
+/// precision to what the input signal actually supports rather than a
+/// false sense of sub-hertz accuracy. `.max(0.0)` before the final cast:
+/// a negative millihertz value shouldn't occur in practice, but a
+/// straight negative-float-to-`u32` cast is itself well-defined-but-
+/// surprising (saturates to `0` since Rust 1.45, not the C-style
+/// wraparound it used to be) — the explicit clamp makes that intent
+/// visible rather than relying on the cast's own current behavior.
+fn millihertz_to_hz(millihertz: i32) -> u32 {
+    (millihertz as f64 / 1000.0).round().max(0.0) as u32
+}
+
 /// A `drm::control::Mode`'s own refresh rate, in whole Hz — rounded from
 /// [`WlMode::from`]'s millihertz (see its own doc comment for the exact
 /// conversion, which accounts for interlace/doublescan/vscan rather than
-/// reading a raw field). Whole Hz, not millihertz, since
-/// `AdaptiveRefresh::frames_since_check` is itself only ever an
-/// integer-frames-per-second-ish sample — matching precision to what the
-/// input signal actually supports rather than a false sense of
-/// sub-hertz accuracy.
+/// reading a raw field). Thin wrapper over [`millihertz_to_hz`] (the real
+/// unit-conversion logic, pulled out as a pure function since `DrmMode`
+/// itself is FFI-opaque with no public test constructor).
 fn refresh_hz(mode: &DrmMode) -> u32 {
-    (WlMode::from(*mode).refresh as f64 / 1000.0).round().max(0.0) as u32
+    millihertz_to_hz(WlMode::from(*mode).refresh)
 }
 
 /// Build this frame's cursor render element(s) at `state.pointer_location`
@@ -1606,10 +1668,7 @@ fn build_cursor_elements(
                     // same buffer-scale-vs-logical-size trap as
                     // `render::texture_buffer_scale`'s doc comment, just
                     // for a hotspot offset instead of an element size.
-                    Point::from((
-                        (image.xhot as f64 / scale_int as f64).round() as i32,
-                        (image.yhot as f64 / scale_int as f64).round() as i32,
-                    ))
+                    Point::from(scale_down_hotspot(image.xhot, image.yhot, scale_int))
                 }
                 None => Point::from((0, 0)),
             }
@@ -1634,11 +1693,39 @@ fn build_cursor_elements(
         .get(output_index)
         .map(|slot| slot.position)
         .unwrap_or_default();
-    let cursor_pos = (state.pointer_location - output_position.to_f64() - hotspot.to_f64())
-        .to_physical(Scale::from(scale))
-        .to_i32_round();
+    let cursor_pos = cursor_physical_position(state.pointer_location, output_position, hotspot, scale);
 
     pointer_element.render_elements(renderer, cursor_pos, Scale::from(scale), 1.0)
+}
+
+/// `image.xhot`/`yhot` (in the loaded cursor frame's own pixel space,
+/// `scale_int`× a Logical hotspot once a HiDPI theme variant is picked)
+/// descaled back down to Logical — see `build_cursor_elements`'s own
+/// comment at its one call site for why the two need to share a space
+/// before being combined with `state.pointer_location`. Pure `f64`
+/// arithmetic, pulled out only because it used to live inline inside a
+/// function that needs a real `&mut GlesRenderer` to reach at all.
+fn scale_down_hotspot(xhot: u32, yhot: u32, scale_int: i32) -> (i32, i32) {
+    ((xhot as f64 / scale_int as f64).round() as i32, (yhot as f64 / scale_int as f64).round() as i32)
+}
+
+/// The cursor's real physical-pixel render position for one output —
+/// `pointer_location` (genuinely Logical, shared global compositor space)
+/// re-based to `output_position` (this output's own local origin, real
+/// multi-monitor), minus the hotspot offset, then converted to physical
+/// at `scale`. Pulled out over plain `smithay::utils::Point`/`Scale`
+/// values (freely constructible, not the blocker) purely because it used
+/// to live inline inside `build_cursor_elements`, which needs a real
+/// `&mut GlesRenderer` to reach at all.
+fn cursor_physical_position(
+    pointer_location: Point<f64, smithay::utils::Logical>,
+    output_position: Point<i32, smithay::utils::Logical>,
+    hotspot: Point<i32, smithay::utils::Logical>,
+    scale: f64,
+) -> Point<i32, smithay::utils::Physical> {
+    (pointer_location - output_position.to_f64() - hotspot.to_f64())
+        .to_physical(Scale::from(scale))
+        .to_i32_round()
 }
 
 fn frame_finish(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Handle) {
@@ -1957,25 +2044,48 @@ impl Dispatch2<ZwlrGammaControlV1, State> for GammaControlUserData {
     }
 }
 
-/// Read the client's raw gamma table off `fd` — per the protocol, three
-/// concatenated `u16` ramps (red, green, blue), each `gamma_size` long,
-/// which is exactly what the legacy `set_gamma` ioctl itself expects.
-/// Native-endian: like an mmap'd C `uint16_t[]`, this is raw memory the
-/// client wrote directly, not a serialized wire format with its own
-/// defined byte order. A short read or the ioctl call itself failing both
-/// surface as a plain `Err` — the caller sends `.failed()` rather than
-/// trusting a client-supplied fd to always behave.
+/// Parse a raw gamma table buffer — per the protocol, three concatenated
+/// `u16` ramps (red, green, blue), each `gamma_size` long, exactly what
+/// the legacy `set_gamma` ioctl itself expects. Native-endian: like an
+/// mmap'd C `uint16_t[]`, this is raw memory the client wrote directly,
+/// not a serialized wire format with its own defined byte order. Decoded
+/// as one flat `red ++ green ++ blue` sequence — the caller splits it
+/// three ways with a zero-copy `split_at` (trivial slicing, not worth its
+/// own extraction/test). `None` if `buf`'s length doesn't match
+/// `gamma_size * 3 * 2` exactly — in practice `apply_gamma`'s own caller
+/// always allocates `buf` at exactly that size before filling it via
+/// `read_exact` (so a short read surfaces as its own separate `Err`
+/// before this is ever called), but checking here too rather than
+/// assuming means this stays panic-free even if that invariant is ever
+/// violated by a future caller. Pulled out as a pure function over
+/// `&[u8]` specifically so it's testable without a real client fd —
+/// returns one flat `Vec<u16>` rather than three separately-owned ones
+/// (an earlier version did, then a review caught that the caller
+/// immediately re-borrowed all three anyway — three extra heap copies of
+/// the whole gamma table for no benefit, on every `SetGamma` request a
+/// night-light-style client sends).
+fn parse_gamma_words(buf: &[u8], gamma_size: usize) -> Option<Vec<u16>> {
+    if buf.len() != gamma_size * 3 * 2 {
+        return None;
+    }
+    Some(buf.chunks_exact(2).map(|pair| u16::from_ne_bytes([pair[0], pair[1]])).collect())
+}
+
+/// Read the client's raw gamma table off `fd` and apply it via the real
+/// `set_gamma` ioctl — see [`parse_gamma_words`] for the actual table
+/// layout/parsing. A short read, a malformed table, or the ioctl call
+/// itself failing all surface as a plain `Err` — the caller sends
+/// `.failed()` rather than trusting a client-supplied fd to always
+/// behave.
 fn apply_gamma(state: &mut State, active: &ActiveGammaControl, fd: OwnedFd) -> Result<(), String> {
     let mut file = File::from(fd);
-    let mut buf = vec![0u8; active.gamma_size as usize * 3 * 2];
+    let gamma_size = active.gamma_size as usize;
+    let mut buf = vec![0u8; gamma_size * 3 * 2];
     file.read_exact(&mut buf)
         .map_err(|err| format!("short read of the gamma table: {err}"))?;
 
-    let words: Vec<u16> = buf
-        .chunks_exact(2)
-        .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
-        .collect();
-    let gamma_size = active.gamma_size as usize;
+    let words =
+        parse_gamma_words(&buf, gamma_size).ok_or_else(|| "gamma table length mismatch".to_string())?;
     let (red, rest) = words.split_at(gamma_size);
     let (green, blue) = rest.split_at(gamma_size);
 
@@ -2101,4 +2211,180 @@ mod tests {
             "the interruption should have reset the streak, not just cost one tick"
         );
     }
+
+    #[test]
+    fn non_desktop_and_not_a_built_in_panel_interface_is_leasable() {
+        assert!(is_leasable(true, connector::Interface::DisplayPort));
+        assert!(is_leasable(true, connector::Interface::HDMIA));
+    }
+
+    #[test]
+    fn not_reported_non_desktop_is_never_leasable() {
+        assert!(!is_leasable(false, connector::Interface::DisplayPort));
+    }
+
+    #[test]
+    fn built_in_panel_interfaces_are_never_leasable_even_if_reported_non_desktop() {
+        // Defense-in-depth: the built-in panel must never be leasable
+        // regardless of what the `non-desktop` DRM property (driver/EDID
+        // derived) reports — see `is_leasable`'s own doc comment.
+        for interface in [
+            connector::Interface::EmbeddedDisplayPort,
+            connector::Interface::LVDS,
+            connector::Interface::DSI,
+            connector::Interface::DPI,
+        ] {
+            assert!(
+                !is_leasable(true, interface),
+                "{interface:?} should never be leasable even if reported non-desktop"
+            );
+        }
+    }
+
+    #[test]
+    fn picks_the_flagged_preferred_mode() {
+        assert_eq!(pick_preferred_mode_index(&[false, true, false]), 1);
+    }
+
+    #[test]
+    fn falls_back_to_the_first_mode_when_nothing_is_flagged_preferred() {
+        assert_eq!(pick_preferred_mode_index(&[false, false, false]), 0);
+        assert_eq!(pick_preferred_mode_index(&[]), 0);
+    }
+
+    #[test]
+    fn adaptive_refresh_order_sorts_ascending_and_dedups_equal_rates() {
+        let refreshes = [60_000, 48_000, 60_000, 90_000];
+        let (order, current) = build_adaptive_refresh_order(&refreshes, 60_000).unwrap();
+        // Sorted-by-value survivor indices: 48000 (idx 1), 60000 (idx 0 —
+        // first occurrence wins the dedup), 90000 (idx 3).
+        assert_eq!(order, vec![1, 0, 3]);
+        assert_eq!(current, 1, "current should point at the preferred refresh's own position within `order`");
+    }
+
+    #[test]
+    fn adaptive_refresh_order_returns_none_with_fewer_than_two_distinct_rates() {
+        assert_eq!(build_adaptive_refresh_order(&[60_000, 60_000], 60_000), None);
+        assert_eq!(build_adaptive_refresh_order(&[60_000], 60_000), None);
+        assert_eq!(build_adaptive_refresh_order(&[], 60_000), None);
+    }
+
+    #[test]
+    fn adaptive_refresh_order_falls_back_to_the_highest_rate_if_preferred_missing() {
+        let refreshes = [48_000, 60_000, 90_000];
+        let (order, current) = build_adaptive_refresh_order(&refreshes, 120_000).unwrap();
+        assert_eq!(order, vec![0, 1, 2]);
+        assert_eq!(current, order.len() - 1);
+    }
+
+    #[test]
+    fn millihertz_to_hz_rounds_to_the_nearest_whole_hertz() {
+        assert_eq!(millihertz_to_hz(59_940), 60);
+        assert_eq!(millihertz_to_hz(60_000), 60);
+        assert_eq!(millihertz_to_hz(23_976), 24);
+    }
+
+    #[test]
+    fn millihertz_to_hz_clamps_negative_to_zero() {
+        assert_eq!(millihertz_to_hz(-1000), 0);
+    }
+
+    #[test]
+    fn parse_gamma_words_decodes_a_well_formed_buffer_into_the_flat_red_green_blue_sequence() {
+        let gamma_size = 2;
+        let mut buf = Vec::new();
+        for v in [1u16, 2, 3, 4, 5, 6] {
+            buf.extend_from_slice(&v.to_ne_bytes());
+        }
+        let words = parse_gamma_words(&buf, gamma_size).unwrap();
+        let (red, rest) = words.split_at(gamma_size);
+        let (green, blue) = rest.split_at(gamma_size);
+        assert_eq!(red, [1, 2]);
+        assert_eq!(green, [3, 4]);
+        assert_eq!(blue, [5, 6]);
+    }
+
+    #[test]
+    fn parse_gamma_words_rejects_a_buffer_with_the_wrong_length() {
+        assert_eq!(parse_gamma_words(&[0u8; 5], 2), None);
+        assert_eq!(parse_gamma_words(&[], 2), None);
+    }
+
+    #[test]
+    fn scale_down_hotspot_descales_by_the_integer_buffer_scale() {
+        assert_eq!(scale_down_hotspot(20, 30, 2), (10, 15));
+        assert_eq!(scale_down_hotspot(0, 0, 1), (0, 0));
+    }
+
+    #[test]
+    fn cursor_physical_position_subtracts_output_position_and_hotspot_then_converts_to_physical() {
+        let pointer_location = Point::<f64, smithay::utils::Logical>::from((110.0, 220.0));
+        let output_position = Point::<i32, smithay::utils::Logical>::from((100, 200));
+        let hotspot = Point::<i32, smithay::utils::Logical>::from((2, 3));
+        let result = cursor_physical_position(pointer_location, output_position, hotspot, 2.0);
+        // Logical delta: (110-100-2, 220-200-3) = (8, 17); at scale 2.0 -> (16, 34).
+        assert_eq!(result, Point::<i32, smithay::utils::Physical>::from((16, 34)));
+    }
+
+    #[test]
+    fn next_output_x_starts_at_zero_with_nothing_placed_yet() {
+        assert_eq!(next_output_x(&[]), 0);
+    }
+
+    #[test]
+    fn next_output_x_places_a_fresh_output_to_the_right_of_every_existing_one() {
+        // (position_x, mode_width_px, scale)
+        let existing = [(0, 1920, 1.0), (1920, 2560, 2.0)];
+        // Second output's own right edge: 1920 + (2560 / 2.0) = 3200.
+        assert_eq!(next_output_x(&existing), 3200);
+    }
+
+    /// `detect_output_scale`'s tests all need `MUDHUTS_OUTPUT_SCALE`
+    /// genuinely absent — it overrides the function's return value
+    /// unconditionally when set (see the module doc's own note on this
+    /// escape hatch), so a developer who happens to have it exported in
+    /// their shell (e.g. left over from manually driving `mudhuts --tty`
+    /// on real hardware) would otherwise see these fail spuriously,
+    /// asserting the override's value instead of the computed one
+    /// (caught in review). `unsafe` since Rust 2024 — `std::env::
+    /// remove_var` on a value nothing else in this process reads is safe
+    /// in practice; the signature just can't express that.
+    fn clear_output_scale_override() {
+        unsafe {
+            std::env::remove_var("MUDHUTS_OUTPUT_SCALE");
+        }
+    }
+
+    #[test]
+    fn detect_output_scale_defaults_to_1x_below_the_192_dpi_threshold() {
+        clear_output_scale_override();
+        // A 24" 1920x1080 display: ~92 DPI, well under the threshold.
+        assert_eq!(detect_output_scale((531, 299), (1920, 1080)), 1.0);
+    }
+
+    #[test]
+    fn detect_output_scale_switches_to_2x_at_the_192_dpi_threshold() {
+        clear_output_scale_override();
+        // This module's own motivating hardware target (see
+        // `detect_output_scale`'s doc comment) — Apple Silicon's built-in
+        // Retina panel, comfortably past 192 DPI: a 13" MacBook panel is
+        // roughly 254mm x 159mm at 2560x1600.
+        assert_eq!(detect_output_scale((254, 159), (2560, 1600)), 2.0);
+    }
+
+    #[test]
+    fn detect_output_scale_degenerate_zero_size_falls_back_to_1x() {
+        clear_output_scale_override();
+        assert_eq!(detect_output_scale((0, 0), (1920, 1080)), 1.0);
+        assert_eq!(detect_output_scale((531, 299), (0, 0)), 1.0);
+    }
+
+    // `MUDHUTS_OUTPUT_SCALE`'s override path *itself* is deliberately not
+    // covered here: `std::env::set_var` mutates real, process-global
+    // state, and Rust runs `#[test]`s in parallel within one process by
+    // default — setting it in one test could leak into any other test
+    // running concurrently (including the ones just above, which rely on
+    // the override being *absent* — see `clear_output_scale_override`).
+    // Not worth a `serial_test`-style dependency just for this one
+    // branch.
 }
