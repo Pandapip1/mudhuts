@@ -162,8 +162,27 @@ impl AppState {
             if rule.target_app_id != info.app_id {
                 continue;
             }
+            // `try_lock`, not `lock().unwrap()` — `info` (the caller's
+            // `&mut MutexGuard`) is a lock already held on *this same*
+            // toplevel's own entry in `self.toplevels` (inserted into the
+            // map by the `Event::Done` handler just before calling this,
+            // so it's already present in the very iteration below). If
+            // this toplevel's own `app_id` matches `rule.target_app_id`
+            // (the case this loop body only reaches when it does), the
+            // scan below walks straight into re-locking that same
+            // `Mutex` from the same call stack — non-reentrant, so
+            // `.lock()` would deadlock the single-threaded event-dispatch
+            // loop forever, not panic. Most reliably hit on the very
+            // first relevant toplevel: `self.toplevels` then contains
+            // only this one entry, so the scan is guaranteed to reach it
+            // immediately. `try_lock().ok()?` just skips an entry that's
+            // currently locked instead — in this single-threaded
+            // dispatch loop, the only entry that can ever already be
+            // locked *is* this one, so skipping it costs nothing (it was
+            // never going to be a valid "main app" match for its own
+            // rule anyway).
             let Some(main_identifier) = self.toplevels.values().find_map(|other| {
-                let other = other.lock().unwrap();
+                let other = other.try_lock().ok()?;
                 (other.app_id == rule.main_app_id)
                     .then(|| other.identifier.clone())
                     .flatten()
