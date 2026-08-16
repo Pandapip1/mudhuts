@@ -299,7 +299,7 @@ impl PointerGrab<State> for MoveSurfaceGrab {
         // physical-pixel `usable_area_for` — see
         // `State::sync_visible_main_window`'s own doc comment: `space`
         // requires a genuinely Logical origin.
-        let (area_x, area_y, _, _) = data.usable_area_logical_for(output_index);
+        let area_origin = data.usable_area_logical_for(output_index).loc;
         // Re-resolved rather than reusing `hut` above — the borrow
         // checker requires it (an immutable borrow of `data.stack` sits
         // between the two), not because the Hut could plausibly have
@@ -325,7 +325,7 @@ impl PointerGrab<State> for MoveSurfaceGrab {
         // to its new `Dock` state — the window stayed stuck at its old
         // position/visibility until something else happened to trigger
         // a sync for this specific Hut.
-        hut.sync_main_window_space((area_x, area_y));
+        hut.sync_main_window_space(area_origin);
         data.request_redraw();
     }
 }

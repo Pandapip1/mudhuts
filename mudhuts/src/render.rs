@@ -468,7 +468,7 @@ thread_local! {
 fn refresh_hut_content_thumbnail(
     hut: &mut ConsoleHut,
     renderer: &mut GlesRenderer,
-    area_origin: (i32, i32),
+    area_origin: smithay::utils::Point<i32, smithay::utils::Logical>,
     size: (i32, i32),
     scale: f64,
 ) {
@@ -610,7 +610,8 @@ fn content_elements(
 ) -> Vec<Element> {
     let area = state.usable_area_for(output_index);
     let scale = state.output_scale_for(output_index);
-    let mut elements = content_pieces_to_elements(content, renderer, (area.0 as f64, area.1 as f64), scale);
+    let mut elements =
+        content_pieces_to_elements(content, renderer, (area.loc.x as f64, area.loc.y as f64), scale);
 
     let top = state.stack.focused_top_level_for(output_index);
     if let Some(tile) = state.stack.graph().downcast::<crate::graph_nodes::TileNode>(top) {
@@ -619,9 +620,9 @@ fn content_elements(
             let fracs = if tile.fracs.len() == children_len { tile.fracs.clone() } else { vec![1.0; children_len] };
             let active = (*tile.active).min(children_len.saturating_sub(1));
             let highlight_ids = tile.highlight_ids.clone();
-            let rects = crate::hut::pane_rects(tile.axis, fracs.into_iter(), (area.2, area.3));
+            let rects = crate::hut::pane_rects(tile.axis, fracs.into_iter(), (area.size.w, area.size.h));
             if let Some(&(x, y, w, h)) = rects.get(active) {
-                let (x, y) = (x + area.0, y + area.1);
+                let (x, y) = (x + area.loc.x, y + area.loc.y);
                 const BASE_BORDER: i32 = 3;
                 let border = scaled(BASE_BORDER, scale).max(1);
                 let color = to_color32f(state.theme.tile_border);
@@ -973,7 +974,7 @@ pub fn build_frame_elements(
         // `refresh_hut_content_thumbnail` feeds this into `space_mut`,
         // which requires a genuinely Logical origin — see
         // `State::sync_visible_main_window`'s own doc comment.
-        let (area_x, area_y, _, _) = state.usable_area_logical_for(output_index);
+        let area_origin = state.usable_area_logical_for(output_index).loc;
         for &entry_top in &top_level {
             // Skips the *focused* entry (`top`, from just above) — unlike
             // every backgrounded entry, it can be the one a real drag
@@ -996,7 +997,7 @@ pub fn build_frame_elements(
                 if let Some(console) =
                     state.stack.graph_mut().downcast_mut::<crate::graph_nodes::ConsoleNode>(leaf)
                 {
-                    refresh_hut_content_thumbnail(&mut console.hut, renderer, (area_x, area_y), size, scale);
+                    refresh_hut_content_thumbnail(&mut console.hut, renderer, area_origin, size, scale);
                 }
             }
         }

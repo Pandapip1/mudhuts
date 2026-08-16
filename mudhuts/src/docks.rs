@@ -415,7 +415,7 @@ pub fn advance_drag(state: &mut State, global_pos: Point<f64, Logical>) {
         // `State::sync_visible_main_window`'s own doc comment: `space`
         // is a real `Space<HutSpaceElement>`, which requires a genuinely
         // Logical origin.
-        let (area_x, area_y, _, _) = state.usable_area_logical_for(output_index);
+        let area_origin = state.usable_area_logical_for(output_index).loc;
         // Fast path first (`output_index` was just freshly resolved
         // above, so this is never stale) — falls back to the full
         // graph-wide search only on a miss.
@@ -430,7 +430,7 @@ pub fn advance_drag(state: &mut State, global_pos: Point<f64, Logical>) {
         // (focused-output-only — see grabs.rs's `unset` for the same
         // fix and its fuller reasoning): the drag's owning Hut may not
         // be the focused one by now.
-        hut.sync_main_window_space((area_x, area_y));
+        hut.sync_main_window_space(area_origin);
         if let Some(drag) = &mut state.dock_drag {
             drag.detached = true;
         }
@@ -499,7 +499,7 @@ pub fn finish_drag(state: &mut State) {
     // `_logical_for`, not the physical-pixel `usable_area_for` — see
     // `State::sync_visible_main_window`'s own doc comment: `space`'s
     // positions (like `location` above) are genuinely Logical.
-    let (area_x, area_y, _, _) = state.usable_area_logical_for(output_index);
+    let area_origin = state.usable_area_logical_for(output_index).loc;
     let Some(hut) = state.stack.find_mut(drag.hut_id) else {
         return;
     };
@@ -511,7 +511,7 @@ pub fn finish_drag(state: &mut State) {
     }
     // This Hut's own space, not `state.sync_visible_main_window()` — see
     // `advance_drag`/`grabs.rs`'s `unset` for the same fix.
-    hut.sync_main_window_space((area_x, area_y));
+    hut.sync_main_window_space(area_origin);
     // Via the handle attached in `start_drag`, not `state.request_redraw()`
     // directly — see `crate::redraw`'s module doc.
     if let Some(redraw) = &drag.redraw {

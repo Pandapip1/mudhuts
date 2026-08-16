@@ -80,10 +80,10 @@ impl XdgShellHandler for State {
             // comment. Per this window's own owning output, not
             // `self.focused_usable_area_logical()` (the focused one) — see this
             // block's own reordering note above.
-            let (_, _, usable_w, usable_h) = self.usable_area_logical_for(output_index);
+            let size = self.usable_area_logical_for(output_index).size;
             surface.with_pending_state(|state| {
                 state.states.set(xdg_toplevel::State::Fullscreen);
-                state.size = Some(smithay::utils::Size::from((usable_w, usable_h)));
+                state.size = Some(size);
             });
         }
 

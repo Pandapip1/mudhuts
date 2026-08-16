@@ -17,7 +17,7 @@ use smithay::reexports::wayland_protocols::ext::session_lock::v1::server::ext_se
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Display, DisplayHandle};
-use smithay::utils::{Logical, Point, Rectangle};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Size};
 use smithay::wayland::compositor::{CompositorClientState, CompositorState};
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
@@ -433,20 +433,35 @@ fn real_output_geometry_for_output(output: &Output) -> Option<Rectangle<i32, Log
 /// in the fractional-scale black-bar-under-waybar bug; see
 /// `console_hut.rs`'s `sync_main_window_space` doc comment for the full
 /// mechanism.
-fn usable_area_physical_for_output(output: &Output) -> (i32, i32, i32, i32) {
+/// Bridges a genuinely-typed `Rectangle` into the bare `(i32, i32, i32, i32)`
+/// tuples `GraphStack`'s own internal geometry API (`leaf_absolute_rect`,
+/// `active_pane_offset`, `pane_rects`, ...) still uses — that API is
+/// self-consistently *always* physical-pixel-space internally (its own
+/// `TileNode`/`ConsoleNode` callers never cross it with a genuinely
+/// `Logical` value anywhere), so it wasn't worth threading the same
+/// `Physical`/`Logical` phantom-type split this file's own `usable_area*`
+/// family now has all the way down into `graph_stack.rs`/`graph_nodes.rs`
+/// too — the actual, previously-shipped bug this split exists to prevent
+/// was specifically about *this* file's callers reaching for the wrong one
+/// of two same-shaped functions, not about `GraphStack`'s single, already-
+/// consistent internal convention. Named explicitly (not just `.into()`)
+/// so a reader sees exactly where a genuinely-typed value deliberately
+/// downgrades to an untyped one, rather than that happening invisibly.
+fn rect_to_tuple<Kind>(rect: Rectangle<i32, Kind>) -> (i32, i32, i32, i32) {
+    (rect.loc.x, rect.loc.y, rect.size.w, rect.size.h)
+}
+
+fn usable_area_physical_for_output(output: &Output) -> Rectangle<i32, Physical> {
     let scale = output.current_scale().fractional_scale();
     let zone = layer_map_for_output(output).non_exclusive_zone();
-    let physical: smithay::utils::Rectangle<i32, smithay::utils::Physical> =
-        zone.to_physical_precise_round(scale);
-    (physical.loc.x, physical.loc.y, physical.size.w, physical.size.h)
+    zone.to_physical_precise_round(scale)
 }
 
 /// Shared body of [`State::focused_usable_area_logical`]/
 /// [`State::usable_area_logical_for`] — [`usable_area_physical_for_output`]'s
 /// unconverted counterpart, for the same reason that one exists.
-fn usable_area_logical_for_output(output: &Output) -> (i32, i32, i32, i32) {
-    let zone = layer_map_for_output(output).non_exclusive_zone();
-    (zone.loc.x, zone.loc.y, zone.size.w, zone.size.h)
+fn usable_area_logical_for_output(output: &Output) -> Rectangle<i32, Logical> {
+    layer_map_for_output(output).non_exclusive_zone()
 }
 
 impl State {
@@ -830,9 +845,9 @@ impl State {
     /// own pixel-native rendering against it. [`Self::focused_usable_area_logical`]
     /// is the *other* half: the same zone, unconverted, for the couple of
     /// call sites that configure real Wayland clients instead.
-    pub fn focused_usable_area(&self) -> (i32, i32, i32, i32) {
+    pub fn focused_usable_area(&self) -> Rectangle<i32, Physical> {
         let Some(output) = self.output.as_ref() else {
-            return (0, 0, self.output_size.0, self.output_size.1);
+            return Rectangle::new(Point::from((0, 0)), Size::from(self.output_size));
         };
         usable_area_physical_for_output(output)
     }
@@ -849,12 +864,12 @@ impl State {
     /// `add_output` with a real connector, so this only actually matters
     /// in the same brief startup window `focused_usable_area`'s own `None`
     /// fallback already covers.
-    pub fn usable_area_for(&self, output_index: usize) -> (i32, i32, i32, i32) {
+    pub fn usable_area_for(&self, output_index: usize) -> Rectangle<i32, Physical> {
         let Some(slot) = self.stack.outputs().get(output_index) else {
-            return (0, 0, 0, 0);
+            return Rectangle::default();
         };
         if slot.output.current_mode().is_none() {
-            return (0, 0, 0, 0);
+            return Rectangle::default();
         }
         usable_area_physical_for_output(&slot.output)
     }
@@ -871,9 +886,9 @@ impl State {
     /// `focused_usable_area()`'s identical fallback, and only ever actually
     /// matters before the first output exists, when physical and logical
     /// aren't meaningfully different yet anyway.
-    pub fn focused_usable_area_logical(&self) -> (i32, i32, i32, i32) {
+    pub fn focused_usable_area_logical(&self) -> Rectangle<i32, Logical> {
         let Some(output) = self.output.as_ref() else {
-            return (0, 0, self.output_size.0, self.output_size.1);
+            return Rectangle::new(Point::from((0, 0)), Size::from(self.output_size));
         };
         usable_area_logical_for_output(output)
     }
@@ -884,7 +899,7 @@ impl State {
     /// `reconfigure_main_windows` must build an `xdg_toplevel` configure
     /// size against the output a change actually happened on, which is
     /// not always the currently-focused one.
-    pub fn usable_area_logical_for(&self, output_index: usize) -> (i32, i32, i32, i32) {
+    pub fn usable_area_logical_for(&self, output_index: usize) -> Rectangle<i32, Logical> {
         // `(0, 0, 0, 0)`, not `self.output_size` (the *focused* output's
         // own physical size) — unlike `focused_usable_area_logical`'s identical-
         // looking fallback (which really is about "no output exists
@@ -896,7 +911,7 @@ impl State {
         // [`Self::output_size_for`]/[`Self::usable_area_for`]'s own
         // neutral-zero fallback.
         let Some(slot) = self.stack.outputs().get(output_index) else {
-            return (0, 0, 0, 0);
+            return Rectangle::default();
         };
         usable_area_logical_for_output(&slot.output)
     }
@@ -958,7 +973,8 @@ impl State {
     /// still filled it edge to edge.
     pub fn active_pane_offset(&self) -> (f64, f64) {
         let area = self.focused_usable_area();
-        self.stack.active_pane_offset(self.stack.focused_top_level(), area)
+        self.stack
+            .active_pane_offset(self.stack.focused_top_level(), rect_to_tuple(area))
     }
 
     /// `root`'s absolute physical-pixel rect right now, if it's a Main
@@ -978,7 +994,11 @@ impl State {
     /// entry's *active* content is ever actually on screen, matching
     /// every other render/hit-test call site's scope.
     pub fn focused_leaf_absolute_rect(&self, root: &WlSurface) -> Option<(i32, i32, i32, i32)> {
-        self.stack.leaf_absolute_rect(self.stack.focused_top_level(), root, self.focused_usable_area())
+        self.stack.leaf_absolute_rect(
+            self.stack.focused_top_level(),
+            root,
+            rect_to_tuple(self.focused_usable_area()),
+        )
     }
 
     /// [`Self::focused_leaf_absolute_rect`], for a specific output rather than
@@ -991,7 +1011,11 @@ impl State {
     /// ConsoleHut's own Main Window" case this otherwise resolves
     /// precisely.
     pub fn leaf_absolute_rect_for(&self, output_index: usize, root: &WlSurface) -> Option<(i32, i32, i32, i32)> {
-        self.stack.leaf_absolute_rect(self.stack.focused_top_level_for(output_index), root, self.usable_area_for(output_index))
+        self.stack.leaf_absolute_rect(
+            self.stack.focused_top_level_for(output_index),
+            root,
+            rect_to_tuple(self.usable_area_for(output_index)),
+        )
     }
 
     /// Make the focused ConsoleHut's own `space` match what it should
@@ -1035,32 +1059,33 @@ impl State {
         // also has a grab active.
         if self.dragging_hut_id != Some(self.stack.focused().id) {
             // `focused_usable_area_logical`, not `focused_usable_area` —
-            // `ConsoleHut::space` is a real `Space<HutSpaceElement>`, and
-            // `Space::map_element` requires a genuinely Logical point
-            // (Smithay's pinned source: `P: Into<Point<i32, Logical>>`).
-            // Passing the *physical*-pixel origin here type-checks fine
-            // (a bare `(i32, i32)` silently converts to whatever `Point`
-            // kind is needed — nothing catches the mismatch), but doubles
-            // up with the real output's own scale the next time this
-            // position gets converted back to physical for rendering
-            // (`render.rs`'s `content_pieces_to_elements`, which treats
+            // `ConsoleHut::sync_main_window_space` requires a genuinely
+            // `Point<i32, Logical>` origin (it maps straight into a real
+            // `Space<HutSpaceElement>` via `Space::map_element`, which
+            // itself requires one — Smithay's pinned source:
+            // `P: Into<Point<i32, Logical>>`). Passing the *physical*-
+            // pixel origin used to type-check fine anyway, back when both
+            // functions returned a bare `(i32, i32)` tuple (nothing
+            // caught the mismatch), and doubled up with the real output's
+            // own scale the next time this position got converted back to
+            // physical for rendering (`render.rs`'s
+            // `content_pieces_to_elements`, which treats
             // `ContentPiece::Window`'s position as genuinely Logical and
             // multiplies by scale) — invisible at scale 1.0, but at any
-            // other scale this silently shifts a Main Window down/right
-            // by roughly one *extra* copy of whatever's reserving space
-            // at the output's origin (e.g. a top-anchored status bar's
-            // own exclusive zone), which is exactly what every other real
-            // `map_element` call in this codebase already converts to
-            // Logical first (see `docks.rs`'s `advance_drag`'s own
-            // `pos.to_logical(...)` before its `space_raw_mut().map_element`
-            // call, immediately below this same function's sibling code).
+            // other scale silently shifted a Main Window down/right by
+            // roughly one *extra* copy of whatever's reserving space at
+            // the output's origin. Now a real, previously-shipped bug a
+            // *type* error, not just a doc comment away from recurring:
+            // `focused_usable_area()` (physical) returns
+            // `Rectangle<i32, Physical>`, so passing *its* `.loc` here
+            // wouldn't compile at all.
             //
             // Computed before taking `hut`'s mutable borrow below —
             // `focused_usable_area_logical` needs `&self` as a whole,
             // which the borrow checker won't allow alongside an active
             // `&mut self.stack` borrow.
-            let (area_x, area_y, _, _) = self.focused_usable_area_logical();
-            self.stack.focused_mut().sync_main_window_space((area_x, area_y));
+            let area = self.focused_usable_area_logical();
+            self.stack.focused_mut().sync_main_window_space(area.loc);
         }
         self.sync_keyboard_focus_to_view();
     }
@@ -1086,10 +1111,11 @@ impl State {
         if self.dragging_hut_id != Some(hut_id) {
             // `usable_area_logical_for`, not `usable_area_for` — see
             // `sync_visible_main_window`'s own doc comment for why
-            // `ConsoleHut::space` needs a genuinely Logical origin here.
-            let (area_x, area_y, _, _) = self.usable_area_logical_for(output_index);
+            // `sync_main_window_space` needs a genuinely
+            // `Point<i32, Logical>` origin here.
+            let area = self.usable_area_logical_for(output_index);
             if let Some(hut) = self.stack.find_mut(hut_id) {
-                hut.sync_main_window_space((area_x, area_y));
+                hut.sync_main_window_space(area.loc);
             }
         }
         self.sync_keyboard_focus_to_view();
@@ -1264,7 +1290,10 @@ impl ClientData for ClientState {
 mod tests {
     use crate::space_element::synthetic_output;
 
-    use super::{real_output_geometry_for_output, usable_area_logical_for_output, usable_area_physical_for_output};
+    use super::{
+        rect_to_tuple, real_output_geometry_for_output, usable_area_logical_for_output,
+        usable_area_physical_for_output,
+    };
 
     // Regression coverage for the class of bug behind the "black bar under
     // waybar" fix (commit `4291e55`): a *physical*-pixel value silently fed
@@ -1280,8 +1309,8 @@ mod tests {
     #[test]
     fn physical_and_logical_usable_area_agree_at_scale_one() {
         let output = synthetic_output("test", (1920, 1080), 1.0);
-        assert_eq!(usable_area_physical_for_output(&output), (0, 0, 1920, 1080));
-        assert_eq!(usable_area_logical_for_output(&output), (0, 0, 1920, 1080));
+        assert_eq!(rect_to_tuple(usable_area_physical_for_output(&output)), (0, 0, 1920, 1080));
+        assert_eq!(rect_to_tuple(usable_area_logical_for_output(&output)), (0, 0, 1920, 1080));
     }
 
     #[test]
@@ -1292,7 +1321,7 @@ mod tests {
         // unchanged (modulo an as-yet-unreserved exclusive zone, i.e. none
         // here), not divide it down by `scale` a second time.
         let output = synthetic_output("test", (3840, 2160), 2.0);
-        assert_eq!(usable_area_physical_for_output(&output), (0, 0, 3840, 2160));
+        assert_eq!(rect_to_tuple(usable_area_physical_for_output(&output)), (0, 0, 3840, 2160));
     }
 
     #[test]
@@ -1302,14 +1331,14 @@ mod tests {
         // what `sync_main_window_space` used to silently receive, doubling
         // every downstream `to_physical` conversion at scale 2.0).
         let output = synthetic_output("test", (3840, 2160), 2.0);
-        assert_eq!(usable_area_logical_for_output(&output), (0, 0, 1920, 1080));
+        assert_eq!(rect_to_tuple(usable_area_logical_for_output(&output)), (0, 0, 1920, 1080));
     }
 
     #[test]
     fn real_output_geometry_is_also_scale_divided_not_raw_physical() {
         let output = synthetic_output("test", (3840, 2160), 2.0);
         let geo = real_output_geometry_for_output(&output).expect("mode was set");
-        assert_eq!((geo.loc.x, geo.loc.y, geo.size.w, geo.size.h), (0, 0, 1920, 1080));
+        assert_eq!(rect_to_tuple(geo), (0, 0, 1920, 1080));
     }
 
     #[test]
@@ -1320,7 +1349,7 @@ mod tests {
         // variants — assert they're still each other's inverse under
         // rounding, not just for the clean *2/ 2 case above.
         let output = synthetic_output("test", (2880, 1620), 1.5);
-        assert_eq!(usable_area_physical_for_output(&output), (0, 0, 2880, 1620));
-        assert_eq!(usable_area_logical_for_output(&output), (0, 0, 1920, 1080));
+        assert_eq!(rect_to_tuple(usable_area_physical_for_output(&output)), (0, 0, 2880, 1620));
+        assert_eq!(rect_to_tuple(usable_area_logical_for_output(&output)), (0, 0, 1920, 1080));
     }
 }

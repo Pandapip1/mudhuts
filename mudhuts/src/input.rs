@@ -465,9 +465,9 @@ impl State {
                     vec![1.0; children.len()]
                 };
                 let axis = tile.axis;
-                let rects = crate::hut::pane_rects(axis, fracs.into_iter(), (area.2, area.3))
+                let rects = crate::hut::pane_rects(axis, fracs.into_iter(), (area.size.w, area.size.h))
                     .into_iter()
-                    .map(|(x, y, w, h)| (x + area.0, y + area.1, w, h));
+                    .map(|(x, y, w, h)| (x + area.loc.x, y + area.loc.y, w, h));
                 let Some(i) = rects.enumerate().find_map(|(i, (x, y, w, h))| {
                     (pixel.x >= x && pixel.x < x + w && pixel.y >= y && pixel.y < y + h).then_some(i)
                 }) else {

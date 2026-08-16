@@ -35,7 +35,6 @@ use smithay::desktop::{LayerSurface, WindowSurfaceType, layer_map_for_output};
 use smithay::output::{Output, WeakOutput};
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::Size;
 use smithay::wayland::compositor::with_states;
 use smithay::wayland::shell::wlr_layer::{
     Layer, LayerSurfaceData, WlrLayerShellHandler, WlrLayerShellState,
@@ -249,8 +248,7 @@ pub fn handle_commit(state: &mut State, surface: &WlSurface) {
 /// other window state that would make a different size correct for some
 /// windows and not others.
 fn reconfigure_main_windows(state: &mut State, output_index: usize) {
-    let (_, _, w, h) = state.usable_area_logical_for(output_index);
-    let size = Size::from((w, h));
+    let size = state.usable_area_logical_for(output_index).size;
     for hut in state.stack.all_huts_for(output_index) {
         for entry in hut.main_windows() {
             let Some(toplevel) = entry.window.toplevel() else {

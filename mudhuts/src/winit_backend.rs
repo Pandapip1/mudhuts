@@ -115,8 +115,7 @@ pub fn init_winit(
                     // state, always logical regardless of how many
                     // physical pixels mudhuts itself renders into — see
                     // `State::focused_usable_area_logical`'s doc comment.
-                    let (_, _, usable_w, usable_h) = state.focused_usable_area_logical();
-                    let usable_logical = smithay::utils::Size::<i32, smithay::utils::Logical>::from((usable_w, usable_h));
+                    let usable_logical = state.focused_usable_area_logical().size;
                     xdg_shell::resize_all_main_windows(&state.stack, usable_logical);
                     // Nothing else re-pushes capture buffer constraints on
                     // a size change — without this, a capture session
@@ -134,8 +133,8 @@ pub fn init_winit(
                     let mut backend = backend.borrow_mut();
                     let size = backend.window_size();
                     state.output_size = (size.w, size.h);
-                    let (_, _, usable_w, usable_h) = state.focused_usable_area();
-                    state.stack.resize_all(usable_w, usable_h);
+                    let usable = state.focused_usable_area().size;
+                    state.stack.resize_all(usable.w, usable.h);
 
                     // KNOWN GAP: unlike `udev_backend.rs`, this backend has
                     // no persistent `Rc<RefCell<GlesRenderer>>` to hand

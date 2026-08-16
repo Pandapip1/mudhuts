@@ -967,8 +967,8 @@ fn connector_connected(
     if let Err(err) = state.stack.rescale_all(scale) {
         tracing::warn!("failed to rescale initial ConsoleHut to real output scale: {err}");
     }
-    let (_, _, usable_w, usable_h) = state.usable_area_for(output_index);
-    state.stack.resize_output(output_index, usable_w, usable_h);
+    let usable = state.usable_area_for(output_index).size;
+    state.stack.resize_output(output_index, usable.w, usable.h);
     // Nothing else re-pushes capture buffer constraints when the output's
     // mode changes (the only point that happens under this backend, since
     // it has no runtime mode-switching) — without this, a capture session
@@ -1143,8 +1143,8 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
     // `State::focused_usable_area`'s doc comment). This crtc's own output only —
     // real multi-monitor: two outputs can have genuinely different modes
     // (see `GraphStack::resize_output`'s own doc comment).
-    let (_, _, usable_w, usable_h) = state.usable_area_for(output_index);
-    state.stack.resize_output(output_index, usable_w, usable_h);
+    let usable = state.usable_area_for(output_index).size;
+    state.stack.resize_output(output_index, usable.w, usable.h);
 
     // Resolved *before* acquiring the renderer borrow below — see
     // `render::resolve_frame_content`'s own doc comment for why that

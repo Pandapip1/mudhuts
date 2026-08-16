@@ -15,7 +15,7 @@ use smithay::desktop::Window;
 use smithay::desktop::space::Space;
 use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Buffer, Physical, Rectangle};
+use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle};
 
 use mudhuts_term::{GlyphCache, TermEvent, Terminal};
 use mudhuts_term::palette::Rgb;
@@ -307,23 +307,28 @@ impl ConsoleHut {
     /// every Alert belonging to it — docked Floating Windows stay
     /// unmapped (`docks.rs` draws a handle instead), Alerts are mapped
     /// last so they end up on top. `area_origin` is the real usable
-    /// area's own `(x, y)` — matters once a layer-shell surface reserves
+    /// area's own origin — matters once a layer-shell surface reserves
     /// part of the output (e.g. a left-anchored panel) — **genuinely
     /// Logical, not physical**: this is a real `Space<HutSpaceElement>`,
     /// and `Space::map_element` (which this calls, below) requires a
     /// Logical point (Smithay's pinned source:
-    /// `P: Into<Point<i32, Logical>>`) — every caller must pass
-    /// `State::focused_usable_area_logical`/`usable_area_logical_for`'s
-    /// own `(x, y)`, *not* `focused_usable_area`/`usable_area_for`'s
-    /// (physical-pixel) one. A bare `(i32, i32)` tuple type-checks either
-    /// way with no compiler warning — a real, previously-shipped bug
-    /// passed the physical value here, invisible at scale 1.0 but
-    /// silently shifting every Main Window down/right by roughly one
-    /// extra copy of whatever's reserving space at the output's origin
-    /// at any other scale (this value gets converted back to physical a
-    /// second time downstream, in `render.rs`'s `content_pieces_to_elements`,
-    /// which — correctly — treats a mapped Window's position as genuinely
-    /// Logical and multiplies by scale once).
+    /// `P: Into<Point<i32, Logical>>`), so the parameter itself is typed
+    /// `Point<i32, Logical>`, not a bare `(i32, i32)` — every caller must
+    /// pass `State::focused_usable_area_logical`/`usable_area_logical_for`'s
+    /// own `.loc`, *not* `focused_usable_area`/`usable_area_for`'s
+    /// (physical-pixel, and since a fix caught in review, genuinely
+    /// `Rectangle<i32, Physical>`-typed) one. A bare `(i32, i32)` tuple
+    /// used to type-check either way with no compiler warning — a real,
+    /// previously-shipped bug passed the physical value here, invisible
+    /// at scale 1.0 but silently shifting every Main Window down/right by
+    /// roughly one extra copy of whatever's reserving space at the
+    /// output's origin at any other scale (this value gets converted back
+    /// to physical a second time downstream, in `render.rs`'s
+    /// `content_pieces_to_elements`, which — correctly — treats a mapped
+    /// Window's position as genuinely Logical and multiplies by scale
+    /// once). Passing `focused_usable_area()`'s `.loc` here now simply
+    /// doesn't compile: `Rectangle<i32, Physical>::loc` is a
+    /// `Point<i32, Physical>`, not `Point<i32, Logical>`.
     ///
     /// Extracted from `State::sync_visible_main_window`'s old body
     /// (composable Hut hierarchy RFC migration step 5 sub-step 2) so it
@@ -331,7 +336,7 @@ impl ConsoleHut {
     /// `render.rs`'s `refresh_hut_content_thumbnail` is the other caller,
     /// syncing a backgrounded entry's `space` only while its Alt-Tab
     /// thumbnail is actually about to be shown.
-    pub fn sync_main_window_space(&mut self, area_origin: (i32, i32)) {
+    pub fn sync_main_window_space(&mut self, area_origin: Point<i32, Logical>) {
         let mapped: Vec<_> = self.space.elements().cloned().collect();
         for window in mapped {
             self.space.unmap_elem(&window);
@@ -390,7 +395,7 @@ impl ConsoleHut {
     /// `sync_hut_space`), not as the default way to *read* `space` for
     /// rendering/hit-testing/frame callbacks — see [`Self::space`]'s own
     /// doc comment for that.
-    pub fn space_mut(&mut self, area_origin: (i32, i32)) -> &mut Space<HutSpaceElement> {
+    pub fn space_mut(&mut self, area_origin: Point<i32, Logical>) -> &mut Space<HutSpaceElement> {
         self.sync_main_window_space(area_origin);
         &mut self.space
     }
