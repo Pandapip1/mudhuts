@@ -22,6 +22,8 @@ mod space_element;
 mod state;
 mod switcher;
 mod theme;
+#[cfg(test)]
+mod test_support;
 mod udev_backend;
 mod hut;
 mod village_chrome;

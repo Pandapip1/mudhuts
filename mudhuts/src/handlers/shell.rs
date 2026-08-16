@@ -298,7 +298,7 @@ fn retag(state: &mut State, tagged_surface: &WlSurface, target: Option<(Role, Wl
         // promoted): unconditionally `true` — promoting one to Main is
         // always a deliberate "show this now" action, regardless of
         // whether the Hut has other tabs open.
-        let make_active = if was_bare { was_active || hut.main_window_count() == 0 } else { true };
+        let make_active = crate::hut::retag_make_active(was_bare, was_active, hut.main_window_count() == 0);
 
         match &target {
             None => {

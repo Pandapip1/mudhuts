@@ -28,3 +28,12 @@ features = [
     "backend_gbm",
     "backend_libinput",
 ]
+
+[dev-dependencies]
+# In-process client half of `test_support`'s real xdg_shell handshake —
+# lets unit tests construct genuine `smithay::desktop::Window`s (needed
+# by anything operating on Main Windows/Floating Windows/Alerts) without
+# a live compositor, the same protocol crates `mudhuts-test-client`
+# already uses against a real one.
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }

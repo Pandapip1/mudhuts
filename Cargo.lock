@@ -1184,6 +1184,8 @@ dependencies = [
  "tracing",
  "tracing-journald",
  "tracing-subscriber",
+ "wayland-client",
+ "wayland-protocols",
  "xcursor",
 ]
 

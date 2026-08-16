@@ -906,3 +906,150 @@ impl Redrawable for ConsoleHut {
         self.active_main_window.attach_redraw_handle(handle);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use smithay::utils::Point;
+
+    use super::*;
+    use crate::main_window::{Alert, Dock, Edge, FloatingWindow};
+    use crate::test_support::spawn_test_windows;
+
+    fn new_hut() -> ConsoleHut {
+        ConsoleHut::spawn(std::iter::empty(), 1.0).unwrap().0
+    }
+
+    fn surface_of(window: &Window) -> WlSurface {
+        window.toplevel().unwrap().wl_surface().clone()
+    }
+
+    #[test]
+    fn a_second_main_window_arriving_in_the_background_does_not_steal_the_active_tab() {
+        let mut hut = new_hut();
+        let [(a, a_fth), (b, b_fth)] = spawn_test_windows(2).try_into().ok().unwrap();
+        hut.push_main_window(a, true, a_fth);
+        hut.push_main_window(b, false, b_fth);
+        assert_eq!(hut.active_main_window_index(), 0, "the 2nd window joined the tab strip without activating");
+        assert_eq!(hut.main_window_count(), 2);
+    }
+
+    #[test]
+    fn take_bare_main_window_shifts_active_index_to_keep_pointing_at_the_same_survivor() {
+        let mut hut = new_hut();
+        let [(a, a_fth), (b, b_fth), (c, c_fth)] = spawn_test_windows(3).try_into().ok().unwrap();
+        let c_surface = surface_of(&c);
+        hut.push_main_window(a.clone(), true, a_fth);
+        hut.push_main_window(b, false, b_fth);
+        hut.push_main_window(c, false, c_fth);
+        hut.set_active_main_window(2); // active tab is now C
+
+        let taken = hut.take_bare_main_window(&surface_of(&a));
+        assert!(taken.is_some(), "A should have been found and removed");
+        assert_eq!(hut.main_window_count(), 2);
+        assert_eq!(hut.active_main_window_index(), 1, "C shifted left into A's old slot");
+        assert_eq!(surface_of(hut.active_window().unwrap()), c_surface, "active tab is still C, not B");
+    }
+
+    #[test]
+    fn remove_window_falls_back_to_the_terminal_once_the_last_main_window_is_gone() {
+        let mut hut = new_hut();
+        let (a, a_fth) = spawn_test_windows(1).into_iter().next().unwrap();
+        let a_surface = surface_of(&a);
+        hut.push_main_window(a, true, a_fth);
+        *hut.showing_terminal = false;
+
+        assert!(hut.remove_window(&a_surface));
+        assert_eq!(hut.main_window_count(), 0);
+        assert!(*hut.showing_terminal, "no Main Windows left, so the terminal should show again");
+    }
+
+    #[test]
+    fn remove_window_also_finds_a_floating_window_or_alert_nested_under_a_main_window() {
+        let mut hut = new_hut();
+        let [(a, a_fth), (b, _)] = spawn_test_windows(2).try_into().ok().unwrap();
+        let b_surface = surface_of(&b);
+        hut.push_main_window(a.clone(), true, a_fth);
+        hut.find_main_window_mut(&surface_of(&a)).unwrap().floating_windows.push(FloatingWindow::new(b));
+
+        assert!(hut.remove_window(&b_surface), "should be found nested under A, not just at the top level");
+        assert_eq!(hut.main_window_count(), 1, "removing a nested Floating Window must not remove its owning Main Window");
+        assert!(hut.find_main_window_mut(&surface_of(&a)).unwrap().floating_windows.is_empty());
+    }
+
+    #[test]
+    fn cycle_tab_wraps_in_both_directions() {
+        let mut hut = new_hut();
+        let [(a, a_fth), (b, b_fth), (c, c_fth)] = spawn_test_windows(3).try_into().ok().unwrap();
+        hut.push_main_window(a, true, a_fth);
+        hut.push_main_window(b, false, b_fth);
+        hut.push_main_window(c, false, c_fth);
+
+        assert_eq!(hut.active_main_window_index(), 0);
+        hut.cycle_tab(true);
+        assert_eq!(hut.active_main_window_index(), 1);
+        hut.cycle_tab(true);
+        assert_eq!(hut.active_main_window_index(), 2);
+        hut.cycle_tab(true);
+        assert_eq!(hut.active_main_window_index(), 0, "forward from the last tab wraps to the first");
+        hut.cycle_tab(false);
+        assert_eq!(hut.active_main_window_index(), 2, "backward from the first tab wraps to the last");
+    }
+
+    /// Regression test for a bug caught in review (see `floating_or_alert_absolute_rect`'s
+    /// own doc comment): it used to read a mapped element's *local* xdg-surface
+    /// geometry (`SpaceElement::geometry`) instead of its real mapped position
+    /// (`Space::element_geometry`), which happened to go unnoticed only because
+    /// its one live caller at the time discarded `.loc` and kept just `.size`.
+    /// Only the Main Window itself maps at `area_origin`; a Floating Window's
+    /// and an Alert's own tracked positions are already absolute — this pins
+    /// down all three concretely rather than relying on `.size` alone ever
+    /// again masking a `.loc` regression.
+    #[test]
+    fn sync_main_window_space_maps_everything_at_its_real_documented_position() {
+        let mut hut = new_hut();
+        let [(main, main_fth), (floating, _), (alert, _)] = spawn_test_windows(3).try_into().ok().unwrap();
+        let main_surface = surface_of(&main);
+        let floating_surface = surface_of(&floating);
+        let alert_surface = surface_of(&alert);
+
+        hut.push_main_window(main, true, main_fth);
+        *hut.showing_terminal = false;
+        let entry = hut.find_main_window_mut(&main_surface).unwrap();
+        let mut fw = FloatingWindow::new(floating);
+        fw.dock = Dock::Floating(Point::from((40, 50)));
+        entry.floating_windows.push(fw);
+        entry.alerts.push(Alert::new(alert));
+
+        let area_origin = Point::from((10, 20));
+        hut.sync_main_window_space(area_origin);
+
+        let (mx, my, ..) = hut.floating_or_alert_absolute_rect(&main_surface).expect("main window should be mapped");
+        assert_eq!((mx, my), (10, 20), "the Main Window maps at the usable area's own origin");
+
+        let (fx, fy, ..) =
+            hut.floating_or_alert_absolute_rect(&floating_surface).expect("floating window should be mapped");
+        assert_eq!((fx, fy), (40, 50), "a Floating Window's tracked position is already absolute, like an Alert's — only the Main Window itself maps at area_origin");
+
+        let (ax, ay, ..) = hut.floating_or_alert_absolute_rect(&alert_surface).expect("alert should be mapped");
+        assert_eq!((ax, ay), (100, 100), "an Alert's tracked position is already absolute, not origin-relative");
+    }
+
+    #[test]
+    fn sync_main_window_space_leaves_a_docked_floating_window_unmapped() {
+        let mut hut = new_hut();
+        let [(main, main_fth), (docked, _)] = spawn_test_windows(2).try_into().ok().unwrap();
+        let main_surface = surface_of(&main);
+        let docked_surface = surface_of(&docked);
+        hut.push_main_window(main, true, main_fth);
+        *hut.showing_terminal = false;
+        hut.find_main_window_mut(&main_surface)
+            .unwrap()
+            .floating_windows
+            .push(FloatingWindow::new(docked)); // starts Docked(Right) — see FloatingWindow::new
+
+        hut.sync_main_window_space(Point::from((0, 0)));
+
+        assert!(hut.floating_or_alert_absolute_rect(&docked_surface).is_none(), "docks.rs draws a handle for a docked window instead of mapping it");
+        let _ = Edge::Right; // documents the default this test relies on
+    }
+}

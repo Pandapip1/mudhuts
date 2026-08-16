@@ -64,6 +64,67 @@ pub(crate) fn shift_active_index_on_removal(active: usize, removed_index: usize,
     if removed_index < active { active - 1 } else { active.min(max_index) }
 }
 
+/// Whether a window `handlers/shell.rs::retag` just re-inserted as a bare
+/// Main Window should become/stay its Hut's active tab. Pulled out of that
+/// function's own body (three review rounds this session each caught a
+/// real bug in this exact decision — see `retag`'s own doc comment on
+/// `was_active`/`was_bare`) into its own named, independently testable
+/// unit — unlike [`shift_active_index_on_removal`] (pulled out to
+/// deduplicate the same formula reimplemented at 2+ call sites), this one
+/// has a single call site; the motivation here is purely that this
+/// specific decision proved hard to get right in place, not duplication.
+///
+/// - `was_bare`: the window was already a bare Main Window being re-tagged
+///   (a redundant `SetMain`, or a `SetFloating`/`SetAlert` whose target
+///   didn't resolve) — as opposed to a nested Floating Window/Alert being
+///   promoted to Main, which is always a deliberate "show this now" and so
+///   always activates regardless of the other two arguments.
+/// - `was_active`: it was already the Hut's active tab *before* this
+///   retag removed and re-inserted it — checked against the *pre*-removal
+///   state, since removal can shift the active index onto a different
+///   surviving tab.
+/// - `hut_is_empty`: the Hut has no other tabs left to keep showing
+///   instead.
+pub(crate) fn retag_make_active(was_bare: bool, was_active: bool, hut_is_empty: bool) -> bool {
+    if was_bare { was_active || hut_is_empty } else { true }
+}
+
+#[cfg(test)]
+mod retag_make_active_tests {
+    use super::retag_make_active;
+
+    #[test]
+    fn promoting_a_nested_floating_window_or_alert_always_activates() {
+        // `was_bare = false` — a deliberate "show this now" action,
+        // regardless of whether it was active before (it never was — it
+        // wasn't even a Main Window) or whether the Hut already has other
+        // tabs open.
+        assert!(retag_make_active(false, false, false));
+        assert!(retag_make_active(false, true, false));
+    }
+
+    #[test]
+    fn a_redundant_retag_of_the_already_active_bare_main_window_stays_active() {
+        assert!(retag_make_active(true, true, false));
+    }
+
+    #[test]
+    fn a_redundant_retag_of_a_backgrounded_bare_main_window_stays_backgrounded() {
+        // The real bug this formula fixes: without `was_active` in the
+        // mix, a no-op re-tag of a tab the user *wasn't* looking at would
+        // silently steal focus onto it.
+        assert!(!retag_make_active(true, false, false));
+    }
+
+    #[test]
+    fn a_bare_main_window_becomes_active_if_the_hut_would_otherwise_be_empty() {
+        // `was_active` is meaningless once every other tab is gone too —
+        // there's nothing else to show, so this one must activate even if
+        // it wasn't the one focused before.
+        assert!(retag_make_active(true, false, true));
+    }
+}
+
 #[cfg(test)]
 mod shift_active_index_tests {
     use super::shift_active_index_on_removal;
