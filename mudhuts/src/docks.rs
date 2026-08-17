@@ -225,12 +225,7 @@ impl HitTestable for DockHandles<'_> {
 }
 
 fn truncate(title: &str) -> String {
-    if title.chars().count() > MAX_TITLE_CHARS {
-        let truncated: String = title.chars().take(MAX_TITLE_CHARS.saturating_sub(1)).collect();
-        format!("{truncated}\u{2026}")
-    } else {
-        title.to_string()
-    }
+    crate::chrome::truncate_with_ellipsis(title, MAX_TITLE_CHARS)
 }
 
 /// Build the docked-handle chrome's render elements, or an empty list if
@@ -369,7 +364,12 @@ pub fn start_drag(state: &mut State, pos: Point<f64, Physical>) -> bool {
 /// Pulled out as a pure function over `Point`/`Scale` so this specific
 /// conversion — subtract, *then* convert to physical, not the other order
 /// — is directly testable at fractional scales without a live drag/State.
-fn rebase_to_output_physical(
+/// `pub(crate)`: also the shared core of `udev_backend.rs`'s
+/// `cursor_physical_position`, which independently reimplemented this
+/// exact formula before review caught the duplication — a second,
+/// untethered copy of a conversion order this doc comment already warns
+/// is easy to get wrong.
+pub(crate) fn rebase_to_output_physical(
     global_pos: Point<f64, Logical>,
     output_position: Point<i32, Logical>,
     scale: f64,

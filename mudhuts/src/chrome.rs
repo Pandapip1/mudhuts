@@ -37,6 +37,22 @@ const MAX_TITLE_CHARS: usize = 24;
 
 type Element = OutputRenderElements<GlesRenderer, HutSpaceRenderElement>;
 
+/// Shorten `s` to at most `max_chars` characters, replacing the last one
+/// with an ellipsis if it was longer — shared by [`window_title`] (own
+/// `MAX_TITLE_CHARS`, `24`) and `docks.rs::truncate` (its own narrower
+/// `MAX_TITLE_CHARS`, `18` — a dock handle has less width to work with
+/// than a tab), which independently reimplemented the identical
+/// char-count-then-ellipsis algorithm before review caught the
+/// duplication.
+pub(crate) fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
+    if s.chars().count() > max_chars {
+        let truncated: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+        format!("{truncated}\u{2026}")
+    } else {
+        s.to_string()
+    }
+}
+
 /// Read a toplevel's title live (not cached/event-driven), falling back
 /// to its app_id, then a placeholder — the same `with_states`/
 /// `XdgToplevelSurfaceData` mechanism `handlers/xdg_shell.rs`'s
@@ -57,15 +73,7 @@ pub(crate) fn window_title(window: &Window) -> String {
     })
     .unwrap_or_else(|| "(window)".to_string());
 
-    if title.chars().count() > MAX_TITLE_CHARS {
-        let truncated: String = title
-            .chars()
-            .take(MAX_TITLE_CHARS.saturating_sub(1))
-            .collect();
-        format!("{truncated}\u{2026}")
-    } else {
-        title
-    }
+    truncate_with_ellipsis(&title, MAX_TITLE_CHARS)
 }
 
 /// Read a toplevel's app_id live — unlike [`window_title`], never falls
