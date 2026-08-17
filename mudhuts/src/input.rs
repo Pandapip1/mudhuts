@@ -351,6 +351,16 @@ impl State {
         // these against coordinates far outside that output's own real
         // bounds, breaking clicks/hover/selection there entirely.
         let output_position = self.stack.output_position(output_index);
+        // Subtract once, in Logical space, then convert what's already
+        // rebased — not a second copy of `docks::rebase_to_output_
+        // physical`'s fragile subtract-*then*-convert formula (see its
+        // own doc comment on why getting that order backwards is the
+        // real risk): chaining a plain `.to_physical` onto an already-
+        // rebased `pos` can't independently re-derive the wrong order,
+        // since there's nothing left here to combine — unlike calling
+        // that shared function with the still-global `pos`, which would
+        // subtract `output_position` a second time internally (caught in
+        // review on an earlier version of this fix).
         let pos = pos - output_position.to_f64();
         let pos_physical = self.to_physical(pos);
         // Under winit this is a no-op ping (the host draws the cursor,
@@ -431,20 +441,33 @@ impl State {
     ///
     /// Called automatically from `state.rs`'s `sync_visible_main_window`/
     /// `sync_hut_space` themselves (immediate correction right at the
-    /// mutation site), *and*, more importantly, unconditionally from
-    /// `render.rs`'s `build_frame_elements` on every real redraw pass —
-    /// the single point both backends' otherwise-separate redraw paths
-    /// converge on, so no mutation path can skip it the way several
-    /// turned up missing the first two call sites across review rounds
-    /// (most recently `GraphStack::remove_exited` — a shell exit
-    /// shifting/collapsing focus; see its own doc comment). Called for
-    /// *every* output that reaches `build_frame_elements` on a given
-    /// redraw pass, not deduplicated to just one — a per-crtc bail (the
-    /// udev backend's own `frame_pending` check, see `render_surface`'s
-    /// doc comment) means not every output necessarily reaches it on
-    /// every tick, so "only once, however that's chosen" can't safely
-    /// assume any specific output reliably does; redundant calls are
-    /// cheap (see below) so there's no real cost to just always doing it.
+    /// mutation site — always ungated, since each only runs once per
+    /// mutation event, not once per output per frame), *and*, more
+    /// importantly, from `render.rs`'s `build_frame_elements` on every
+    /// real redraw pass — the single point both backends' otherwise-
+    /// separate redraw paths converge on, so no mutation path can skip it
+    /// the way several turned up missing the first two call sites across
+    /// review rounds (most recently `GraphStack::remove_exited` — a shell
+    /// exit shifting/collapsing focus; see its own doc comment).
+    /// Logically needed for *every* output that reaches
+    /// `build_frame_elements` on a given redraw pass, not deduplicated to
+    /// just one — a per-crtc bail (the udev backend's own `frame_pending`
+    /// check, see `render_surface`'s doc comment) means not every output
+    /// necessarily reaches it on every tick, so "only once, however
+    /// that's chosen" can't safely assume any specific output reliably
+    /// does. Redundant calls are logically safe — this method only ever
+    /// *repairs* a genuinely stale focus, never force-overrides a still-
+    /// legitimate one — but **not free**: it scans every output's own
+    /// layer map internally, so `build_frame_elements` doesn't call this
+    /// method directly. It goes through `GraphStack::
+    /// take_needs_keyboard_focus_sync` instead, which runs this at most
+    /// once per real frame (a frame that renders every output together,
+    /// the common case, previously paid for that scan once per output —
+    /// an O(outputs^2) cost with no correctness benefit, caught in
+    /// review; see that gate's own doc comment). Any *new* per-output
+    /// render-path call site should go through that same gate, not call
+    /// this method directly — the two existing mutation-time call sites
+    /// above are the deliberate exception, not a precedent to copy.
     ///
     /// **This must NOT unconditionally force-set focus to "the terminal or
     /// the active Main Window" every time it runs** — an earlier version
