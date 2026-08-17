@@ -260,3 +260,74 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn img(size: u32, width: u32, height: u32, delay: u32) -> Image {
+        Image {
+            size,
+            width,
+            height,
+            xhot: 0,
+            yhot: 0,
+            delay,
+            pixels_rgba: Vec::new(),
+            pixels_argb: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn nearest_images_of_no_images_is_empty() {
+        assert!(nearest_images(24, &[]).is_empty());
+    }
+
+    #[test]
+    fn nearest_images_picks_the_closest_size() {
+        let images = vec![img(16, 16, 16, 0), img(32, 32, 32, 0), img(48, 48, 48, 0)];
+        let nearest = nearest_images(30, &images);
+        assert_eq!(nearest.len(), 1);
+        assert_eq!(nearest[0].0, 1);
+    }
+
+    #[test]
+    fn nearest_images_includes_every_frame_matching_the_nearest_dimensions() {
+        // An animated cursor's frames all share the same size but have
+        // distinct delays — the whole point of returning a `Vec` rather
+        // than a single nearest match.
+        let images = vec![
+            img(24, 24, 24, 100),
+            img(24, 24, 24, 100),
+            img(48, 48, 48, 100),
+        ];
+        let nearest = nearest_images(20, &images);
+        assert_eq!(nearest.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![0, 1]);
+    }
+
+    #[test]
+    fn frame_of_no_images_is_none() {
+        assert!(frame(0, 24, &[]).is_none());
+    }
+
+    #[test]
+    fn frame_picks_the_candidate_whose_delay_window_contains_the_elapsed_time() {
+        let images = vec![img(24, 24, 24, 100), img(24, 24, 24, 100), img(24, 24, 24, 100)];
+        assert_eq!(frame(0, 24, &images).map(|(i, _)| i), Some(0));
+        assert_eq!(frame(150, 24, &images).map(|(i, _)| i), Some(1));
+        assert_eq!(frame(250, 24, &images).map(|(i, _)| i), Some(2));
+    }
+
+    #[test]
+    fn frame_wraps_around_via_modulo_of_the_total_delay() {
+        let images = vec![img(24, 24, 24, 100), img(24, 24, 24, 100)];
+        // Total delay is 200ms; 250ms should behave the same as 50ms.
+        assert_eq!(frame(250, 24, &images).map(|(i, _)| i), frame(50, 24, &images).map(|(i, _)| i));
+    }
+
+    #[test]
+    fn frame_falls_back_to_the_first_candidate_when_total_delay_is_zero() {
+        let images = vec![img(24, 24, 24, 0), img(24, 24, 24, 0)];
+        assert_eq!(frame(9999, 24, &images).map(|(i, _)| i), Some(0));
+    }
+}
