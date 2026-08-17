@@ -9,7 +9,7 @@ use smithay::desktop::layer_map_for_output;
 use smithay::input::keyboard::{FilterResult, KeysymHandle, ModifiersState, keysyms};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Logical, Physical, Point, SERIAL_COUNTER, Scale, Serial};
+use smithay::utils::{Logical, Physical, Point, Rectangle, SERIAL_COUNTER, Scale, Serial};
 use smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitorSeat;
 use smithay::wayland::selection::data_device::set_data_device_selection;
 use smithay::wayland::selection::primary_selection::set_primary_selection;
@@ -139,6 +139,128 @@ fn encode(
         Key::Text(c)
     };
     mudhuts_term::keys::encode(key, mods_from(mods), mode)
+}
+
+/// Clamps `new_location` first to `bounds` (the virtual desktop's own
+/// bounding hull), then — if that's not enough to land inside any real
+/// output's own rect (a "dead zone" between two different-sized/
+/// positioned outputs) — snaps to the nearest point on whichever real
+/// output rect is geometrically closest, rather than leaving it
+/// somewhere no real output actually covers. Deliberately not resolved
+/// via "whichever output is currently focused": that could be a
+/// completely different, geometrically distant monitor, and snapping
+/// into it from a dead zone would teleport the cursor across the whole
+/// virtual desktop instead of stopping at the nearest real edge. Pulled
+/// out of `PointerMotion`'s relative-delta handling as a pure function
+/// over `Point`/`Rectangle` — this is the densest, most failure-prone
+/// geometry in this file (float comparisons, an empty/tie `min_by`, an
+/// "already contained" fast path) and was previously untestable without
+/// a live multi-monitor `GraphStack`.
+fn clamp_to_nearest_output(
+    new_location: Point<f64, Logical>,
+    bounds: Rectangle<f64, Logical>,
+    output_rects: impl Iterator<Item = Rectangle<f64, Logical>> + Clone,
+) -> Point<f64, Logical> {
+    let mut new_location = new_location;
+    new_location.x = new_location.x.clamp(bounds.loc.x, (bounds.loc.x + bounds.size.w).max(bounds.loc.x));
+    new_location.y = new_location.y.clamp(bounds.loc.y, (bounds.loc.y + bounds.size.h).max(bounds.loc.y));
+
+    // Cheap common-case check first: if `new_location` is already
+    // genuinely inside some real output's rect (the overwhelming
+    // majority of motion samples), this is a no-op and the more
+    // expensive per-output nearest-point search below never runs at all.
+    // `output_rects` is a generic `impl Iterator`, not a collected `Vec`
+    // — this is real hot-path code (every relative pointer-motion
+    // sample), and a version of this extraction that collected into a
+    // `Vec` first added a heap allocation to every single event that
+    // wasn't there before (caught in review) — `Clone` lets it be walked
+    // twice (this check, then the nearest-point search below) without
+    // ever materializing one.
+    if output_rects.clone().any(|rect| rect.contains(new_location)) {
+        return new_location;
+    }
+
+    let nearest = output_rects
+        .map(|rect| {
+            let cx = new_location.x.clamp(rect.loc.x, (rect.loc.x + rect.size.w).max(rect.loc.x));
+            let cy = new_location.y.clamp(rect.loc.y, (rect.loc.y + rect.size.h).max(rect.loc.y));
+            let dist = (cx - new_location.x).hypot(cy - new_location.y);
+            (dist, Point::from((cx, cy)))
+        })
+        .min_by(|(a, _), (b, _)| a.total_cmp(b));
+    if let Some((_, clamped)) = nearest {
+        new_location = clamped;
+    }
+    new_location
+}
+
+/// Accumulates `delta` into `accum`, extracts however many whole `unit`-
+/// sized steps have built up (truncated toward zero), and carries the
+/// remainder back — the same "accumulate continuous motion into discrete
+/// steps, don't just treat every single event as one step" shape backs
+/// both SGR mouse-wheel click reporting and this ConsoleHut's own
+/// scrollback stepping (see `PointerAxis`'s own comments on why a naive
+/// per-event step made a gentle trackpad swipe register as dozens of
+/// clicks). Returns `(new_accum, whole_units)`. Pure over primitives, so
+/// this carry-the-remainder arithmetic — easy to get subtly wrong,
+/// e.g. forgetting to subtract the *consumed* portion back out, or with
+/// the wrong sign — is directly testable without a live terminal/pointer.
+fn accumulate_discrete_units(accum: f64, delta: f64, unit: f64) -> (f64, i32) {
+    let accum = accum + delta;
+    let whole_units = (accum / unit).trunc() as i32;
+    (accum - whole_units as f64 * unit, whole_units)
+}
+
+/// Which pane index (if any) `pixel` lands inside, given `rects` — each
+/// `(x, y, w, h)`, the same shape `hut::pane_rects` returns — in the same
+/// order they're enumerated. Pulled out of `try_click_chrome`'s Tile-pane
+/// hit-test as a pure function so the round-to-pixel-then-contains logic
+/// that turns a raw click into a pane index is directly testable, same
+/// reasoning as `village_chrome.rs`'s `level_layout`/`chrome.rs`'s
+/// `tab_layout` already being shared between drawing and hit-testing.
+fn hit_pane_index(pixel: Point<i32, Physical>, rects: impl Iterator<Item = (i32, i32, i32, i32)>) -> Option<usize> {
+    rects
+        .enumerate()
+        .find_map(|(i, (x, y, w, h))| (pixel.x >= x && pixel.x < x + w && pixel.y >= y && pixel.y < y + h).then_some(i))
+}
+
+/// The order `exclusive_layer_surface` checks outputs in: the focused one
+/// first (real keystrokes — including an on-screen lock/PIN entry — must
+/// go to whichever output the user is actually looking at, not whichever
+/// client happened to request `exclusive` first), then every other output
+/// in its own original relative order. `focused_index >= count` (should
+/// never happen in practice, but not assumed) just means nothing is
+/// checked first. Pulled out as a pure function over indices so this
+/// ordering guarantee is directly testable without constructing real
+/// layer-shell surfaces/outputs.
+fn exclusive_search_order(focused_index: usize, count: usize) -> impl Iterator<Item = usize> {
+    // A lazy chain, not a collected `Vec` — matches `clamp_to_nearest_
+    // output`'s own reasoning (see its doc comment on a prior version of
+    // this whole extraction pass adding needless allocations to
+    // input-dispatch paths that never had any before).
+    std::iter::once(focused_index).filter(move |&i| i < count).chain((0..count).filter(move |&i| i != focused_index))
+}
+
+/// The tab-strip auto-hide state machine's core decision (see
+/// `update_tab_strip_reveal`'s own doc comment for the feature this
+/// backs): reveal instantly on touching the top edge; while already
+/// revealed, stay revealed only as long as the pointer remains within
+/// the strip's own height; otherwise stay hidden. `strip_height` is
+/// `None` exactly when it's irrelevant to the outcome (the edge-touch
+/// branch always wins regardless of it, and the not-currently-revealed
+/// branch never reads it either) — `update_tab_strip_reveal`'s own
+/// caller only computes the real height (a real graph traversal, not
+/// free) on the one branch that actually needs it, preserved here as
+/// `None` rather than forcing every caller to compute it unconditionally
+/// just to satisfy this function's own signature.
+fn tab_strip_reveal_state(pointer_y: f64, edge_reveal_px: f64, currently_revealed: bool, strip_height: Option<f64>) -> bool {
+    if pointer_y <= edge_reveal_px {
+        true
+    } else if currently_revealed {
+        strip_height.is_some_and(|h| pointer_y <= h)
+    } else {
+        false
+    }
 }
 
 impl State {
@@ -461,15 +583,13 @@ impl State {
     /// path's own depth, no I/O).
     fn update_tab_strip_reveal(&mut self, pointer_y_physical: f64) {
         const EDGE_REVEAL_PX: f64 = 4.0;
-        let revealed = if pointer_y_physical <= EDGE_REVEAL_PX {
-            true
-        } else if self.tab_strip_revealed {
-            let height = crate::render::combined_tab_strip_height(self, self.stack.focused_output_index());
-            pointer_y_physical <= height as f64
-        } else {
-            false
-        };
-        self.tab_strip_revealed = revealed;
+        // Only computed on the one branch that actually needs it — see
+        // `tab_strip_reveal_state`'s own doc comment on why `None`
+        // elsewhere isn't just a placeholder.
+        let strip_height = (pointer_y_physical > EDGE_REVEAL_PX && self.tab_strip_revealed)
+            .then(|| crate::render::combined_tab_strip_height(self, self.stack.focused_output_index()) as f64);
+        self.tab_strip_revealed =
+            tab_strip_reveal_state(pointer_y_physical, EDGE_REVEAL_PX, self.tab_strip_revealed, strip_height);
     }
 
     /// Try to handle a left-click as a chrome interaction — a
@@ -533,9 +653,7 @@ impl State {
                 let rects = crate::hut::pane_rects(axis, fracs.into_iter(), (area.size.w, area.size.h))
                     .into_iter()
                     .map(|(x, y, w, h)| (x + area.loc.x, y + area.loc.y, w, h));
-                let Some(i) = rects.enumerate().find_map(|(i, (x, y, w, h))| {
-                    (pixel.x >= x && pixel.x < x + w && pixel.y >= y && pixel.y < y + h).then_some(i)
-                }) else {
+                let Some(i) = hit_pane_index(pixel, rects) else {
                     return false;
                 };
                 // Writing through the `Signal` requests its own redraw
@@ -669,18 +787,8 @@ impl State {
                 })
                 .map(|l| l.wl_surface().clone())
         }
-        let focused_index = self.stack.focused_output_index();
-        if let Some(slot) = self.stack.outputs().get(focused_index)
-            && let Some(surface) = exclusive_on(&slot.output)
-        {
-            return Some(surface);
-        }
-        self.stack
-            .outputs()
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != focused_index)
-            .find_map(|(_, slot)| exclusive_on(&slot.output))
+        exclusive_search_order(self.stack.focused_output_index(), self.stack.outputs().len())
+            .find_map(|i| self.stack.outputs().get(i).and_then(|slot| exclusive_on(&slot.output)))
     }
 
     /// Where every input event goes while `self.locked` (see
@@ -1021,51 +1129,17 @@ impl State {
                 // reference clamps against `space.output_geometry`, not a
                 // raw physical mode size, for the same reason).
                 let bounds = self.stack.virtual_bounding_box();
-                let mut new_location = self.pointer_location + event.delta();
-                new_location.x = new_location.x.clamp(bounds.loc.x, (bounds.loc.x + bounds.size.w).max(bounds.loc.x));
-                new_location.y = new_location.y.clamp(bounds.loc.y, (bounds.loc.y + bounds.size.h).max(bounds.loc.y));
                 // `bounds` is only a bounding *hull*, not a true union
-                // (see `GraphStack::virtual_bounding_box`'s doc comment)
-                // — clamp a second time, into whichever real output's rect
-                // is geometrically *nearest*, so a "dead zone" between two
-                // different-height outputs can never leave `new_location`
-                // somewhere not actually contained by any real output's
-                // rect (which would otherwise get rebased in
-                // `handle_pointer_motion` as if it were safely inside).
-                // Deliberately not `output_index_at(new_location)` here:
-                // that falls back to whichever output is *currently
-                // focused* for an unowned point, which could be a
-                // completely different, geometrically distant monitor —
-                // snapping into it from a dead zone would teleport the
-                // cursor across the whole virtual desktop instead of
-                // stopping at the nearest real edge.
-                // Cheap common-case check first — `output_index_at`'s own
-                // fallback-to-focused isn't trustworthy for this (see
-                // above), but its underlying rect-contains scan is: if
-                // `new_location` is already genuinely inside some real
-                // output's rect (the overwhelming majority of motion
-                // samples), this is a no-op and the expensive per-output
-                // nearest-point search below never runs at all.
-                let already_contained = (0..self.stack.outputs().len())
-                    .any(|i| self.stack.output_rect(i).is_some_and(|rect| rect.contains(new_location)));
-                if !already_contained {
-                    let nearest = self
-                        .stack
-                        .outputs()
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, _)| {
-                            let rect = self.stack.output_rect(i)?;
-                            let cx = new_location.x.clamp(rect.loc.x, (rect.loc.x + rect.size.w).max(rect.loc.x));
-                            let cy = new_location.y.clamp(rect.loc.y, (rect.loc.y + rect.size.h).max(rect.loc.y));
-                            let dist = (cx - new_location.x).hypot(cy - new_location.y);
-                            Some((dist, Point::from((cx, cy))))
-                        })
-                        .min_by(|(a, _), (b, _)| a.total_cmp(b));
-                    if let Some((_, clamped)) = nearest {
-                        new_location = clamped;
-                    }
-                }
+                // (see `GraphStack::virtual_bounding_box`'s doc comment),
+                // so clamping to it alone can leave a point in the "dead
+                // zone" between two different-height/positioned outputs,
+                // not actually contained by any real output's rect (which
+                // would otherwise get rebased in `handle_pointer_motion`
+                // as if it were safely inside) — see
+                // `clamp_to_nearest_output`'s own doc comment for the rest.
+                let output_rects = (0..self.stack.outputs().len()).filter_map(|i| self.stack.output_rect(i));
+                let new_location =
+                    clamp_to_nearest_output(self.pointer_location + event.delta(), bounds, output_rects);
                 self.handle_pointer_motion(new_location, event.time_msec());
             }
             InputEvent::PointerMotionAbsolute { event, .. } => {
@@ -1283,31 +1357,29 @@ impl State {
                         // TUI app's (vim/less/btop/...) own scrollback far
                         // faster than the same physical motion should.
                         let hut = self.stack.focused_mut();
-                        hut.wheel_click_accum += vertical_amount;
-                        let clicks = (hut.wheel_click_accum / WHEEL_CLICK_PX).trunc() as i32;
-                        if clicks != 0 {
-                            hut.wheel_click_accum -= clicks as f64 * WHEEL_CLICK_PX;
-
-                            if let Some(pointer) = self.seat.get_pointer() {
-                                let pos = self.to_physical(pointer.current_location());
-                                let (ox, oy) = self.active_pane_offset();
-                                let (col, row, _) =
-                                    self.stack.focused().pixel_to_cell(pos.x - ox, pos.y - oy);
-                                let mods = self.current_mods();
-                                let wheel_button = if clicks > 0 {
-                                    mudhuts_term::mouse::BUTTON_WHEEL_DOWN
-                                } else {
-                                    mudhuts_term::mouse::BUTTON_WHEEL_UP
-                                };
-                                for _ in 0..clicks.abs() {
-                                    self.stack.focused().terminal.report_mouse_button(
-                                        wheel_button,
-                                        mods,
-                                        true,
-                                        col + 1,
-                                        row + 1,
-                                    );
-                                }
+                        let (new_accum, clicks) =
+                            accumulate_discrete_units(hut.wheel_click_accum, vertical_amount, WHEEL_CLICK_PX);
+                        hut.wheel_click_accum = new_accum;
+                        if clicks != 0
+                            && let Some(pointer) = self.seat.get_pointer()
+                        {
+                            let pos = self.to_physical(pointer.current_location());
+                            let (ox, oy) = self.active_pane_offset();
+                            let (col, row, _) = self.stack.focused().pixel_to_cell(pos.x - ox, pos.y - oy);
+                            let mods = self.current_mods();
+                            let wheel_button = if clicks > 0 {
+                                mudhuts_term::mouse::BUTTON_WHEEL_DOWN
+                            } else {
+                                mudhuts_term::mouse::BUTTON_WHEEL_UP
+                            };
+                            for _ in 0..clicks.abs() {
+                                self.stack.focused().terminal.report_mouse_button(
+                                    wheel_button,
+                                    mods,
+                                    true,
+                                    col + 1,
+                                    row + 1,
+                                );
                             }
                         }
                     } else {
@@ -1324,10 +1396,10 @@ impl State {
                         // tall a line actually is.
                         let cell_h = self.stack.focused().glyphs.cell_height() as f64;
                         let hut = self.stack.focused_mut();
-                        hut.scroll_line_accum += vertical_amount;
-                        let lines = (hut.scroll_line_accum / cell_h).trunc() as i32;
+                        let (new_accum, lines) =
+                            accumulate_discrete_units(hut.scroll_line_accum, vertical_amount, cell_h);
+                        hut.scroll_line_accum = new_accum;
                         if lines != 0 {
-                            hut.scroll_line_accum -= lines as f64 * cell_h;
                             // `lines > 0` is "scroll down" (same convention
                             // as the wheel-report mapping above);
                             // `Terminal::scroll`'s sign is the opposite
@@ -1359,5 +1431,139 @@ impl State {
         // harmless no-op call (its own event loop iteration already
         // flushes via the host's normal dispatch cycle).
         let _ = self.display_handle.flush_clients();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamp_to_nearest_output_is_a_no_op_when_already_inside_an_output() {
+        let bounds = Rectangle::new(Point::from((0.0, 0.0)), smithay::utils::Size::from((2000.0, 800.0)));
+        let outputs = [Rectangle::new(Point::from((0.0, 0.0)), smithay::utils::Size::from((1000.0, 800.0)))];
+        let point = Point::from((500.0, 400.0));
+        assert_eq!(clamp_to_nearest_output(point, bounds, outputs.into_iter()), point);
+    }
+
+    #[test]
+    fn clamp_to_nearest_output_clamps_to_the_hull_first() {
+        let bounds = Rectangle::new(Point::from((0.0, 0.0)), smithay::utils::Size::from((1000.0, 800.0)));
+        let outputs = [Rectangle::new(Point::from((0.0, 0.0)), smithay::utils::Size::from((1000.0, 800.0)))];
+        // Far outside the hull entirely — clamped into the hull, which is
+        // itself a real output here, so no further nearest-point search
+        // is needed.
+        let point = Point::from((5000.0, -200.0));
+        assert_eq!(clamp_to_nearest_output(point, bounds, outputs.into_iter()), Point::from((1000.0, 0.0)));
+    }
+
+    #[test]
+    fn clamp_to_nearest_output_snaps_into_the_dead_zone_between_two_outputs() {
+        // Two side-by-side outputs, B shorter than A — a "dead zone"
+        // exists below B but to the right of A.
+        let a = Rectangle::new(Point::from((0.0, 0.0)), smithay::utils::Size::from((1000.0, 800.0)));
+        let b = Rectangle::new(Point::from((1000.0, 0.0)), smithay::utils::Size::from((1000.0, 600.0)));
+        let bounds = Rectangle::new(Point::from((0.0, 0.0)), smithay::utils::Size::from((2000.0, 800.0)));
+        let point = Point::from((1500.0, 700.0));
+        // Nearest point on A: (1000, 700), distance 500.
+        // Nearest point on B: (1500, 600), distance 100 — genuinely closer.
+        assert_eq!(clamp_to_nearest_output(point, bounds, [a, b].into_iter()), Point::from((1500.0, 600.0)));
+    }
+
+    #[test]
+    fn clamp_to_nearest_output_with_no_real_outputs_falls_back_to_the_hull_clamp() {
+        let bounds = Rectangle::new(Point::from((0.0, 0.0)), smithay::utils::Size::from((1000.0, 800.0)));
+        let point = Point::from((5000.0, 5000.0));
+        assert_eq!(clamp_to_nearest_output(point, bounds, std::iter::empty()), Point::from((1000.0, 800.0)));
+    }
+
+    #[test]
+    fn accumulate_discrete_units_stays_at_zero_below_one_unit() {
+        let (accum, units) = accumulate_discrete_units(0.0, 5.0, 15.0);
+        assert_eq!(units, 0);
+        assert_eq!(accum, 5.0);
+    }
+
+    #[test]
+    fn accumulate_discrete_units_extracts_exact_multiples_with_no_remainder() {
+        let (accum, units) = accumulate_discrete_units(0.0, 30.0, 15.0);
+        assert_eq!(units, 2);
+        assert_eq!(accum, 0.0);
+    }
+
+    #[test]
+    fn accumulate_discrete_units_carries_the_remainder_across_calls() {
+        let (accum, units) = accumulate_discrete_units(0.0, 20.0, 15.0);
+        assert_eq!(units, 1);
+        assert_eq!(accum, 5.0);
+        // A second small delta combines with the carried remainder to
+        // produce a second unit exactly when the total crosses 15.
+        let (accum, units) = accumulate_discrete_units(accum, 10.0, 15.0);
+        assert_eq!(units, 1);
+        assert_eq!(accum, 0.0);
+    }
+
+    #[test]
+    fn accumulate_discrete_units_handles_negative_deltas_symmetrically() {
+        let (accum, units) = accumulate_discrete_units(0.0, -20.0, 15.0);
+        assert_eq!(units, -1);
+        assert_eq!(accum, -5.0);
+    }
+
+    #[test]
+    fn hit_pane_index_finds_the_containing_rect() {
+        let rects = vec![(0, 0, 100, 100), (100, 0, 100, 100)];
+        assert_eq!(hit_pane_index(Point::from((50, 50)), rects.clone().into_iter()), Some(0));
+        assert_eq!(hit_pane_index(Point::from((150, 50)), rects.into_iter()), Some(1));
+    }
+
+    #[test]
+    fn hit_pane_index_outside_every_rect_is_none() {
+        let rects = vec![(0, 0, 100, 100), (100, 0, 100, 100)];
+        assert_eq!(hit_pane_index(Point::from((500, 500)), rects.into_iter()), None);
+    }
+
+    #[test]
+    fn hit_pane_index_upper_bound_is_exclusive() {
+        // (0,0,100,100)'s own far edge (x=100) belongs to the *next*
+        // pane, not this one — an inclusive upper bound here would let a
+        // click land in two panes' rects at once.
+        let rects = vec![(0, 0, 100, 100), (100, 0, 100, 100)];
+        assert_eq!(hit_pane_index(Point::from((100, 50)), rects.into_iter()), Some(1));
+    }
+
+    #[test]
+    fn exclusive_search_order_puts_the_focused_output_first() {
+        assert_eq!(exclusive_search_order(0, 3).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(exclusive_search_order(2, 3).collect::<Vec<_>>(), vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn exclusive_search_order_with_a_single_output() {
+        assert_eq!(exclusive_search_order(0, 1).collect::<Vec<_>>(), vec![0]);
+    }
+
+    #[test]
+    fn exclusive_search_order_with_an_out_of_range_focused_index_is_still_complete() {
+        assert_eq!(exclusive_search_order(5, 3).collect::<Vec<_>>(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn tab_strip_reveal_state_reveals_on_edge_touch_regardless_of_prior_state() {
+        assert!(tab_strip_reveal_state(0.0, 4.0, false, None));
+        assert!(tab_strip_reveal_state(4.0, 4.0, false, None));
+    }
+
+    #[test]
+    fn tab_strip_reveal_state_stays_hidden_until_the_edge_is_touched() {
+        // Past the edge threshold, but never revealed to begin with —
+        // must stay hidden regardless of how tall the strip is.
+        assert!(!tab_strip_reveal_state(10.0, 4.0, false, Some(1000.0)));
+    }
+
+    #[test]
+    fn tab_strip_reveal_state_stays_revealed_within_the_strip_and_hides_past_it() {
+        assert!(tab_strip_reveal_state(10.0, 4.0, true, Some(20.0)));
+        assert!(!tab_strip_reveal_state(30.0, 4.0, true, Some(20.0)));
     }
 }
