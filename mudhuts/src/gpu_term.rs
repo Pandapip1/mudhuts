@@ -1080,3 +1080,62 @@ fn rgb_f32(rgb: Rgb) -> [f32; 3] {
         rgb[2] as f32 / 255.0,
     ]
 }
+
+#[cfg(test)]
+mod shelf_packer_tests {
+    use super::*;
+
+    #[test]
+    fn first_alloc_lands_at_the_origin() {
+        let mut packer = ShelfPacker::new();
+        assert_eq!(packer.alloc(10, 20), Some((0, 0)));
+    }
+
+    #[test]
+    fn sequential_allocs_on_the_same_shelf_advance_left_to_right() {
+        let mut packer = ShelfPacker::new();
+        assert_eq!(packer.alloc(10, 20), Some((0, 0)));
+        assert_eq!(packer.alloc(15, 20), Some((10, 0)));
+        assert_eq!(packer.alloc(5, 20), Some((25, 0)));
+    }
+
+    #[test]
+    fn a_glyph_that_would_overflow_the_row_wraps_to_a_new_shelf() {
+        let mut packer = ShelfPacker::new();
+        packer.alloc(ATLAS_SIZE - 5, 20).unwrap();
+        // 10 more px wouldn't fit in the remaining 5px of this row.
+        assert_eq!(packer.alloc(10, 30), Some((0, 20)));
+    }
+
+    #[test]
+    fn a_new_shelfs_row_starts_below_the_tallest_glyph_on_the_previous_shelf() {
+        let mut packer = ShelfPacker::new();
+        // First shelf: a short glyph then a tall one — the shelf's
+        // height must be the max of the two, not just the last placed.
+        assert_eq!(packer.alloc(10, 5), Some((0, 0)));
+        assert_eq!(packer.alloc(10, 30), Some((10, 0)));
+        // Force a wrap to a new shelf; it should start 30px down, not 5.
+        assert_eq!(packer.alloc(ATLAS_SIZE, 1), Some((0, 30)));
+    }
+
+    #[test]
+    fn a_glyph_wider_than_the_atlas_never_fits() {
+        let mut packer = ShelfPacker::new();
+        assert_eq!(packer.alloc(ATLAS_SIZE + 1, 10), None);
+    }
+
+    #[test]
+    fn a_glyph_taller_than_the_atlas_never_fits() {
+        let mut packer = ShelfPacker::new();
+        assert_eq!(packer.alloc(10, ATLAS_SIZE + 1), None);
+    }
+
+    #[test]
+    fn once_the_atlas_is_vertically_full_further_allocs_fail() {
+        let mut packer = ShelfPacker::new();
+        // Fill every shelf exactly to the bottom edge.
+        assert!(packer.alloc(ATLAS_SIZE, ATLAS_SIZE).is_some());
+        // Anything else forces a wrap past the atlas's bottom edge.
+        assert_eq!(packer.alloc(1, 1), None);
+    }
+}
