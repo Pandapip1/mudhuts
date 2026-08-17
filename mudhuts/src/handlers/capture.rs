@@ -265,6 +265,40 @@ impl State {
     }
 }
 
+/// One row's byte ranges within the tightly-packed source and the
+/// (possibly differently-strided) destination, for every row that
+/// actually fits within both `src_len` and `dst_len` — stops at the
+/// first row that wouldn't (shouldn't happen once Smithay's own
+/// `validate_buffer` has run before calling into this handler, but
+/// stays panic-free rather than assuming that invariant, per project
+/// convention) and every row after, since both offsets only grow with
+/// `row`. Pulled out of `write_shm_buffer` as pure arithmetic over
+/// lengths/strides so the bounds logic is directly testable without a
+/// real `WlBuffer`. Returns a lazy iterator, not a `Vec` — `capture_frame`
+/// calls this once per captured frame (an active screencast is typically
+/// 30-60fps), so this needs to stay allocation-free like the rest of
+/// that hot path.
+fn shm_copy_plan(
+    size: (i32, i32),
+    offset: i32,
+    stride: i32,
+    src_len: usize,
+    dst_len: usize,
+) -> impl Iterator<Item = (std::ops::Range<usize>, std::ops::Range<usize>)> {
+    let row_bytes = size.0 as usize * 4;
+    let height = size.1 as usize;
+    let offset = offset as usize;
+    let stride = stride as usize;
+
+    (0..height)
+        .map(move |row| {
+            let src_start = row * row_bytes;
+            let dst_start = offset + row * stride;
+            (src_start..src_start + row_bytes, dst_start..dst_start + row_bytes)
+        })
+        .take_while(move |(src_range, dst_range)| src_range.end <= src_len && dst_range.end <= dst_len)
+}
+
 /// Copy `pixels` (tightly-packed, `size.0 * size.1 * 4` bytes, one row after
 /// another) into the client's SHM buffer at its real `offset`/`stride` —
 /// never assumed to equal `width * 4`, per the client's own pool layout.
@@ -275,30 +309,74 @@ fn write_shm_buffer(
     offset: i32,
     stride: i32,
 ) -> Result<(), FailureReason> {
-    let row_bytes = size.0 as usize * 4;
-    let height = size.1 as usize;
-    let offset = offset as usize;
-    let stride = stride as usize;
-
     with_buffer_contents_mut(buffer, |ptr, len, _| {
         // Safety: `ptr`/`len` describe the client's SHM pool for exactly as
         // long as this closure runs (see `with_buffer_contents_mut`'s own
         // safety doc) — never stored past this call.
         let dst = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
-        for row in 0..height {
-            let src_start = row * row_bytes;
-            let dst_start = offset + row * stride;
-            if src_start + row_bytes > pixels.len() || dst_start + row_bytes > dst.len() {
-                // Shouldn't happen once Smithay's own `validate_buffer` has
-                // run before calling into this handler — stay panic-free
-                // rather than assume it, per project convention.
-                break;
-            }
-            dst[dst_start..dst_start + row_bytes].copy_from_slice(&pixels[src_start..src_start + row_bytes]);
+        for (src_range, dst_range) in shm_copy_plan(size, offset, stride, pixels.len(), dst.len()) {
+            dst[dst_range].copy_from_slice(&pixels[src_range]);
         }
     })
     .map_err(|err| {
         tracing::warn!("capture: failed to write SHM buffer: {err}");
         FailureReason::Unknown
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_tightly_packed_destination_copies_every_row_contiguously() {
+        let row_bytes = 4 * 4; // 4px wide, 4 bytes/px
+        let plan: Vec<_> = shm_copy_plan((4, 3), 0, row_bytes as i32, row_bytes * 3, row_bytes * 3).collect();
+        assert_eq!(plan.len(), 3);
+        assert_eq!(plan[0], (0..row_bytes, 0..row_bytes));
+        assert_eq!(plan[1], (row_bytes..2 * row_bytes, row_bytes..2 * row_bytes));
+        assert_eq!(plan[2], (2 * row_bytes..3 * row_bytes, 2 * row_bytes..3 * row_bytes));
+    }
+
+    #[test]
+    fn a_wider_destination_stride_leaves_a_gap_between_destination_rows() {
+        let row_bytes = 16;
+        let stride = 32; // padded to double the tightly-packed width
+        let plan: Vec<_> = shm_copy_plan((4, 2), 0, stride, row_bytes * 2, stride as usize * 2).collect();
+        assert_eq!(plan[0].1, 0..row_bytes);
+        assert_eq!(plan[1].1, stride as usize..stride as usize + row_bytes);
+        // The source side stays tightly packed regardless of the
+        // destination's stride.
+        assert_eq!(plan[1].0, row_bytes..2 * row_bytes);
+    }
+
+    #[test]
+    fn a_nonzero_offset_shifts_every_destination_row() {
+        let row_bytes = 16;
+        let offset = 100;
+        let plan: Vec<_> =
+            shm_copy_plan((4, 2), offset, row_bytes as i32, row_bytes * 2, offset as usize + row_bytes * 2).collect();
+        assert_eq!(plan[0].1, offset as usize..offset as usize + row_bytes);
+        assert_eq!(plan[1].1, offset as usize + row_bytes..offset as usize + 2 * row_bytes);
+    }
+
+    #[test]
+    fn stops_before_a_row_that_would_overrun_the_source() {
+        let row_bytes = 16;
+        // Only enough source bytes for 2 of the requested 5 rows.
+        let plan: Vec<_> = shm_copy_plan((4, 5), 0, row_bytes as i32, row_bytes * 2, row_bytes * 10).collect();
+        assert_eq!(plan.len(), 2);
+    }
+
+    #[test]
+    fn stops_before_a_row_that_would_overrun_the_destination() {
+        let row_bytes = 16;
+        let plan: Vec<_> = shm_copy_plan((4, 5), 0, row_bytes as i32, row_bytes * 10, row_bytes * 2).collect();
+        assert_eq!(plan.len(), 2);
+    }
+
+    #[test]
+    fn zero_height_produces_an_empty_plan() {
+        assert!(shm_copy_plan((4, 0), 0, 16, 0, 0).next().is_none());
+    }
 }
