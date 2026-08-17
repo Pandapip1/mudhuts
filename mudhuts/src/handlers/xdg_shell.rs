@@ -288,6 +288,16 @@ impl XdgDialogHandler for State {
     fn dialog_hint_changed(&mut self, _toplevel: ToplevelSurface, _hint: ToplevelDialogHint) {}
 }
 
+/// Whether `handle_commit` should undo `new_toplevel`'s default
+/// fullscreen hint for a toplevel that's turned out to be a dialog —
+/// either signal is enough on its own (see `handle_commit`'s own comment
+/// on why both are checked). Pulled out as a pure predicate over the two
+/// inputs so this decision is directly testable without a real
+/// `ToplevelSurface`/`WlSurface`.
+fn should_unfullscreen_for_dialog(has_parent: bool, dialog_hint: ToplevelDialogHint) -> bool {
+    has_parent || dialog_hint != ToplevelDialogHint::Unknown
+}
+
 /// Should be called on `WlSurface::commit`.
 ///
 /// This is the right (and only reliable) place to decide whether a
@@ -326,7 +336,7 @@ pub fn handle_commit(popups: &mut PopupManager, window: Option<Window>, surface:
             // Checked in addition to, not instead of, `dialog_hint`:
             // plenty of dialog-ish toolkits set a parent without ever
             // touching xdg-dialog-v1.
-            if toplevel.parent().is_some() || dialog_hint != ToplevelDialogHint::Unknown {
+            if should_unfullscreen_for_dialog(toplevel.parent().is_some(), dialog_hint) {
                 toplevel.with_pending_state(|state| {
                     state.states.unset(xdg_toplevel::State::Fullscreen);
                     state.size = None;
@@ -457,5 +467,31 @@ impl State {
         popup.with_pending_state(|state| {
             state.geometry = state.positioner.get_unconstrained_geometry(target);
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_toplevel_with_no_parent_and_no_dialog_hint_stays_fullscreen() {
+        assert!(!should_unfullscreen_for_dialog(false, ToplevelDialogHint::Unknown));
+    }
+
+    #[test]
+    fn a_parented_toplevel_unfullscreens_even_without_a_dialog_hint() {
+        assert!(should_unfullscreen_for_dialog(true, ToplevelDialogHint::Unknown));
+    }
+
+    #[test]
+    fn a_dialog_hint_unfullscreens_even_without_a_parent() {
+        assert!(should_unfullscreen_for_dialog(false, ToplevelDialogHint::Dialog));
+        assert!(should_unfullscreen_for_dialog(false, ToplevelDialogHint::Modal));
+    }
+
+    #[test]
+    fn both_signals_together_still_unfullscreen() {
+        assert!(should_unfullscreen_for_dialog(true, ToplevelDialogHint::Dialog));
     }
 }
