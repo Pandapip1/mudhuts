@@ -463,7 +463,16 @@ fn real_output_geometry_for_output(output: &Output) -> Option<Rectangle<i32, Log
 /// consistent internal convention. Named explicitly (not just `.into()`)
 /// so a reader sees exactly where a genuinely-typed value deliberately
 /// downgrades to an untyped one, rather than that happening invisibly.
-fn rect_to_tuple<Kind>(rect: Rectangle<i32, Kind>) -> (i32, i32, i32, i32) {
+///
+/// Deliberately monomorphic to `Physical`, not generic over `Kind` — every
+/// real call site must only ever feed this a physical-pixel rect (per the
+/// reasoning above); a version generic over `Kind` would happily accept a
+/// `Logical` rect too, silently reintroducing the exact physical/logical
+/// mismatch bug class this file's own `usable_area*` split exists to
+/// prevent, just one level further down the call chain (caught in
+/// review). The test module below has its own tiny generic twin for
+/// comparing both `Physical` and `Logical` fixtures against a tuple.
+fn rect_to_tuple(rect: Rectangle<i32, Physical>) -> (i32, i32, i32, i32) {
     (rect.loc.x, rect.loc.y, rect.size.w, rect.size.h)
 }
 
@@ -542,6 +551,11 @@ impl State {
         Self::init_wayland_listener(display, event_loop, listening_socket)?;
         let loop_signal = event_loop.get_signal();
 
+        // Read once, shared by all four `*Config::load()`s below —
+        // see `crate::config::read_config_file`'s own doc comment for
+        // why that function itself doesn't cache this.
+        let config_file = crate::config::read_config_file();
+
         Ok(Self {
             start_time,
             socket_name,
@@ -563,10 +577,10 @@ impl State {
             seat,
             keyboards: Vec::new(),
             stack,
-            keymap: Keymap::load(),
-            theme: crate::theme::Theme::load(),
-            display_config: crate::display_config::DisplayConfig::load(),
-            chrome_config: crate::chrome_config::ChromeConfig::load(),
+            keymap: Keymap::load(&config_file),
+            theme: crate::theme::Theme::load(&config_file),
+            display_config: crate::display_config::DisplayConfig::load(&config_file),
+            chrome_config: crate::chrome_config::ChromeConfig::load(&config_file),
             tab_strip_revealed: false,
             output_size: (0, 0),
             text_selecting: false,
@@ -1345,10 +1359,8 @@ impl ClientData for ClientState {
 mod tests {
     use crate::space_element::synthetic_output;
 
-    use super::{
-        rect_to_tuple, real_output_geometry_for_output, usable_area_logical_for_output,
-        usable_area_physical_for_output,
-    };
+    use super::{real_output_geometry_for_output, usable_area_logical_for_output, usable_area_physical_for_output};
+    use smithay::utils::Rectangle;
 
     // Regression coverage for the class of bug behind the "black bar under
     // waybar" fix (commit `4291e55`): a *physical*-pixel value silently fed
@@ -1360,12 +1372,20 @@ mod tests {
     // `real_output_geometry_for_output`) directly, without needing a whole
     // `State` — so a future accidental swap of which one a call site reaches
     // for gets caught here instead of requiring a live HiDPI rebuild+retest.
+    //
+    // Test-only twin of the production `rect_to_tuple` (deliberately
+    // monomorphic to `Physical` — see its own doc comment): these
+    // assertions need to compare both `Physical` and `Logical` fixtures
+    // against a plain tuple, which the production function must not accept.
+    fn tuple<Kind>(rect: Rectangle<i32, Kind>) -> (i32, i32, i32, i32) {
+        (rect.loc.x, rect.loc.y, rect.size.w, rect.size.h)
+    }
 
     #[test]
     fn physical_and_logical_usable_area_agree_at_scale_one() {
         let output = synthetic_output("test", (1920, 1080), 1.0);
-        assert_eq!(rect_to_tuple(usable_area_physical_for_output(&output)), (0, 0, 1920, 1080));
-        assert_eq!(rect_to_tuple(usable_area_logical_for_output(&output)), (0, 0, 1920, 1080));
+        assert_eq!(tuple(usable_area_physical_for_output(&output)), (0, 0, 1920, 1080));
+        assert_eq!(tuple(usable_area_logical_for_output(&output)), (0, 0, 1920, 1080));
     }
 
     #[test]
@@ -1376,7 +1396,7 @@ mod tests {
         // unchanged (modulo an as-yet-unreserved exclusive zone, i.e. none
         // here), not divide it down by `scale` a second time.
         let output = synthetic_output("test", (3840, 2160), 2.0);
-        assert_eq!(rect_to_tuple(usable_area_physical_for_output(&output)), (0, 0, 3840, 2160));
+        assert_eq!(tuple(usable_area_physical_for_output(&output)), (0, 0, 3840, 2160));
     }
 
     #[test]
@@ -1386,14 +1406,14 @@ mod tests {
         // what `sync_main_window_space` used to silently receive, doubling
         // every downstream `to_physical` conversion at scale 2.0).
         let output = synthetic_output("test", (3840, 2160), 2.0);
-        assert_eq!(rect_to_tuple(usable_area_logical_for_output(&output)), (0, 0, 1920, 1080));
+        assert_eq!(tuple(usable_area_logical_for_output(&output)), (0, 0, 1920, 1080));
     }
 
     #[test]
     fn real_output_geometry_is_also_scale_divided_not_raw_physical() {
         let output = synthetic_output("test", (3840, 2160), 2.0);
         let geo = real_output_geometry_for_output(&output).expect("mode was set");
-        assert_eq!(rect_to_tuple(geo), (0, 0, 1920, 1080));
+        assert_eq!(tuple(geo), (0, 0, 1920, 1080));
     }
 
     #[test]
@@ -1404,7 +1424,7 @@ mod tests {
         // variants — assert they're still each other's inverse under
         // rounding, not just for the clean *2/ 2 case above.
         let output = synthetic_output("test", (2880, 1620), 1.5);
-        assert_eq!(rect_to_tuple(usable_area_physical_for_output(&output)), (0, 0, 2880, 1620));
-        assert_eq!(rect_to_tuple(usable_area_logical_for_output(&output)), (0, 0, 1920, 1080));
+        assert_eq!(tuple(usable_area_physical_for_output(&output)), (0, 0, 2880, 1620));
+        assert_eq!(tuple(usable_area_logical_for_output(&output)), (0, 0, 1920, 1080));
     }
 }

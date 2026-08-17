@@ -96,6 +96,50 @@ pub struct GraphStack {
     /// deferred simplification.
     scale: f64,
     redraw: RedrawHandle,
+    /// Whether `State::sync_keyboard_focus_to_view` still needs to run
+    /// for the current frame — reset alongside `graph.begin_frame`'s own
+    /// per-frame resolve cache by [`Self::begin_frame`]. That method
+    /// scans every output's own layer map looking for the current
+    /// keyboard focus, and (per `render.rs::build_frame_elements`'s own
+    /// doc comment) has to be called once for every output that renders
+    /// during a real frame, not deduplicated to a fixed output index —
+    /// but a real multi-monitor frame typically renders every output
+    /// together in one synchronous pass, so without this gate the same
+    /// full scan ran once per output, making total per-frame cost
+    /// O(outputs^2) instead of O(outputs) (caught in review). One run
+    /// per frame already satisfies that invariant, since every output
+    /// rendered this frame does so after the same `begin_frame` call.
+    ///
+    /// A [`FrameGate`], not a bare `bool` folded into `graph.rs`'s own
+    /// `Graph::cache` (a keyed per-`(NodeId, port)` *resolve-value*
+    /// memoization, a genuinely different kind of thing than "has this
+    /// one-shot side effect already run this frame") — but still a
+    /// small, named, reusable primitive rather than an ad hoc flag, so
+    /// a future second "run at most once per real frame" need (this is
+    /// currently the only one) has an obvious precedent to reuse instead
+    /// of inventing its own (caught in review).
+    keyboard_focus_synced: FrameGate,
+}
+
+/// A one-shot "has this already run for the current frame" gate, reset
+/// by [`GraphStack::begin_frame`] — see `keyboard_focus_synced`'s own
+/// doc comment for why this exists as a small named type rather than a
+/// bare `bool`.
+#[derive(Default)]
+struct FrameGate(bool);
+
+impl FrameGate {
+    fn reset(&mut self) {
+        self.0 = false;
+    }
+
+    /// `true` (and marks it done) only the first call since the last
+    /// [`Self::reset`].
+    fn take(&mut self) -> bool {
+        let needed = !self.0;
+        self.0 = true;
+        needed
+    }
 }
 
 /// Which shape to wrap the focused leaf into — see [`GraphStack::wrap`].
@@ -145,6 +189,7 @@ impl GraphStack {
             extra_env,
             scale: 1.0,
             redraw,
+            keyboard_focus_synced: FrameGate::default(),
         };
         stack.insert_channel(id, first_events)?;
         Ok(stack)
@@ -181,6 +226,21 @@ impl GraphStack {
 
     pub fn begin_frame(&mut self) {
         self.graph.begin_frame();
+        self.keyboard_focus_synced.reset();
+    }
+
+    /// `true` (and marks it done) only the first time this is called
+    /// since the last [`Self::begin_frame`] — see `keyboard_focus_synced`'s
+    /// own doc comment. `render.rs::build_frame_elements` is this
+    /// field's only real gate; the other, mutation-time call sites of
+    /// `sync_keyboard_focus_to_view` (`sync_hut_space`/
+    /// `sync_visible_main_window`) deliberately stay ungated — they run
+    /// once per mutation event, not once per output per frame, so
+    /// they're not the O(outputs) pattern this exists to fix, and
+    /// calling `sync_keyboard_focus_to_view` again redundantly is always
+    /// safe regardless (see its own doc comment).
+    pub(crate) fn take_needs_keyboard_focus_sync(&mut self) -> bool {
+        self.keyboard_focus_synced.take()
     }
 
     /// Fills in the real output for slot `index` once a backend creates
@@ -451,7 +511,18 @@ impl GraphStack {
     /// Main Window) is what's currently effectively shown — mirrors
     /// `Hut::shows_terminal_effective` exactly.
     pub fn shows_terminal_effective(&self, top: NodeId) -> bool {
-        if is_effectively_tiled(&self.graph, top) {
+        self.shows_terminal_effective_given_tiled(top, is_effectively_tiled(&self.graph, top))
+    }
+
+    /// [`Self::shows_terminal_effective`], given the caller already knows
+    /// whether `top` is tiled — `render.rs::build_frame_elements` needs
+    /// that same `is_effectively_tiled` result for its own separate
+    /// purposes on every frame anyway, so calling the plain version right
+    /// next to it recomputed it (and re-cloned the `Vec<NodeId>`
+    /// `hut_list_input` builds just to read its length) a second time in
+    /// a row for no reason (caught in review).
+    pub(crate) fn shows_terminal_effective_given_tiled(&self, top: NodeId, is_tiled: bool) -> bool {
+        if is_tiled {
             return true;
         }
         let leaf = self.graph.focused_leaf(top);
@@ -852,6 +923,43 @@ impl GraphStack {
         Redrawable::attach_redraw_handle(&mut new_console, self.redraw.clone());
         let new_id = self.graph.add_node(Box::new(new_console));
 
+        // Every fallible step from here on is provably unreachable today
+        // (see `swap_child_in_place`'s own doc comment on why) — but if
+        // one ever did fail, `new_id`'s `ConsoleHut` is a live PTY/shell
+        // process (`ConsoleHut::spawn`, above), not just a graph node;
+        // leaving it (and whatever wrapper node got created before the
+        // failure) orphaned in `self.graph` on the way out would leak
+        // both for the rest of the session. `wrap_link` rolls back
+        // everything it created itself via `or_rollback`; this only has
+        // to additionally remove `new_id`, the one node it created
+        // before delegating (caught in review).
+        let result = self.wrap_link(kind, new_id);
+        self.or_rollback(new_id, result)?;
+
+        self.redraw.mark_dirty();
+        self.insert_channel(id, events)
+    }
+
+    /// Removes `id` from the graph if `result` is `Err`, then returns
+    /// `result` unchanged — [`Self::wrap_link`]'s shared "roll back the
+    /// node this step just created if the next thing about it fails"
+    /// step, so a future fallible step added there can't omit the
+    /// rollback by copy-pasting the pattern wrong (caught in review on
+    /// an earlier version that hand-rolled this identically 4 times).
+    fn or_rollback<T>(&mut self, id: NodeId, result: Result<T, String>) -> Result<T, String> {
+        if result.is_err() {
+            self.graph.remove_node(id);
+        }
+        result
+    }
+
+    /// [`Self::wrap`]'s own linking step (build the Tab/Tile wrapper
+    /// around `new_id` and the current focused leaf, then splice it into
+    /// the tree) — split out only so its error path can roll back
+    /// whatever it already created on the way to a later failure,
+    /// uniformly, regardless of which of the several fallible steps
+    /// below actually failed.
+    fn wrap_link(&mut self, kind: WrapKind, new_id: NodeId) -> Result<(), String> {
         let top_id = self.focused_top_level();
         let path = self.graph.focused_path(top_id);
         // Always has >= 1 entry (`top_id` itself) — see
@@ -868,9 +976,9 @@ impl GraphStack {
                 *tab.active = 1;
                 Redrawable::attach_redraw_handle(&mut tab, self.redraw.clone());
                 let wrapped_id = self.graph.add_node(Box::new(tab));
-                self.graph
-                    .set_hut_list(wrapped_id, "children", vec![new_id, focused_leaf])
-                    .map_err(|err| format!("{err:?}"))?;
+                let result =
+                    self.graph.set_hut_list(wrapped_id, "children", vec![new_id, focused_leaf]).map_err(|err| format!("{err:?}"));
+                self.or_rollback(wrapped_id, result)?;
                 wrapped_id
             }
             WrapKind::Tile(axis) => {
@@ -880,9 +988,9 @@ impl GraphStack {
                 *tile.active = 1;
                 Redrawable::attach_redraw_handle(&mut tile, self.redraw.clone());
                 let wrapped_id = self.graph.add_node(Box::new(tile));
-                self.graph
-                    .set_hut_list(wrapped_id, "children", vec![new_id, focused_leaf])
-                    .map_err(|err| format!("{err:?}"))?;
+                let result =
+                    self.graph.set_hut_list(wrapped_id, "children", vec![new_id, focused_leaf]).map_err(|err| format!("{err:?}"));
+                self.or_rollback(wrapped_id, result)?;
                 wrapped_id
             }
         };
@@ -903,11 +1011,10 @@ impl GraphStack {
             // `TileNode::fracs`/`TabNode::child_chrome` bookkeeping this
             // also has to carry along.
             let parent = path[path.len() - 2];
-            self.swap_child_in_place(parent, focused_leaf, wrapped_id);
+            let result = self.swap_child_in_place(parent, focused_leaf, wrapped_id);
+            self.or_rollback(wrapped_id, result)?;
         }
-
-        self.redraw.mark_dirty();
-        self.insert_channel(id, events)
+        Ok(())
     }
 
     fn insert_channel(&self, id: u64, events: Channel<TermEvent>) -> Result<(), String> {
@@ -1268,7 +1375,9 @@ impl GraphStack {
             }
         }
         for parent in self.all_node_ids() {
-            self.swap_child_in_place(parent, old, new);
+            if let Err(err) = self.swap_child_in_place(parent, old, new) {
+                tracing::warn!("repoint: {err}");
+            }
         }
     }
 
@@ -1298,30 +1407,29 @@ impl GraphStack {
     /// (the original, review-caught gap) would leak a `LabelCache`/two
     /// `Id`s/a `ChangeTracker` per swap, unboundedly, across a long-lived
     /// daily-driver session.
-    fn swap_child_in_place(&mut self, parent: NodeId, old: NodeId, new: NodeId) {
+    ///
+    /// Returns the underlying `set_hut_list` failure rather than
+    /// swallowing it — not reachable today (`parent` only ever arrives
+    /// here already proven to have a valid `children` `HutList` port,
+    /// via `old`'s own presence in it a few lines above, which only ever
+    /// resolves through real Tab/Tile nodes), but `wrap`'s own call site
+    /// used to propagate this exact failure via `?` before it was folded
+    /// into this shared helper — silently discarding it here would be a
+    /// real, if currently-unreachable, narrowing of that contract:
+    /// `wrap_tab`/`wrap_tile` could report success while leaving a
+    /// freshly-spawned ConsoleHut and wrapper node fully configured but
+    /// orphaned, unreachable from any parent (caught in review). Callers
+    /// with no `Result` of their own to propagate through (`repoint`)
+    /// log it instead.
+    fn swap_child_in_place(&mut self, parent: NodeId, old: NodeId, new: NodeId) -> Result<(), String> {
         let mut children = self.graph.hut_list_input(parent, "children");
         let Some(pos) = children.iter().position(|&c| c == old) else {
-            return;
+            return Ok(());
         };
         children[pos] = new;
-        // Not reachable today — `parent` only ever arrives here already
-        // proven to have a valid `children` `HutList` port (both callers
-        // reach it via `focused_path`/`hut_list_input`'s own successful
-        // read a few lines above, which only ever recurses through real
-        // Tab/Tile nodes) — but `wrap`'s own call site used to propagate
-        // this exact failure via `?` before it was folded into this
-        // shared helper (caught in review: silently discarding it would
-        // have been a real, if currently-unreachable, narrowing of that
-        // error contract — `wrap_tab`/`wrap_tile` could report success
-        // while leaving a freshly-spawned ConsoleHut and wrapper node
-        // fully configured but orphaned, unreachable from any parent).
-        // Logged rather than propagated: `repoint`'s own call site (the
-        // other caller) has no `Result` to propagate through, and this
-        // codebase's own no-panics convention prefers "log and continue"
-        // over introducing a new way for either caller to fail.
-        if let Err(err) = self.graph.set_hut_list(parent, "children", children) {
-            tracing::warn!("swap_child_in_place: failed to relink {parent:?}'s children: {err:?}");
-        }
+        self.graph
+            .set_hut_list(parent, "children", children)
+            .map_err(|err| format!("failed to relink {parent:?}'s children: {err:?}"))?;
         if let Some(tile) = self.graph.downcast_mut::<TileNode>(parent) {
             if let Some(frac) = tile.fracs.remove(&old) {
                 tile.fracs.insert(new, frac);
@@ -1329,6 +1437,7 @@ impl GraphStack {
         } else if let Some(tab) = self.graph.downcast_mut::<TabNode>(parent) {
             tab.child_chrome.remove(&old);
         }
+        Ok(())
     }
 }
 
@@ -1345,6 +1454,16 @@ mod tests {
         let stack = new_stack();
         assert_eq!(stack.len(), 1);
         assert!(!stack.focused().touched());
+    }
+
+    #[test]
+    fn keyboard_focus_sync_is_needed_once_then_not_again_until_the_next_frame() {
+        let mut stack = new_stack();
+        assert!(stack.take_needs_keyboard_focus_sync(), "first call this frame should need a sync");
+        assert!(!stack.take_needs_keyboard_focus_sync(), "a second call in the same frame is redundant");
+        assert!(!stack.take_needs_keyboard_focus_sync(), "still redundant on a third call");
+        stack.begin_frame();
+        assert!(stack.take_needs_keyboard_focus_sync(), "a new frame needs its own sync again");
     }
 
     #[test]
