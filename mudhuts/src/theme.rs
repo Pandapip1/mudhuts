@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 use mudhuts_term::palette::Rgb;
 
-use crate::config::config_path;
+use crate::config::ConfigFileContents;
 
 pub struct Theme {
     pub tab_active_fg: Rgb,
@@ -58,23 +58,13 @@ impl Theme {
     /// Load the default theme, then apply overrides from
     /// `~/.config/mudhuts/config.toml`'s `[theme]` section if present —
     /// same "any problem is logged and skipped, never fatal" convention
-    /// as `Keymap::load`.
-    pub fn load() -> Self {
+    /// as `Keymap::load`. `config_file` is read once by the caller
+    /// (`State::new`) and shared across all four `*Config::load()`s —
+    /// see `crate::config::read_config_file`'s own doc comment for why
+    /// this doesn't read it itself.
+    pub(crate) fn load(config_file: &ConfigFileContents) -> Self {
         let mut theme = Self::default();
-
-        let Some(path) = config_path() else {
-            return theme;
-        };
-        let contents = match std::fs::read_to_string(&path) {
-            Ok(contents) => contents,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return theme,
-            Err(err) => {
-                tracing::warn!("failed to read config at {}: {err}", path.display());
-                return theme;
-            }
-        };
-
-        Self::apply_toml_overrides(&mut theme, &contents, &path.display().to_string());
+        Self::apply_toml_overrides(&mut theme, &config_file.contents, &config_file.source);
         theme
     }
 

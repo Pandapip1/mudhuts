@@ -3,7 +3,7 @@
 //! file/mechanism `theme.rs`'s `[theme]` section and `keybindings.rs`'s
 //! `[keybindings]` section use (see [`crate::config::config_path`]).
 
-use crate::config::config_path;
+use crate::config::ConfigFileContents;
 
 #[derive(Default)]
 pub struct DisplayConfig {
@@ -22,23 +22,13 @@ impl DisplayConfig {
     /// Load the default display config, then apply overrides from
     /// `~/.config/mudhuts/config.toml`'s `[display]` section if present —
     /// same "any problem is logged and skipped, never fatal" convention
-    /// as `Theme::load`/`Keymap::load`.
-    pub fn load() -> Self {
+    /// as `Theme::load`/`Keymap::load`. `config_file` is read once by
+    /// the caller (`State::new`) and shared across all four
+    /// `*Config::load()`s — see `crate::config::read_config_file`'s own
+    /// doc comment for why this doesn't read it itself.
+    pub(crate) fn load(config_file: &ConfigFileContents) -> Self {
         let mut config = Self::default();
-
-        let Some(path) = config_path() else {
-            return config;
-        };
-        let contents = match std::fs::read_to_string(&path) {
-            Ok(contents) => contents,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return config,
-            Err(err) => {
-                tracing::warn!("failed to read config at {}: {err}", path.display());
-                return config;
-            }
-        };
-
-        Self::apply_toml_overrides(&mut config, &contents, &path.display().to_string());
+        Self::apply_toml_overrides(&mut config, &config_file.contents, &config_file.source);
         config
     }
 

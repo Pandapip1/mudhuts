@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use smithay::input::keyboard::{ModifiersState, xkb};
 
-use crate::config::config_path;
+use crate::config::ConfigFileContents;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
@@ -258,40 +258,14 @@ impl Keymap {
     /// parsing the config (missing file, bad TOML, unknown action name,
     /// unparseable chord) is logged and skipped rather than treated as
     /// fatal — the compositor always ends up with at least the defaults.
-    pub fn load() -> Self {
+    /// `config_file` is read once by the caller (`State::new`) and
+    /// shared across all four `*Config::load()`s — see
+    /// `crate::config::read_config_file`'s own doc comment for why this
+    /// doesn't read it itself.
+    pub(crate) fn load(config_file: &ConfigFileContents) -> Self {
         let mut bindings = default_bindings();
         let mut stack_hold = ModMask::default();
-
-        let Some(path) = config_path() else {
-            return Self {
-                bindings,
-                stack_hold,
-            };
-        };
-
-        let contents = match std::fs::read_to_string(&path) {
-            Ok(contents) => contents,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Self {
-                    bindings,
-                    stack_hold,
-                };
-            }
-            Err(err) => {
-                tracing::warn!("failed to read config at {}: {err}", path.display());
-                return Self {
-                    bindings,
-                    stack_hold,
-                };
-            }
-        };
-
-        Self::apply_toml_overrides(
-            &mut bindings,
-            &mut stack_hold,
-            &contents,
-            &path.display().to_string(),
-        );
+        Self::apply_toml_overrides(&mut bindings, &mut stack_hold, &config_file.contents, &config_file.source);
         Self {
             bindings,
             stack_hold,
