@@ -394,6 +394,17 @@ struct ContentTarget {
     scale: f64,
 }
 
+/// Whether a `ContentTarget`'s cached `(size, scale)` (`None` if there's
+/// no entry at all yet) still matches what's needed now. Pulled out as a
+/// pure function so this comparison — real `f64` scale equality, which a
+/// future call site computing "the same" scale via a slightly different
+/// path (e.g. a rounded/derived variant) could quietly stop matching,
+/// thrash-rebuilding the offscreen buffer every single frame — is
+/// directly testable without a live `GlesRenderer`.
+fn target_is_stale(current: Option<((i32, i32), f64)>, size: (i32, i32), scale: f64) -> bool {
+    !matches!(current, Some((s, sc)) if s == size && sc == scale)
+}
+
 /// Get (or, if stale/missing, rebuild) `key`'s entry in `targets` —
 /// [`ContentTarget`]'s own doc comment on why this is factored out rather
 /// than duplicated per caller. "Stale" mirrors both callers' identical
@@ -412,7 +423,7 @@ fn ensure_content_target<'a, K: Eq + std::hash::Hash + Copy>(
     size: (i32, i32),
     scale: f64,
 ) -> Option<&'a mut ContentTarget> {
-    let stale = !matches!(targets.get(&key), Some(t) if t.size == size && t.scale == scale);
+    let stale = target_is_stale(targets.get(&key).map(|t| (t.size, t.scale)), size, scale);
     if stale {
         // Real `scale`, not `1.0` — see `synthetic_output`'s doc comment:
         // both callers hand their output straight to
@@ -585,6 +596,19 @@ pub fn resolve_frame_content(state: &mut State, output_index: usize) -> Vec<crat
     state.stack.resolve_content(top)
 }
 
+/// The four border-strip rects (top, bottom, left, right) framing
+/// `(x, y, w, h)` — a genuinely tiled Tile-Hut's active-pane highlight.
+/// `rect` is already real-output-absolute (`content_elements`'s own
+/// caller has already added the usable area's own origin before calling
+/// this). Pulled out as a pure function over primitives so this
+/// arithmetic — `y + h - border`, `x + w - border`, the exact class of
+/// off-by-one this codebase's own precision-conscious style worries
+/// about elsewhere — is directly testable: each strip should land
+/// exactly on the pane's own boundary, with no gap and no overlap.
+fn border_strips((x, y, w, h): (i32, i32, i32, i32), border: i32) -> [(i32, i32, i32, i32); 4] {
+    [(x, y, w, border), (x, y + h - border, w, border), (x, y, border, h), (x + w - border, y, border, h)]
+}
+
 /// Convert `content` (already resolved by [`resolve_frame_content`],
 /// *before* `renderer` was ever borrowed — see that function's doc
 /// comment) into real frame elements, in the same real-output-*absolute*
@@ -626,12 +650,7 @@ fn content_elements(
                 const BASE_BORDER: i32 = 3;
                 let border = scaled(BASE_BORDER, scale).max(1);
                 let color = to_color32f(state.theme.tile_border);
-                let strips = [
-                    (x, y, w, border),
-                    (x, y + h - border, w, border),
-                    (x, y, border, h),
-                    (x + w - border, y, border, h),
-                ];
+                let strips = border_strips((x, y, w, h), border);
                 let mut highlights = Vec::new();
                 for (id, (sx, sy, sw, sh)) in highlight_ids.into_iter().zip(strips) {
                     let background = SolidColorRenderElement::new(
@@ -876,14 +895,28 @@ fn lock_screen_elements(
 /// of the same condition).
 pub(crate) fn combined_tab_strip_height(state: &State, output_index: usize) -> i32 {
     let top = state.stack.focused_top_level_for(output_index);
-    if crate::graph_nodes::is_effectively_tiled(state.stack.graph(), top) {
+    let is_tiled = crate::graph_nodes::is_effectively_tiled(state.stack.graph(), top);
+    if is_tiled {
         return 0;
     }
     let cell_h = state.stack.focused_for(output_index).glyphs.cell_height().max(1) as i32;
     let scale = state.output_scale_for(output_index);
     let village_height = village_chrome::stack_height(state.stack.graph(), top, cell_h, scale);
     let chrome_height = chrome::strip_height(state.stack.focused_for(output_index), scale);
-    village_height + chrome_height
+    combined_strip_height(is_tiled, village_height, chrome_height)
+}
+
+/// `combined_tab_strip_height`'s own arithmetic, pulled out as a pure
+/// function over primitives: `0` whenever tiled, regardless of the
+/// component heights, otherwise their sum. A prior version of the
+/// (then-inline) tiled check was subtly incomplete and shipped a real
+/// regression — a tiled ConsoleHut with Main Windows open reporting a
+/// nonzero height nothing actually draws, caught only in review (see
+/// `combined_tab_strip_height`'s own doc comment) — this pins the
+/// contract down with a real regression test instead of relying on
+/// review catching it again.
+fn combined_strip_height(is_tiled: bool, village_height: i32, chrome_height: i32) -> i32 {
+    if is_tiled { 0 } else { village_height + chrome_height }
 }
 
 /// Whether the combined Hut-level + Main-Window tab strip should actually
@@ -896,8 +929,18 @@ pub(crate) fn combined_tab_strip_height(state: &State, output_index: usize) -> i
 /// would both be real, confusing regressions this exists to rule out by
 /// construction rather than by two call sites agreeing on a formula.
 pub(crate) fn tab_strip_visible(state: &State, output_index: usize) -> bool {
-    !state.chrome_config.auto_hide_tab_strip
-        || (output_index == state.stack.focused_output_index() && state.tab_strip_revealed)
+    tab_strip_visible_formula(
+        state.chrome_config.auto_hide_tab_strip,
+        output_index == state.stack.focused_output_index(),
+        state.tab_strip_revealed,
+    )
+}
+
+/// `tab_strip_visible`'s own 3-input truth table, pulled out as a pure
+/// function so the single-source-of-truth formula its own doc comment
+/// describes is directly tested, not just asserted in prose.
+fn tab_strip_visible_formula(auto_hide: bool, is_focused_output: bool, revealed: bool) -> bool {
+    !auto_hide || (is_focused_output && revealed)
 }
 
 // Deliberate real-multi-monitor consequence, not a bug (raised in
@@ -1167,3 +1210,118 @@ pub fn build_frame_elements(
     elements
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn texture_buffer_scale_rounds_to_the_nearest_whole_scale() {
+        assert_eq!(texture_buffer_scale(1.0), 1);
+        assert_eq!(texture_buffer_scale(1.4), 1);
+        assert_eq!(texture_buffer_scale(1.5), 2);
+        assert_eq!(texture_buffer_scale(1.6), 2);
+        assert_eq!(texture_buffer_scale(2.0), 2);
+    }
+
+    #[test]
+    fn texture_buffer_scale_clamps_to_at_least_1() {
+        assert_eq!(texture_buffer_scale(0.0), 1);
+        assert_eq!(texture_buffer_scale(0.99), 1);
+        assert_eq!(texture_buffer_scale(-5.0), 1);
+    }
+
+    #[test]
+    fn scaled_multiplies_and_rounds() {
+        assert_eq!(scaled(12, 1.0), 12);
+        assert_eq!(scaled(12, 2.0), 24);
+        assert_eq!(scaled(10, 1.25), 13); // 12.5 rounds up
+        assert_eq!(scaled(0, 3.0), 0);
+    }
+
+    #[test]
+    fn change_tracker_bumps_on_the_first_commit() {
+        let mut tracker: ChangeTracker<bool> = ChangeTracker::new();
+        let before = CommitCounter::default();
+        let first = tracker.commit(false);
+        assert_eq!(first.distance(Some(before)), Some(1));
+    }
+
+    #[test]
+    fn change_tracker_does_not_bump_on_a_repeated_value() {
+        let mut tracker: ChangeTracker<i32> = ChangeTracker::new();
+        let first = tracker.commit(5);
+        let second = tracker.commit(5);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn change_tracker_bumps_on_a_changed_value_and_bumps_again_on_reverting() {
+        let mut tracker: ChangeTracker<i32> = ChangeTracker::new();
+        let a = tracker.commit(1);
+        let b = tracker.commit(2);
+        assert_ne!(a, b);
+        let c = tracker.commit(1);
+        assert_ne!(b, c, "reverting to a previously-seen value must still bump — this isn't a value cache");
+    }
+
+    #[test]
+    fn target_is_stale_with_no_entry_is_stale() {
+        assert!(target_is_stale(None, (100, 100), 1.0));
+    }
+
+    #[test]
+    fn target_is_stale_with_matching_size_and_scale_is_not_stale() {
+        assert!(!target_is_stale(Some(((100, 100), 1.0)), (100, 100), 1.0));
+    }
+
+    #[test]
+    fn target_is_stale_when_size_changed() {
+        assert!(target_is_stale(Some(((100, 100), 1.0)), (200, 100), 1.0));
+    }
+
+    #[test]
+    fn target_is_stale_when_scale_changed() {
+        assert!(target_is_stale(Some(((100, 100), 1.0)), (100, 100), 2.0));
+    }
+
+    #[test]
+    fn border_strips_land_exactly_on_the_pane_boundary_with_no_gap_or_overlap() {
+        let strips = border_strips((10, 20, 100, 50), 3);
+        let [top, bottom, left, right] = strips;
+        assert_eq!(top, (10, 20, 100, 3));
+        assert_eq!(bottom, (10, 20 + 50 - 3, 100, 3));
+        assert_eq!(left, (10, 20, 3, 50));
+        assert_eq!(right, (10 + 100 - 3, 20, 3, 50));
+        // Bottom strip's own far edge lands exactly on the pane's own
+        // bottom edge — no gap, no overflow past it.
+        assert_eq!(bottom.1 + bottom.3, 20 + 50);
+        assert_eq!(right.0 + right.2, 10 + 100);
+    }
+
+    #[test]
+    fn combined_strip_height_is_always_zero_while_tiled() {
+        // The exact regression this function's own doc comment describes:
+        // nonzero component heights must still yield 0 once tiled.
+        assert_eq!(combined_strip_height(true, 30, 20), 0);
+    }
+
+    #[test]
+    fn combined_strip_height_sums_components_when_not_tiled() {
+        assert_eq!(combined_strip_height(false, 30, 20), 50);
+        assert_eq!(combined_strip_height(false, 0, 0), 0);
+    }
+
+    #[test]
+    fn tab_strip_visible_formula_always_visible_with_auto_hide_off() {
+        assert!(tab_strip_visible_formula(false, false, false));
+        assert!(tab_strip_visible_formula(false, true, true));
+    }
+
+    #[test]
+    fn tab_strip_visible_formula_with_auto_hide_needs_focus_and_reveal() {
+        assert!(tab_strip_visible_formula(true, true, true));
+        assert!(!tab_strip_visible_formula(true, true, false), "focused but not revealed must stay hidden");
+        assert!(!tab_strip_visible_formula(true, false, true), "revealed on a non-focused output must stay hidden");
+        assert!(!tab_strip_visible_formula(true, false, false));
+    }
+}
