@@ -85,30 +85,10 @@ pub fn find_owning_hut(client_pid: u32, stack: &GraphStack) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use smithay::reexports::calloop::EventLoop;
-    use smithay::reexports::calloop::LoopHandle;
-
     use super::*;
-    use crate::State;
-    use crate::console_hut::ConsoleHut;
-
-    fn loop_handle() -> LoopHandle<'static, State> {
-        let event_loop: EventLoop<'static, State> = EventLoop::try_new().unwrap();
-        Box::leak(Box::new(event_loop)).handle()
-    }
-
-    fn new_stack() -> GraphStack {
-        let (hut, events) = ConsoleHut::spawn(std::iter::empty(), 1.0).unwrap();
-        let (ping, _source) = smithay::reexports::calloop::ping::make_ping().unwrap();
-        GraphStack::new(
-            hut,
-            events,
-            loop_handle(),
-            Vec::new(),
-            crate::redraw::RedrawHandle::new(ping),
-        )
-        .unwrap()
-    }
+    // Shared with `graph_stack.rs`/`handlers/shell.rs`'s own test
+    // modules — see `test_support.rs`'s own doc comment.
+    use crate::test_support::test_stack as new_stack;
 
     #[test]
     fn parent_pid_of_the_current_process_is_readable() {

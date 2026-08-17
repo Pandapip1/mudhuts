@@ -23,10 +23,12 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use smithay::desktop::Window;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, DataInit, DisplayHandle, New, Resource};
 use smithay::utils::SERIAL_COUNTER;
+use smithay::wayland::foreign_toplevel_list::ForeignToplevelHandle;
 use smithay::wayland::{Dispatch2, GlobalData, GlobalDispatch2};
 
 use mudhuts_protocols::server::mudhuts_shell_authority_v1::{self, Error as AuthorityError, MudhutsShellAuthorityV1};
@@ -34,6 +36,7 @@ use mudhuts_protocols::server::mudhuts_shell_v1::{self, MudhutsShellV1};
 use mudhuts_protocols::server::mudhuts_window_role_v1::{self, MudhutsWindowRoleV1};
 
 use crate::State;
+use crate::graph_stack::GraphStack;
 use crate::main_window::{Alert, FloatingWindow};
 
 impl GlobalDispatch2<MudhutsShellV1, State> for GlobalData {
@@ -223,127 +226,19 @@ enum Role {
 /// found, handled below by leaving it as a bare Main Window instead of
 /// silently moving it across Huts).
 fn retag(state: &mut State, tagged_surface: &WlSurface, target: Option<(Role, WlSurface)>) {
-    // Mutation happens entirely within this loop (over `state.stack`'s own
-    // borrow); `sync_visible_main_window`/`request_redraw` need `&mut
-    // State` themselves, so they're called after the loop's borrow has
-    // ended rather than from inside it.
-    let mut handled_hut_id = None;
-    // Whether this retag actually produced a Floating Window/Alert (as
-    // opposed to a bare Main Window, or the "target not found" fallback
-    // that also treats it as a bare Main Window) — see this function's
-    // own resync below for why this matters: neither
-    // `sync_hut_space`/`sync_keyboard_focus_to_view` ever focuses
-    // anything but a Hut's *Main Window*, so without an explicit
-    // `keyboard.set_focus` call here, a newly-tagged Alert/Floating
-    // Window becomes visible on screen but silently never receives
-    // keyboard input — caught in review of an unrelated change to
-    // `sync_keyboard_focus_to_view` (see its own doc comment), but a
-    // real, pre-existing gap in this function specifically, not
-    // introduced by that change.
-    let mut tagged_floating_or_alert = false;
-    for hut in state.stack.all_huts_mut() {
-        // Captured *before* removal — `take_bare_main_window` shifts/
-        // clamps `active_main_window` the moment it removes anything
-        // (`shift_active_index_on_removal`), which for a 2+-tab Hut can
-        // leave it pointing at a *different* surviving tab, not "none" —
-        // so checking "was this the active tab" only makes sense against
-        // the *pre*-removal state. `false` for a nested Floating
-        // Window/Alert being promoted (its owning Main Window entry is a
-        // different `Window` than `tagged_surface` itself, so this never
-        // matches there) — correct, since promoting one of those is
-        // always a genuinely new tab, not a re-insertion of one that was
-        // already active.
-        let was_active = hut.active_main_window_entry().is_some_and(|e| e.matches(tagged_surface));
-        // Which removal path succeeded matters for `make_active` below,
-        // so this can no longer just be `.or_else(...)`'d away into a
-        // single `Option` the way it started — a *bare* Main Window
-        // being re-tagged (e.g. a redundant `SetMain`, or a `SetFloating`
-        // whose target didn't resolve, see the fallback arm below) is a
-        // fundamentally different case from a *nested* Floating
-        // Window/Alert being promoted to a bare Main Window: only the
-        // former should ever be judged against `was_active`/"Hut already
-        // has other tabs" at all — the latter (`SetMain` on something
-        // that was Floating/Alert) is always a deliberate "bring this to
-        // the front" action, and always making it active is the original,
-        // correct behavior there (caught in review: an earlier version of
-        // this fix applied the bare-Main-Window formula to *both* cases,
-        // silently backgrounding a freshly-un-floated/un-alerted window
-        // instead of showing it).
-        let was_bare = hut.has_bare_main_window(tagged_surface);
-        let Some(window) = hut
-            .take_bare_main_window(tagged_surface)
-            .or_else(|| hut.take_nested_window(tagged_surface))
-        else {
-            continue;
-        };
-        // Captured now — `all_huts_mut()` walks every output, not just
-        // the focused one, so the Hut this retag actually landed on
-        // isn't necessarily the focused one (see this function's own
-        // resync below).
-        handled_hut_id = Some(hut.id);
-        // Whether the retagged window should become/stay this Hut's
-        // active tab once re-inserted as a bare Main Window (`None`
-        // below, or the "target not found" fallback). For `was_bare`:
-        // mirrors `handlers/xdg_shell.rs`'s `new_toplevel` (see
-        // `push_main_window`'s own doc comment on the bug this avoids)
-        // for "the Hut already has other tabs open", plus `was_active`
-        // for "this window *was itself* the active tab being removed and
-        // reinserted" — `new_toplevel` never has to handle that (it only
-        // ever deals with a genuinely brand-new `Window`, never one
-        // round-tripping through remove-then-reinsert within the same Hut
-        // it came from); without it, a redundant re-tag of an
-        // already-active bare Main Window would silently flip the user's
-        // view to whatever sibling tab the active-index clamp happened to
-        // land on. For `!was_bare` (a nested Floating Window/Alert being
-        // promoted): unconditionally `true` — promoting one to Main is
-        // always a deliberate "show this now" action, regardless of
-        // whether the Hut has other tabs open.
-        let make_active = crate::hut::retag_make_active(was_bare, was_active, hut.main_window_count() == 0);
-
-        match &target {
-            None => {
-                tracing::debug!("mudhuts_window_role_v1: retagged as a bare Main Window");
-                let foreign_handle = state
-                    .foreign_toplevel_list_state
-                    .new_toplevel::<State>(&crate::chrome::window_title(&window), &crate::chrome::window_app_id(&window));
-                hut.push_main_window(window, make_active, foreign_handle);
-            }
-            Some((role, main_surface)) => match hut.find_main_window_mut(main_surface) {
-                Some(entry) => {
-                    match role {
-                        Role::Floating => entry.floating_windows.push(FloatingWindow::new(window)),
-                        Role::Alert => entry.alerts.push(Alert::new(window)),
-                    }
-                    tagged_floating_or_alert = true;
-                    tracing::debug!(
-                        "mudhuts_window_role_v1: retagged as {}",
-                        match role {
-                            Role::Floating => "a Floating Window",
-                            Role::Alert => "an Alert",
-                        }
-                    );
-                }
-                None => {
-                    tracing::warn!(
-                        "mudhuts_window_role_v1: target main window not found in the same ConsoleHut, leaving as a bare Main Window"
-                    );
-                    let foreign_handle = state.foreign_toplevel_list_state.new_toplevel::<State>(
-                        &crate::chrome::window_title(&window),
-                        &crate::chrome::window_app_id(&window),
-                    );
-                    hut.push_main_window(window, make_active, foreign_handle);
-                }
-            },
-        }
-        break;
-    }
+    let (handled_hut_id, tagged_floating_or_alert) =
+        retag_in_stack(&mut state.stack, tagged_surface, target, |window| {
+            state
+                .foreign_toplevel_list_state
+                .new_toplevel::<State>(&crate::chrome::window_title(window), &crate::chrome::window_app_id(window))
+        });
 
     if let Some(hut_id) = handled_hut_id {
         // This Hut's own space, not `state.sync_visible_main_window()`
         // (which only ever rebuilds the *focused* Hut's `space` — same
         // fix/reasoning as `grabs.rs`'s `unset`/`docks.rs`'s
         // `finish_drag`): the retagged window's Hut isn't necessarily
-        // the focused one, since the loop above searches every output.
+        // the focused one, since `retag_in_stack` searches every output.
         state.sync_hut_space(hut_id);
         // Explicit keyboard focus for a freshly-tagged Alert (in
         // practice — see below for why a fresh Floating Window never
@@ -404,5 +299,353 @@ fn retag(state: &mut State, tagged_surface: &WlSurface, target: Option<(Role, Wl
         state.request_redraw();
     } else {
         tracing::warn!("mudhuts_window_role_v1: tagged toplevel not found in any ConsoleHut");
+    }
+}
+
+/// The core mutation `retag` performs — move `tagged_surface`'s window to
+/// its new role within `stack`, wherever it currently lives. Pulled out
+/// to operate on `&mut GraphStack` alone (not `&mut State`) specifically
+/// so it's unit-testable via `test_support.rs`'s `spawn_test_windows`
+/// harness, without needing a live seat/renderer/display: this exact
+/// logic has shipped three separate real regressions within this same
+/// session (see `was_active`/`was_bare`'s own comments below), and
+/// `test_support.rs`'s own doc comment names this function specifically
+/// as the motivating case for building that harness in the first place.
+///
+/// `mint_handle` mints a fresh `ForeignToplevelHandle` for a window
+/// (re)becoming a bare Main Window — injected rather than reached via a
+/// real `ForeignToplevelListState` field directly, so a test can supply
+/// pre-minted spare handles (e.g. harvested from extra `spawn_test_windows`
+/// pairs) instead of standing up a second live Wayland server purely to
+/// mint one more.
+///
+/// Returns `(hut_id, tagged_floating_or_alert)` — `None` for the former
+/// if `tagged_surface` wasn't found in any Hut at all; the latter is
+/// `true` only when this retag actually produced a Floating Window/Alert
+/// (not a bare Main Window, and not the "target not found" fallback that
+/// also treats it as one). `retag` (this function's one real caller)
+/// does everything from here that genuinely needs `&mut State` (space/
+/// focus resync, `request_redraw`) — kept entirely out of this function
+/// on purpose.
+fn retag_in_stack(
+    stack: &mut GraphStack,
+    tagged_surface: &WlSurface,
+    target: Option<(Role, WlSurface)>,
+    mut mint_handle: impl FnMut(&Window) -> ForeignToplevelHandle,
+) -> (Option<u64>, bool) {
+    let mut handled_hut_id = None;
+    // Whether this retag actually produced a Floating Window/Alert (as
+    // opposed to a bare Main Window, or the "target not found" fallback
+    // that also treats it as a bare Main Window) — see `retag`'s own
+    // resync for why this matters: neither `sync_hut_space`/
+    // `sync_keyboard_focus_to_view` ever focuses anything but a Hut's
+    // *Main Window*, so without an explicit `keyboard.set_focus` call
+    // there, a newly-tagged Alert/Floating Window becomes visible on
+    // screen but silently never receives keyboard input — caught in
+    // review of an unrelated change to `sync_keyboard_focus_to_view` (see
+    // its own doc comment), but a real, pre-existing gap in this function
+    // specifically, not introduced by that change.
+    let mut tagged_floating_or_alert = false;
+    for hut in stack.all_huts_mut() {
+        // Captured *before* removal — `take_bare_main_window` shifts/
+        // clamps `active_main_window` the moment it removes anything
+        // (`shift_active_index_on_removal`), which for a 2+-tab Hut can
+        // leave it pointing at a *different* surviving tab, not "none" —
+        // so checking "was this the active tab" only makes sense against
+        // the *pre*-removal state. `false` for a nested Floating
+        // Window/Alert being promoted (its owning Main Window entry is a
+        // different `Window` than `tagged_surface` itself, so this never
+        // matches there) — correct, since promoting one of those is
+        // always a genuinely new tab, not a re-insertion of one that was
+        // already active.
+        let was_active = hut.active_main_window_entry().is_some_and(|e| e.matches(tagged_surface));
+        // Which removal path succeeded matters for `make_active` below,
+        // so this can no longer just be `.or_else(...)`'d away into a
+        // single `Option` the way it started — a *bare* Main Window
+        // being re-tagged (e.g. a redundant `SetMain`, or a `SetFloating`
+        // whose target didn't resolve, see the fallback arm below) is a
+        // fundamentally different case from a *nested* Floating
+        // Window/Alert being promoted to a bare Main Window: only the
+        // former should ever be judged against `was_active`/"Hut already
+        // has other tabs" at all — the latter (`SetMain` on something
+        // that was Floating/Alert) is always a deliberate "bring this to
+        // the front" action, and always making it active is the original,
+        // correct behavior there (caught in review: an earlier version of
+        // this fix applied the bare-Main-Window formula to *both* cases,
+        // silently backgrounding a freshly-un-floated/un-alerted window
+        // instead of showing it).
+        let was_bare = hut.has_bare_main_window(tagged_surface);
+        let Some(window) = hut
+            .take_bare_main_window(tagged_surface)
+            .or_else(|| hut.take_nested_window(tagged_surface))
+        else {
+            continue;
+        };
+        // Captured now — `all_huts_mut()` walks every output, not just
+        // the focused one, so the Hut this retag actually landed on
+        // isn't necessarily the focused one (see this function's own
+        // resync below).
+        handled_hut_id = Some(hut.id);
+        // Whether the retagged window should become/stay this Hut's
+        // active tab once re-inserted as a bare Main Window (`None`
+        // below, or the "target not found" fallback). For `was_bare`:
+        // mirrors `handlers/xdg_shell.rs`'s `new_toplevel` (see
+        // `push_main_window`'s own doc comment on the bug this avoids)
+        // for "the Hut already has other tabs open", plus `was_active`
+        // for "this window *was itself* the active tab being removed and
+        // reinserted" — `new_toplevel` never has to handle that (it only
+        // ever deals with a genuinely brand-new `Window`, never one
+        // round-tripping through remove-then-reinsert within the same Hut
+        // it came from); without it, a redundant re-tag of an
+        // already-active bare Main Window would silently flip the user's
+        // view to whatever sibling tab the active-index clamp happened to
+        // land on. For `!was_bare` (a nested Floating Window/Alert being
+        // promoted): unconditionally `true` — promoting one to Main is
+        // always a deliberate "show this now" action, regardless of
+        // whether the Hut has other tabs open.
+        let make_active = crate::hut::retag_make_active(was_bare, was_active, hut.main_window_count() == 0);
+
+        // `Option`-wrapped rather than moved directly into whichever arm
+        // below consumes it: both the `None` target and the "target not
+        // found" fallback need the identical mint-a-handle-then-
+        // push_main_window sequence, and doing that once after the match
+        // (instead of once per arm, as an earlier version did — caught in
+        // review) means a future change to that sequence can't drift
+        // between the two copies.
+        let mut window = Some(window);
+        match &target {
+            None => {
+                tracing::debug!("mudhuts_window_role_v1: retagged as a bare Main Window");
+            }
+            Some((role, main_surface)) => match hut.find_main_window_mut(main_surface) {
+                // `window.take()`, not a bare unwrap/expect: this arm is
+                // the only place that ever consumes `window`, so it's
+                // always still `Some` here in practice, but staying
+                // panic-free rather than assumed costs nothing — an
+                // unreachable `None` just silently skips instead of
+                // taking down the compositor's event loop.
+                Some(entry) => {
+                    if let Some(window) = window.take() {
+                        match role {
+                            Role::Floating => entry.floating_windows.push(FloatingWindow::new(window)),
+                            Role::Alert => entry.alerts.push(Alert::new(window)),
+                        }
+                        tagged_floating_or_alert = true;
+                        tracing::debug!(
+                            "mudhuts_window_role_v1: retagged as {}",
+                            match role {
+                                Role::Floating => "a Floating Window",
+                                Role::Alert => "an Alert",
+                            }
+                        );
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        "mudhuts_window_role_v1: target main window not found in the same ConsoleHut, leaving as a bare Main Window"
+                    );
+                }
+            },
+        }
+        if let Some(window) = window {
+            let foreign_handle = mint_handle(&window);
+            hut.push_main_window(window, make_active, foreign_handle);
+        }
+        break;
+    }
+
+    (handled_hut_id, tagged_floating_or_alert)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // `new_stack`/`surface_of` shared with `graph_stack.rs`/`ownership.rs`/
+    // `console_hut.rs`'s own test modules — see `test_support.rs`'s own
+    // doc comment.
+    use crate::test_support::{spawn_test_windows, surface_of, test_stack as new_stack};
+
+    /// A second, independent Hut in the same stack, alongside the one
+    /// `new_stack()` already starts with — `next()` only grows the stack
+    /// (instead of replacing the untouched tail) once the current entry
+    /// is marked touched, mirroring `graph_stack.rs`'s own
+    /// `next_past_a_touched_tail_grows_the_stack` test.
+    fn add_second_hut(stack: &mut GraphStack) {
+        stack.focused_mut().mark_touched();
+        stack.next().unwrap();
+    }
+
+    /// `retag_in_stack` needs a `ForeignToplevelHandle` every time it
+    /// (re)creates a bare Main Window — sourced here from spare
+    /// `(Window, ForeignToplevelHandle)` pairs the caller already has on
+    /// hand (their own `Window` half discarded), rather than minting a
+    /// fresh one via a second `spawn_test_windows` call. Deliberately
+    /// *not* calling `spawn_test_windows` itself: every surface compared
+    /// within one test has to come from the same single harness
+    /// invocation — two separate `spawn_test_windows` calls each stand up
+    /// their own brand-new, independent in-process Wayland server, and
+    /// their low, freshly-numbered protocol object ids can coincidentally
+    /// collide across the two, which `WlSurface`'s own equality has no
+    /// reason to disambiguate away (found the hard way: two tests below
+    /// originally called `spawn_test_windows` twice each and intermittently
+    /// mismatched surfaces that were never supposed to compare equal).
+    fn handle_source(spares: Vec<(Window, ForeignToplevelHandle)>) -> impl FnMut(&Window) -> ForeignToplevelHandle {
+        let mut spares = spares.into_iter();
+        move |_window| spares.next().expect("test ran out of spare ForeignToplevelHandles").1
+    }
+
+    #[test]
+    fn retagging_a_bare_main_window_as_itself_is_a_no_op_reinsert() {
+        let mut stack = new_stack();
+        // `target: None` always mints a fresh handle (see `retag_in_stack`'s
+        // `None =>` arm) even for a no-op reinsert of the same window — so
+        // this needs one spare beyond `a` itself.
+        let [(a, a_fth), spare] = spawn_test_windows(2).try_into().ok().unwrap();
+        let a_surface = surface_of(&a);
+        stack.focused_mut().push_main_window(a, true, a_fth);
+
+        let (hut_id, tagged_floating_or_alert) =
+            retag_in_stack(&mut stack, &a_surface, None, handle_source(vec![spare]));
+
+        assert_eq!(hut_id, Some(stack.focused().id));
+        assert!(!tagged_floating_or_alert);
+        assert!(stack.focused().has_bare_main_window(&a_surface));
+        assert_eq!(stack.focused().main_window_count(), 1);
+    }
+
+    #[test]
+    fn retagging_a_nested_floating_window_as_main_promotes_and_activates_it() {
+        let mut stack = new_stack();
+        let [(a, a_fth), (b, _), spare] = spawn_test_windows(3).try_into().ok().unwrap();
+        let a_surface = surface_of(&a);
+        let b_surface = surface_of(&b);
+        stack.focused_mut().push_main_window(a, true, a_fth);
+        stack.focused_mut().find_main_window_mut(&a_surface).unwrap().floating_windows.push(FloatingWindow::new(b));
+
+        let (hut_id, tagged_floating_or_alert) =
+            retag_in_stack(&mut stack, &b_surface, None, handle_source(vec![spare]));
+
+        assert_eq!(hut_id, Some(stack.focused().id));
+        assert!(!tagged_floating_or_alert, "promoting to Main is not itself a Floating/Alert retag");
+        assert!(stack.focused().has_bare_main_window(&b_surface));
+        assert_eq!(
+            surface_of(stack.focused().active_window().unwrap()),
+            b_surface,
+            "promoting a Floating Window to Main is always a deliberate \"show this now\" action"
+        );
+    }
+
+    #[test]
+    fn retagging_a_bare_main_window_as_floating_moves_it_under_its_target() {
+        let mut stack = new_stack();
+        // No spare needed: `main_surface` (A) resolves via
+        // `find_main_window_mut` in the same Hut, so `retag_in_stack`
+        // never reaches a `mint_handle` call on this path at all.
+        let [(a, a_fth), (b, b_fth)] = spawn_test_windows(2).try_into().ok().unwrap();
+        let a_surface = surface_of(&a);
+        let b_surface = surface_of(&b);
+        stack.focused_mut().push_main_window(a, true, a_fth);
+        stack.focused_mut().push_main_window(b, false, b_fth);
+
+        let (hut_id, tagged_floating_or_alert) = retag_in_stack(
+            &mut stack,
+            &b_surface,
+            Some((Role::Floating, a_surface.clone())),
+            handle_source(Vec::new()),
+        );
+
+        assert_eq!(hut_id, Some(stack.focused().id));
+        assert!(tagged_floating_or_alert);
+        assert!(!stack.focused().has_bare_main_window(&b_surface), "B should have left the bare Main Window list");
+        assert_eq!(stack.focused().main_window_count(), 1, "only A remains as a bare Main Window");
+        let entry = stack.focused_mut().find_main_window_mut(&a_surface).unwrap();
+        assert_eq!(entry.floating_windows.len(), 1);
+        assert!(entry.floating_windows[0].matches(&b_surface));
+    }
+
+    #[test]
+    fn retagging_as_floating_under_a_target_in_a_different_hut_falls_back_to_bare_main() {
+        let mut stack = new_stack();
+        // One `spawn_test_windows` call up front for every surface this
+        // test ever compares — including `a`/`b`, spread across two Huts
+        // only *after* both are minted from the same harness invocation
+        // (see `handle_source`'s own doc comment on why splitting this
+        // into two separate calls caused real, intermittent failures).
+        let [(a, a_fth), (b, b_fth), spare] = spawn_test_windows(3).try_into().ok().unwrap();
+        let a_surface = surface_of(&a);
+        let b_surface = surface_of(&b);
+        stack.focused_mut().push_main_window(a, true, a_fth);
+
+        add_second_hut(&mut stack);
+        let second_hut_id = stack.focused().id;
+        stack.focused_mut().push_main_window(b, true, b_fth);
+
+        // `a_surface` belongs to the *first* Hut, not the one `b_surface`
+        // itself lives in — `find_main_window_mut` only ever searches the
+        // Hut currently being iterated, so this must never resolve.
+        let (hut_id, tagged_floating_or_alert) = retag_in_stack(
+            &mut stack,
+            &b_surface,
+            Some((Role::Floating, a_surface)),
+            handle_source(vec![spare]),
+        );
+
+        assert_eq!(hut_id, Some(second_hut_id), "B must stay in its own Hut, not move into A's");
+        assert!(!tagged_floating_or_alert, "the target-not-found fallback treats it as a bare Main Window");
+        assert!(stack.find_mut(second_hut_id).unwrap().has_bare_main_window(&b_surface));
+    }
+
+    #[test]
+    fn redundant_retag_of_the_already_active_bare_main_window_stays_active() {
+        let mut stack = new_stack();
+        let [(a, a_fth), (b, b_fth), spare] = spawn_test_windows(3).try_into().ok().unwrap();
+        let a_surface = surface_of(&a);
+        stack.focused_mut().push_main_window(a, true, a_fth); // A becomes active
+        stack.focused_mut().push_main_window(b, false, b_fth);
+
+        let (_, tagged_floating_or_alert) =
+            retag_in_stack(&mut stack, &a_surface, None, handle_source(vec![spare]));
+
+        assert!(!tagged_floating_or_alert);
+        assert_eq!(
+            surface_of(stack.focused().active_window().unwrap()),
+            a_surface,
+            "a no-op re-tag of the tab the user is already looking at must not switch away from it"
+        );
+    }
+
+    #[test]
+    fn redundant_retag_of_a_backgrounded_bare_main_window_stays_backgrounded() {
+        let mut stack = new_stack();
+        let [(a, a_fth), (b, b_fth), spare] = spawn_test_windows(3).try_into().ok().unwrap();
+        let a_surface = surface_of(&a);
+        let b_surface = surface_of(&b);
+        stack.focused_mut().push_main_window(a, true, a_fth); // A stays active throughout
+        stack.focused_mut().push_main_window(b, false, b_fth);
+
+        let (_, tagged_floating_or_alert) =
+            retag_in_stack(&mut stack, &b_surface, None, handle_source(vec![spare]));
+
+        assert!(!tagged_floating_or_alert);
+        assert_eq!(
+            surface_of(stack.focused().active_window().unwrap()),
+            a_surface,
+            "re-tagging a tab the user *wasn't* looking at must not silently steal focus onto it"
+        );
+        assert!(stack.focused().has_bare_main_window(&b_surface));
+    }
+
+    #[test]
+    fn retag_of_an_untracked_surface_finds_nothing() {
+        let mut stack = new_stack();
+        let [(a, a_fth), (unrelated, _)] = spawn_test_windows(2).try_into().ok().unwrap();
+        stack.focused_mut().push_main_window(a, true, a_fth);
+        let unrelated_surface = surface_of(&unrelated);
+
+        let (hut_id, tagged_floating_or_alert) =
+            retag_in_stack(&mut stack, &unrelated_surface, None, handle_source(Vec::new()));
+
+        assert_eq!(hut_id, None);
+        assert!(!tagged_floating_or_alert);
     }
 }

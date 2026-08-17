@@ -913,14 +913,12 @@ mod tests {
 
     use super::*;
     use crate::main_window::{Alert, Dock, Edge, FloatingWindow};
-    use crate::test_support::spawn_test_windows;
+    // `surface_of` shared with `handlers/shell.rs`'s own test module —
+    // see `test_support.rs`'s own doc comment.
+    use crate::test_support::{spawn_test_windows, surface_of};
 
     fn new_hut() -> ConsoleHut {
         ConsoleHut::spawn(std::iter::empty(), 1.0).unwrap().0
-    }
-
-    fn surface_of(window: &Window) -> WlSurface {
-        window.toplevel().unwrap().wl_surface().clone()
     }
 
     #[test]

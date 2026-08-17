@@ -19,6 +19,25 @@
 //! `handlers/shell.rs::retag`) that operates on `Window`/`WlSurface`
 //! identity — previously untestable at all, since nothing in this
 //! codebase (or in Smithay itself) had a lighter-weight way to produce one.
+//!
+//! **Call [`spawn_test_windows`] exactly once per test, sized for
+//! everything that test needs** — never split across two separate calls
+//! within the same test, even if the two groups of windows are logically
+//! unrelated (e.g. "belongs to Hut A" vs. "belongs to Hut B"). Each call
+//! stands up its own brand-new, independent in-process Wayland server
+//! from scratch, so every client-side object (including every `WlSurface`)
+//! gets a fresh, low protocol object id starting from the same small
+//! numbers a *different* call's client would also start from — nothing
+//! about `WlSurface`'s own identity/equality has any reason to also
+//! account for *which Display instance* minted it. Two surfaces from two
+//! separate calls can this way come out numerically indistinguishable
+//! from `WlSurface`'s own point of view, even though they're genuinely
+//! different objects. Found the hard way, not reasoned out in advance:
+//! `handlers/shell.rs`'s own `retag_in_stack` tests originally called
+//! this twice per test (once for the windows being pushed as initial
+//! state, once more via a separate handle-minting helper) and
+//! intermittently mismatched surfaces that were never supposed to
+//! compare equal — see that module's own test-helper doc comment.
 
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
@@ -281,6 +300,36 @@ pub(crate) fn spawn_test_windows(
             (Window::new_wayland_window(toplevel), handle)
         })
         .collect()
+}
+
+/// A real `LoopHandle` from a real, never-run `EventLoop` — `graph_stack.rs`
+/// and `ownership.rs` each already hand-rolled this exact same three-line
+/// sequence independently before this consolidation (and a third,
+/// freshly-written copy very nearly joined them, in `handlers/shell.rs`'s
+/// own new test module — caught in review before that ever landed).
+pub(crate) fn test_loop_handle() -> smithay::reexports::calloop::LoopHandle<'static, crate::State> {
+    let event_loop: smithay::reexports::calloop::EventLoop<'static, crate::State> =
+        smithay::reexports::calloop::EventLoop::try_new().unwrap();
+    Box::leak(Box::new(event_loop)).handle()
+}
+
+/// A fresh, single-`ConsoleHut` `GraphStack` — same "three call sites,
+/// one hand-rolled copy each" duplication [`test_loop_handle`] itself
+/// used to have, consolidated here for the same reason.
+pub(crate) fn test_stack() -> crate::graph_stack::GraphStack {
+    let (hut, events) = crate::console_hut::ConsoleHut::spawn(std::iter::empty(), 1.0).unwrap();
+    let (ping, _source) = smithay::reexports::calloop::ping::make_ping().unwrap();
+    crate::graph_stack::GraphStack::new(hut, events, test_loop_handle(), Vec::new(), crate::redraw::RedrawHandle::new(ping))
+        .unwrap()
+}
+
+/// `window`'s own toplevel surface — a one-line helper, but
+/// `console_hut.rs`'s own test module already had an independent copy of
+/// it before this consolidation (and `handlers/shell.rs`'s new one would
+/// have made a second, caught in the same review pass as
+/// [`test_loop_handle`]'s own near-duplicate).
+pub(crate) fn surface_of(window: &Window) -> smithay::reexports::wayland_server::protocol::wl_surface::WlSurface {
+    window.toplevel().unwrap().wl_surface().clone()
 }
 
 #[cfg(test)]

@@ -1334,23 +1334,11 @@ impl GraphStack {
 
 #[cfg(test)]
 mod tests {
-    use smithay::reexports::calloop::EventLoop;
-
     use super::*;
-    use crate::console_hut::ConsoleHut;
-
-    /// Real `LoopHandle` (from a real, never-run `EventLoop`) — mirrors
-    /// `stack.rs`'s own test helper exactly.
-    fn loop_handle() -> LoopHandle<'static, State> {
-        let event_loop: EventLoop<'static, State> = EventLoop::try_new().unwrap();
-        Box::leak(Box::new(event_loop)).handle()
-    }
-
-    fn new_stack() -> GraphStack {
-        let (hut, events) = ConsoleHut::spawn(std::iter::empty(), 1.0).unwrap();
-        let (ping, _source) = smithay::reexports::calloop::ping::make_ping().unwrap();
-        GraphStack::new(hut, events, loop_handle(), Vec::new(), RedrawHandle::new(ping)).unwrap()
-    }
+    // Shared with `ownership.rs`/`handlers/shell.rs`'s own test modules —
+    // aliased to this file's pre-existing local names rather than
+    // renaming every one of this file's own call sites.
+    use crate::test_support::test_stack as new_stack;
 
     #[test]
     fn starts_with_a_single_focused_untouched_hut() {
