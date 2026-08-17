@@ -130,7 +130,6 @@ use smithay::backend::renderer::ImportDma;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{self, UdevBackend, UdevEvent};
-use smithay::desktop::layer_map_for_output;
 use smithay::input::pointer::{CursorIcon, CursorImageAttributes, CursorImageStatus};
 use smithay::output::{Mode as WlMode, Output, PhysicalProperties, Scale as OutputScale};
 use smithay::reexports::calloop::ping::PingSource;
@@ -1352,70 +1351,14 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
         Err(err) => tracing::warn!("render_frame failed: {err}"),
     }
 
-    // Missing here entirely until now — `winit_backend.rs`'s redraw
-    // handler has always done this, but nothing under this backend ever
-    // did. Without `send_frame`, a well-behaved client (anything pacing
-    // its own rendering off `wl_surface.frame` callbacks — which is
-    // effectively every real client) draws once and then waits forever
-    // for a callback that never comes, looking exactly like "doesn't
-    // work". `flush_clients` matters just as much: `dispatch_clients`
-    // (wired up in `state.rs`'s `init_wayland_listener`) only reads
-    // *incoming* client requests — nothing anywhere else flushes
-    // *outgoing* protocol messages (configures, frame callbacks, ...) to
-    // client sockets under this backend.
-    let elapsed = state.start_time.elapsed();
-    // `focused_mut_for(output_index)` — this crtc's own output, not
-    // `focused_mut()` (whichever output currently has *input* focus,
-    // possibly a different one entirely on a multi-monitor session).
-    // Using the globally-focused Hut here meant a window on a
-    // non-focused output never received a `wl_surface.frame` callback at
-    // all from *its own* output's render pass, so a well-behaved client
-    // pacing redraws off that callback drew once and then stalled.
-    // `space()`, deliberately NOT the self-syncing `space_mut` — this
-    // runs on *every* rendered frame (far more often than the discrete
-    // pointer-motion samples that drive a drag), and `grabs.rs`'s
-    // `MoveSurfaceGrab::motion`/`docks.rs`'s `advance_drag` write a live,
-    // in-progress drag position directly into this same Hut's `space`
-    // via `space_raw_mut`. Forcing a sync here — caught by review before
-    // landing — would resync from the stale pre-drag model on the very
-    // next frame after any drag motion, snapping the window back toward
-    // its last confirmed position and/or discarding `raise_element`'s
-    // z-order adjustment (`input.rs`'s click-to-focus) the same way.
-    // Reading raw is also the *correct* behavior here regardless: frame
-    // callbacks and `refresh()` should reflect whatever's actually,
-    // currently being displayed, live-drag positions included.
-    let hut = state.stack.focused_mut_for(output_index);
-    let space = hut.space_raw_mut();
-    space.elements().for_each(|element| {
-        if let crate::space_element::HutSpaceElement::Window(window) = element {
-            window.send_frame(
-                &output,
-                elapsed,
-                Some(std::time::Duration::ZERO),
-                |_, _| Some(output.clone()),
-            );
-        }
-    });
-    space.refresh();
-    // Same gap this whole block's doc comment already describes for a
-    // Main Window's own `wl_surface`, just for `layer_map_for_output`'s
-    // surfaces instead of a `Space`'s — a layer-shell client (a status
-    // bar, a launcher) that paces its own redraws off `wl_surface.frame`
-    // (effectively every GTK/Qt client, including waybar) draws once and
-    // then stalls forever without this. Every layer on this output, not
-    // just the visible ones — mirrors `send_frames_surface_tree`'s own
-    // "every subsurface that requested it" scope, and layers in every
-    // `Layer` (Background/Bottom/Top/Overlay) still need to keep pacing
-    // their own redraws even while occluded by normal content.
-    layer_map_for_output(&output).layers().for_each(|layer| {
-        layer.send_frame(&output, elapsed, Some(std::time::Duration::ZERO), |_, _| Some(output.clone()));
-    });
-    state.popups.cleanup();
-    // `session_destroyed` only removes mudhuts' own owned `Session`s
-    // (`state.image_copy_sessions`) — it doesn't touch `ImageCopyCaptureState`'s
-    // separate internal tracking Vecs, so those need this periodic sweep too.
-    state.image_copy_capture_state.cleanup();
-    let _ = state.display_handle.flush_clients();
+    // Missing here entirely until this backend's own frame-callback fix
+    // landed — without it, a well-behaved client (anything pacing its
+    // own rendering off `wl_surface.frame` callbacks — effectively every
+    // real client) draws once and then waits forever for a callback that
+    // never comes, looking exactly like "doesn't work". `output_index`
+    // (this crtc's own output), not always the globally-focused one —
+    // see `render::send_frame_callbacks`'s own doc comment.
+    render::send_frame_callbacks(state, output_index, &output);
 }
 
 /// How often [`check_adaptive_refresh`] samples real queued-frame counts
@@ -1730,15 +1673,18 @@ fn scale_down_hotspot(xhot: u32, yhot: u32, scale_int: i32) -> (i32, i32) {
 /// at `scale`. Pulled out over plain `smithay::utils::Point`/`Scale`
 /// values (freely constructible, not the blocker) purely because it used
 /// to live inline inside `build_cursor_elements`, which needs a real
-/// `&mut GlesRenderer` to reach at all.
+/// `&mut GlesRenderer` to reach at all. The output-rebase-then-convert
+/// core is shared with `docks.rs::rebase_to_output_physical` (see its own
+/// doc comment) — this just also subtracts the hotspot first and rounds
+/// to a real pixel at the end, which that shared drag-position function
+/// deliberately doesn't need to.
 fn cursor_physical_position(
     pointer_location: Point<f64, smithay::utils::Logical>,
     output_position: Point<i32, smithay::utils::Logical>,
     hotspot: Point<i32, smithay::utils::Logical>,
     scale: f64,
 ) -> Point<i32, smithay::utils::Physical> {
-    (pointer_location - output_position.to_f64() - hotspot.to_f64())
-        .to_physical(Scale::from(scale))
+    crate::docks::rebase_to_output_physical(pointer_location - hotspot.to_f64(), output_position, scale)
         .to_i32_round()
 }
 

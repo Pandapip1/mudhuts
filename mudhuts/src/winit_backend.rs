@@ -4,7 +4,6 @@ use std::rc::Rc;
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::winit::{self, WinitEvent};
-use smithay::desktop::layer_map_for_output;
 use smithay::input::keyboard::KeyboardSource;
 use smithay::output::{Mode, Output, PhysicalProperties, Scale as OutputScale, Subpixel};
 use smithay::reexports::calloop::EventLoop;
@@ -226,42 +225,10 @@ pub fn init_winit(
                         }
                     }
 
-                    let elapsed = state.start_time.elapsed();
-                    // `space()`, deliberately NOT the self-syncing
-                    // `space_mut` — see `udev_backend.rs`'s identical fix
-                    // and its own doc comment for why forcing a sync in
-                    // this per-frame sweep would corrupt a live in-progress
-                    // drag/raise-element z-order.
-                    let hut = state.stack.focused_mut();
-                    let space = hut.space_raw_mut();
-                    space.elements().for_each(|element| {
-                        if let crate::space_element::HutSpaceElement::Window(window) = element {
-                            window.send_frame(
-                                &output,
-                                elapsed,
-                                Some(std::time::Duration::ZERO),
-                                |_, _| Some(output.clone()),
-                            );
-                        }
-                    });
-                    space.refresh();
-                    // See `udev_backend.rs`'s identical fix and its own
-                    // doc comment: a layer-shell client pacing its own
-                    // redraws off `wl_surface.frame` (waybar, most
-                    // GTK/Qt clients) never got one from this backend
-                    // either, so it drew once and stalled forever.
-                    layer_map_for_output(&output).layers().for_each(|layer| {
-                        layer.send_frame(&output, elapsed, Some(std::time::Duration::ZERO), |_, _| {
-                            Some(output.clone())
-                        });
-                    });
-                    state.popups.cleanup();
-                    // `session_destroyed` only removes mudhuts' own owned
-                    // `Session`s (`state.image_copy_sessions`) — it doesn't
-                    // touch `ImageCopyCaptureState`'s separate internal
-                    // tracking Vecs, so those need this periodic sweep too.
-                    state.image_copy_capture_state.cleanup();
-                    let _ = state.display_handle.flush_clients();
+                    // This backend is genuinely single-output, so its own
+                    // `focused_output` is always `0` — see
+                    // `render::send_frame_callbacks`'s own doc comment.
+                    render::send_frame_callbacks(state, 0, &output);
                 }
                 WinitEvent::Focus(false) => {
                     // The nested window just lost keyboard focus at the

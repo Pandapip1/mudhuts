@@ -13,6 +13,7 @@ use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::utils::{CommitCounter, DamageBag, DamageSnapshot};
 use smithay::backend::renderer::{ImportAll, ImportMem, RendererSuper};
 use smithay::desktop::space::{Space, SpaceRenderElements, space_render_elements};
+use smithay::desktop::layer_map_for_output;
 use smithay::output::Output;
 use smithay::utils::{Buffer, Rectangle, Scale, Transform};
 
@@ -896,27 +897,29 @@ fn lock_screen_elements(
 pub(crate) fn combined_tab_strip_height(state: &State, output_index: usize) -> i32 {
     let top = state.stack.focused_top_level_for(output_index);
     let is_tiled = crate::graph_nodes::is_effectively_tiled(state.stack.graph(), top);
-    if is_tiled {
-        return 0;
-    }
-    let cell_h = state.stack.focused_for(output_index).glyphs.cell_height().max(1) as i32;
-    let scale = state.output_scale_for(output_index);
-    let village_height = village_chrome::stack_height(state.stack.graph(), top, cell_h, scale);
-    let chrome_height = chrome::strip_height(state.stack.focused_for(output_index), scale);
-    combined_strip_height(is_tiled, village_height, chrome_height)
+    combined_strip_height(is_tiled, || {
+        let cell_h = state.stack.focused_for(output_index).glyphs.cell_height().max(1) as i32;
+        let scale = state.output_scale_for(output_index);
+        let village_height = village_chrome::stack_height(state.stack.graph(), top, cell_h, scale);
+        let chrome_height = chrome::strip_height(state.stack.focused_for(output_index), scale);
+        village_height + chrome_height
+    })
 }
 
-/// `combined_tab_strip_height`'s own arithmetic, pulled out as a pure
-/// function over primitives: `0` whenever tiled, regardless of the
-/// component heights, otherwise their sum. A prior version of the
-/// (then-inline) tiled check was subtly incomplete and shipped a real
-/// regression — a tiled ConsoleHut with Main Windows open reporting a
-/// nonzero height nothing actually draws, caught only in review (see
-/// `combined_tab_strip_height`'s own doc comment) — this pins the
-/// contract down with a real regression test instead of relying on
-/// review catching it again.
-fn combined_strip_height(is_tiled: bool, village_height: i32, chrome_height: i32) -> i32 {
-    if is_tiled { 0 } else { village_height + chrome_height }
+/// `combined_tab_strip_height`'s own tiled short-circuit, pulled out as a
+/// pure function so the regression it guards against (a tiled ConsoleHut
+/// with Main Windows open reporting a nonzero height nothing actually
+/// draws — see that function's own doc comment) stays directly testable
+/// without a full `State` fixture (this codebase has no such harness
+/// yet). `height` is lazy, not a plain `i32`, specifically so a test can
+/// assert the tiled case never even evaluates it (a `village_height`/
+/// `chrome_height` computation paid for and then discarded on every
+/// tiled call was itself a real, review-caught regression once — see
+/// git history) while still letting `combined_tab_strip_height` pass in
+/// that expensive computation directly, with zero indirection cost when
+/// not tiled.
+fn combined_strip_height(is_tiled: bool, height: impl FnOnce() -> i32) -> i32 {
+    if is_tiled { 0 } else { height() }
 }
 
 /// Whether the combined Hut-level + Main-Window tab strip should actually
@@ -1037,11 +1040,22 @@ pub fn build_frame_elements(
     // ever *repairs* a genuinely stale focus, never force-overrides a
     // still-legitimate one (a clicked Floating Window/Alert, a mapped
     // layer-shell surface).
-    state.sync_keyboard_focus_to_view();
+    //
+    // Gated to at most once per real frame (`take_needs_keyboard_focus_
+    // sync`), not once per output — this call's own internal layer-map
+    // scan is O(outputs), and a frame that renders every output together
+    // (the common case) previously paid for that scan once per output,
+    // an O(outputs^2) cost with no correctness benefit: every output
+    // that renders this frame does so after the same `begin_frame` call,
+    // so one run already satisfies the "at least one call per tick that
+    // renders" invariant above (caught in review).
+    if state.stack.take_needs_keyboard_focus_sync() {
+        state.sync_keyboard_focus_to_view();
+    }
 
-    let show_terminal = state.showing_terminal_effective_for(output_index);
     let top = state.stack.focused_top_level_for(output_index);
     let is_tile = crate::graph_nodes::is_effectively_tiled(state.stack.graph(), top);
+    let show_terminal = state.stack.shows_terminal_effective_given_tiled(top, is_tile);
     let scale = state.output_scale_for(output_index);
     let mut elements = Vec::new();
 
@@ -1210,6 +1224,65 @@ pub fn build_frame_elements(
     elements
 }
 
+/// Tells every client something on `output` can draw again, and flushes
+/// the resulting protocol traffic — the step both backends' redraw paths
+/// run right after actually presenting a real frame there, alongside
+/// this file's own `build_frame_elements` (the one place both backends'
+/// otherwise-separate redraw paths already converge for building that
+/// frame's content — see that function's own doc comment). Pulled out
+/// after review caught `udev_backend.rs`/`winit_backend.rs` independently
+/// carrying byte-for-byte identical copies of this, kept in sync only by
+/// a comment pointing at each other rather than the compiler.
+///
+/// `space_raw_mut`, deliberately NOT the self-syncing `space_mut` — runs
+/// on *every* rendered frame (far more often than the discrete
+/// pointer-motion samples that drive a drag), and `grabs.rs`'s
+/// `MoveSurfaceGrab::motion`/`docks.rs`'s `advance_drag` write a live,
+/// in-progress drag position directly into this same Hut's `space` via
+/// `space_raw_mut`. Forcing a sync here would resync from the stale
+/// pre-drag model on the very next frame after any drag motion, snapping
+/// the window back toward its last confirmed position and/or discarding
+/// `raise_element`'s z-order adjustment (`input.rs`'s click-to-focus) the
+/// same way. Reading raw is also the *correct* behavior here regardless:
+/// frame callbacks and `refresh()` should reflect whatever's actually,
+/// currently being displayed, live-drag positions included.
+///
+/// `output_index`, not always the globally-focused output — a window on
+/// a non-focused output otherwise never receives a `wl_surface.frame`
+/// callback at all from *its own* output's render pass, so a
+/// well-behaved client pacing redraws off that callback draws once and
+/// then stalls. `winit_backend.rs` is genuinely single-output, so its
+/// own `focused_output` is always `0`; passing `0` there is exactly
+/// equivalent to its old `state.stack.focused_mut()`.
+pub(crate) fn send_frame_callbacks(state: &mut State, output_index: usize, output: &Output) {
+    let elapsed = state.start_time.elapsed();
+    let hut = state.stack.focused_mut_for(output_index);
+    let space = hut.space_raw_mut();
+    space.elements().for_each(|element| {
+        if let HutSpaceElement::Window(window) = element {
+            window.send_frame(output, elapsed, Some(std::time::Duration::ZERO), |_, _| Some(output.clone()));
+        }
+    });
+    space.refresh();
+    // A layer-shell client pacing its own redraws off `wl_surface.frame`
+    // (waybar, most GTK/Qt clients) needs the exact same callback — every
+    // layer on this output, not just the visible ones, mirrors
+    // `send_frames_surface_tree`'s own "every subsurface that requested
+    // it" scope, and layers in every `Layer` (Background/Bottom/Top/
+    // Overlay) still need to keep pacing their own redraws even while
+    // occluded by normal content.
+    layer_map_for_output(output).layers().for_each(|layer| {
+        layer.send_frame(output, elapsed, Some(std::time::Duration::ZERO), |_, _| Some(output.clone()));
+    });
+    state.popups.cleanup();
+    // `session_destroyed` only removes mudhuts' own owned `Session`s
+    // (`state.image_copy_sessions`) — it doesn't touch
+    // `ImageCopyCaptureState`'s separate internal tracking `Vec`s, so
+    // those need this periodic sweep too.
+    state.image_copy_capture_state.cleanup();
+    let _ = state.display_handle.flush_clients();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1299,16 +1372,17 @@ mod tests {
     }
 
     #[test]
-    fn combined_strip_height_is_always_zero_while_tiled() {
+    fn combined_strip_height_is_zero_while_tiled_and_never_evaluates_the_height() {
         // The exact regression this function's own doc comment describes:
-        // nonzero component heights must still yield 0 once tiled.
-        assert_eq!(combined_strip_height(true, 30, 20), 0);
+        // nonzero component heights must still yield 0 once tiled — and,
+        // separately, that expensive computation must not even run.
+        assert_eq!(combined_strip_height(true, || panic!("height must not be evaluated while tiled")), 0);
     }
 
     #[test]
-    fn combined_strip_height_sums_components_when_not_tiled() {
-        assert_eq!(combined_strip_height(false, 30, 20), 50);
-        assert_eq!(combined_strip_height(false, 0, 0), 0);
+    fn combined_strip_height_returns_the_height_when_not_tiled() {
+        assert_eq!(combined_strip_height(false, || 50), 50);
+        assert_eq!(combined_strip_height(false, || 0), 0);
     }
 
     #[test]
