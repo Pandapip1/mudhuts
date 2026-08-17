@@ -147,6 +147,28 @@ pub struct Handle {
     pub title: String,
 }
 
+/// Where the `step`-th (0-based) handle stacked along `edge` sits, in
+/// physical pixels — `output_size`/`handle_size` are `(w, h)`, `gap` is
+/// the spacing between consecutive stacked handles, `margin` keeps clear
+/// of screen corners/`chrome.rs`'s tab strip (see [`EDGE_MARGIN`]'s own
+/// doc comment). Right/Bottom subtract from the output dimension (flush
+/// against the *far* edge) while Left/Top don't (flush against `0`) —
+/// pulled out as a pure function over primitives specifically so that
+/// asymmetry, and the `step * (size + gap)` stacking offset, are directly
+/// testable: a flipped sign or swapped axis here would silently misplace
+/// every docked handle on screen, and nothing short of eyes-on visual
+/// inspection could catch it before this existed.
+fn handle_position(edge: Edge, step: i32, output_size: (i32, i32), handle_size: (i32, i32), gap: i32, margin: i32) -> (i32, i32) {
+    let (output_w, output_h) = output_size;
+    let (handle_w, handle_h) = handle_size;
+    match edge {
+        Edge::Left => (0, margin + step * (handle_h + gap)),
+        Edge::Right => (output_w - handle_w, margin + step * (handle_h + gap)),
+        Edge::Top => (margin + step * (handle_w + gap), 0),
+        Edge::Bottom => (margin + step * (handle_w + gap), output_h - handle_h),
+    }
+}
+
 /// Compute where each of the focused ConsoleHut's active Main Window's docked
 /// Floating Window handles currently are. Empty if the terminal is showing or
 /// there's no active Main Window — handles only make sense alongside the
@@ -155,7 +177,6 @@ pub fn handle_layout(hut: &ConsoleHut, output_size: (i32, i32), scale: f64) -> V
     let Some(entry) = hut.active_main_window_entry() else {
         return Vec::new();
     };
-    let (output_w, output_h) = output_size;
     let handle_w = crate::render::scaled(HANDLE_W, scale);
     let handle_h = crate::render::scaled(HANDLE_H, scale);
     let handle_gap = crate::render::scaled(HANDLE_GAP, scale);
@@ -168,13 +189,8 @@ pub fn handle_layout(hut: &ConsoleHut, output_size: (i32, i32), scale: f64) -> V
             .iter()
             .filter(|sub| matches!(sub.dock, Dock::Docked(e) if e == edge));
         for (n, sub) in docked_on_edge.enumerate() {
-            let step = n as i32;
-            let (x, y) = match edge {
-                Edge::Left => (0, edge_margin + step * (handle_h + handle_gap)),
-                Edge::Right => (output_w - handle_w, edge_margin + step * (handle_h + handle_gap)),
-                Edge::Top => (edge_margin + step * (handle_w + handle_gap), 0),
-                Edge::Bottom => (edge_margin + step * (handle_w + handle_gap), output_h - handle_h),
-            };
+            let (x, y) =
+                handle_position(edge, n as i32, output_size, (handle_w, handle_h), handle_gap, edge_margin);
             let Some(toplevel) = sub.window.toplevel() else {
                 continue;
             };
@@ -345,6 +361,35 @@ pub fn start_drag(state: &mut State, pos: Point<f64, Physical>) -> bool {
     true
 }
 
+/// `global_pos` (genuinely global Logical — see [`advance_drag`]'s own
+/// doc comment) rebased to Physical, local to `output_position` — the
+/// exact Logical-vs-Physical-at-fractional-scale conversion class that's
+/// caused real, shipped bugs elsewhere in this codebase (the auto-hide
+/// tab strip and Main Window positioning work both hit variants of this).
+/// Pulled out as a pure function over `Point`/`Scale` so this specific
+/// conversion — subtract, *then* convert to physical, not the other order
+/// — is directly testable at fractional scales without a live drag/State.
+fn rebase_to_output_physical(
+    global_pos: Point<f64, Logical>,
+    output_position: Point<i32, Logical>,
+    scale: f64,
+) -> Point<f64, Physical> {
+    (global_pos - output_position.to_f64()).to_physical(Scale::from(scale))
+}
+
+/// Whether a drag has moved far enough from its start (`delta = pos -
+/// start`, both physical pixels) to detach into a floating window rather
+/// than being read as just a click — `scale` keeps [`DETACH_THRESHOLD`]'s
+/// apparent size the same regardless of the output's real DPI, matching
+/// every other hand-tuned chrome constant in this crate. Pulled out as a
+/// pure function over primitives so this comparison is directly testable
+/// without a live drag/State — an inclusive vs. exclusive threshold
+/// mistake, or a missed `* scale`, would silently change how far a drag
+/// has to travel before it detaches, differently per monitor.
+fn exceeds_detach_threshold(delta: Point<f64, Physical>, scale: f64) -> bool {
+    delta.x.hypot(delta.y) > DETACH_THRESHOLD * scale
+}
+
 /// Advance an in-progress handle drag on pointer motion: flips the
 /// Floating Window to floating and maps it for the first time once the drag
 /// crosses [`DETACH_THRESHOLD`], then just repositions it directly on
@@ -399,11 +444,11 @@ pub fn advance_drag(state: &mut State, global_pos: Point<f64, Logical>) {
     }
     let scale = state.output_scale_for(output_index);
     let output_position = state.stack.output_position(output_index);
-    let pos = (global_pos - output_position.to_f64()).to_physical(Scale::from(scale));
+    let pos = rebase_to_output_physical(global_pos, output_position, scale);
 
     if !detached {
         let delta = pos - start;
-        if delta.x.hypot(delta.y) <= DETACH_THRESHOLD * scale {
+        if !exceeds_detach_threshold(delta, scale) {
             return;
         }
         let logical = pos.to_logical(Scale::from(scale)).to_i32_round();
@@ -516,5 +561,109 @@ pub fn finish_drag(state: &mut State) {
     // directly — see `crate::redraw`'s module doc.
     if let Some(redraw) = &drag.redraw {
         redraw.mark_dirty();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn left_and_top_sit_flush_against_the_zero_origin() {
+        assert_eq!(handle_position(Edge::Left, 0, (1000, 800), (140, 28), 4, 40), (0, 40));
+        assert_eq!(handle_position(Edge::Top, 0, (1000, 800), (140, 28), 4, 40), (40, 0));
+    }
+
+    #[test]
+    fn right_and_bottom_sit_flush_against_the_far_edge() {
+        assert_eq!(handle_position(Edge::Right, 0, (1000, 800), (140, 28), 4, 40), (1000 - 140, 40));
+        assert_eq!(handle_position(Edge::Bottom, 0, (1000, 800), (140, 28), 4, 40), (40, 800 - 28));
+    }
+
+    #[test]
+    fn stacking_offset_accumulates_by_size_plus_gap() {
+        // Third handle (step 2) stacked down the Left edge.
+        assert_eq!(handle_position(Edge::Left, 2, (1000, 800), (140, 28), 4, 40), (0, 40 + 2 * (28 + 4)));
+        // Third handle (step 2) stacked along the Top edge — stacks by
+        // width, not height, since Top/Bottom stack horizontally.
+        assert_eq!(handle_position(Edge::Top, 2, (1000, 800), (140, 28), 4, 40), (40 + 2 * (140 + 4), 0));
+    }
+
+    #[test]
+    fn left_and_top_ignore_the_far_output_dimension() {
+        // Regression guard against a copy-paste swap of which dimension
+        // gets subtracted: Left's x/Top's y must stay 0 regardless of
+        // the output's own size.
+        assert_eq!(handle_position(Edge::Left, 0, (1000, 800), (140, 28), 4, 40).0, 0);
+        assert_eq!(handle_position(Edge::Left, 0, (5000, 8000), (140, 28), 4, 40).0, 0);
+        assert_eq!(handle_position(Edge::Top, 0, (1000, 800), (140, 28), 4, 40).1, 0);
+        assert_eq!(handle_position(Edge::Top, 0, (5000, 8000), (140, 28), 4, 40).1, 0);
+    }
+
+    #[test]
+    fn exactly_at_the_threshold_does_not_yet_exceed() {
+        assert!(!exceeds_detach_threshold(Point::from((DETACH_THRESHOLD, 0.0)), 1.0));
+    }
+
+    #[test]
+    fn one_unit_past_the_threshold_exceeds() {
+        assert!(exceeds_detach_threshold(Point::from((DETACH_THRESHOLD + 1.0, 0.0)), 1.0));
+    }
+
+    #[test]
+    fn scale_multiplies_the_effective_threshold() {
+        // 20px is past the base threshold (12) but under the scale=2.0
+        // effective one (24) — must not exceed.
+        assert!(!exceeds_detach_threshold(Point::from((20.0, 0.0)), 2.0));
+        // 13px is past the base threshold and scale=1.0 doesn't stretch
+        // it any further — must exceed.
+        assert!(exceeds_detach_threshold(Point::from((13.0, 0.0)), 1.0));
+    }
+
+    #[test]
+    fn diagonal_delta_uses_hypot_not_either_axis_alone() {
+        // Each axis alone (9) is under the threshold (12), but the real
+        // Euclidean distance (~12.73) is past it.
+        assert!(exceeds_detach_threshold(Point::from((9.0, 9.0)), 1.0));
+    }
+
+    #[test]
+    fn rebase_subtracts_output_position_then_converts_to_physical() {
+        let global = Point::<f64, Logical>::from((150.0, 250.0));
+        let output_position = Point::<i32, Logical>::from((100, 200));
+        let physical = rebase_to_output_physical(global, output_position, 2.0);
+        // Local logical: (50, 50); at scale 2.0: (100, 100).
+        assert_eq!(physical, Point::<f64, Physical>::from((100.0, 100.0)));
+    }
+
+    #[test]
+    fn truncate_leaves_a_title_exactly_at_the_limit_unchanged() {
+        let title = "x".repeat(MAX_TITLE_CHARS);
+        assert_eq!(truncate(&title), title);
+    }
+
+    #[test]
+    fn truncate_shortens_a_title_one_over_the_limit() {
+        let title = "x".repeat(MAX_TITLE_CHARS + 1);
+        let result = truncate(&title);
+        assert_eq!(result.chars().count(), MAX_TITLE_CHARS);
+        assert!(result.ends_with('\u{2026}'));
+        assert_eq!(result.chars().filter(|&c| c == 'x').count(), MAX_TITLE_CHARS - 1);
+    }
+
+    #[test]
+    fn truncate_leaves_an_empty_title_unchanged() {
+        assert_eq!(truncate(""), "");
+    }
+
+    #[test]
+    fn truncate_counts_multi_byte_characters_not_bytes() {
+        // Each of these is a multi-byte UTF-8 scalar but a single
+        // `char` — a byte-length-based truncation would cut mid-
+        // character or truncate far earlier than intended.
+        let title = "🦀".repeat(MAX_TITLE_CHARS + 1);
+        let result = truncate(&title);
+        assert_eq!(result.chars().count(), MAX_TITLE_CHARS);
+        assert!(result.ends_with('\u{2026}'));
     }
 }
