@@ -24,35 +24,23 @@ use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::gles::GlesRenderer;
-use smithay::utils::{Physical, Point, Rectangle, Size, Transform};
+use smithay::utils::{Point, Transform};
 
-use crate::chrome::{to_color32f, window_title};
+use crate::chrome::{TAB_PADDING, TabRect, tab_h, tab_row_layout, to_color32f, window_title};
 use crate::graph::{Graph, NodeId};
 use crate::graph_nodes::{ConsoleNode, RenderEnv, TabNode};
 use crate::render::OutputRenderElements;
 use crate::space_element::HutSpaceRenderElement;
 use crate::theme::Theme;
 
-/// Base sizes (scale 1.0) — scaled via `crate::render::scaled` wherever
-/// they're actually used, matching `chrome.rs`'s own constants.
-const TAB_PADDING: i32 = 12;
-const TAB_GAP: i32 = 4;
-const LEFT_MARGIN: i32 = 16;
-const MAX_TITLE_CHARS: usize = 24;
-
 type Element = OutputRenderElements<GlesRenderer, HutSpaceRenderElement>;
-
-/// One tab's clickable/drawable rectangle within a single Tab-Hut
-/// level, plus which child it is (an index into that level's `children`).
-pub struct TabRect {
-    pub index: usize,
-    pub rect: Rectangle<i32, Physical>,
-}
 
 /// What to show on a child's tab — its currently-effective ConsoleHut's active
 /// view: the active Main Window's title if it's showing one, else
-/// "Terminal". Same fallback chain `chrome::window_title` already uses
-/// for a single ConsoleHut's own Main-Window tabs, one level down.
+/// "Terminal". `window_title` already truncates and falls back exactly
+/// the way a tab label needs to, so there's nothing left for this
+/// function to do beyond picking which of "Terminal" or that title
+/// applies.
 fn child_label(graph: &Graph<RenderEnv>, child: NodeId) -> String {
     let leaf = graph.focused_leaf(child);
     let Some(console) = graph.downcast::<ConsoleNode>(leaf) else {
@@ -63,43 +51,9 @@ fn child_label(graph: &Graph<RenderEnv>, child: NodeId) -> String {
         && hut.main_window_count() > 0
         && let Some(window) = hut.active_window()
     {
-        let title = window_title(window);
-        return if title.chars().count() > MAX_TITLE_CHARS {
-            let truncated: String = title.chars().take(MAX_TITLE_CHARS.saturating_sub(1)).collect();
-            format!("{truncated}\u{2026}")
-        } else {
-            title
-        };
+        return window_title(window);
     }
     "Terminal".to_string()
-}
-
-fn tab_h(cell_h: i32, scale: f64) -> i32 {
-    cell_h + crate::render::scaled(TAB_PADDING, scale) * 2
-}
-
-/// One Tab-Hut level's tab rects, at physical-pixel row `y` — shared
-/// between rendering and click hit-testing (see this module's doc), so
-/// the two can never disagree about where a tab actually is. Takes
-/// already-resolved `labels` (not the children themselves) so callers
-/// needing just the layout don't have to hold a `&Graph` borrow through
-/// this call too.
-fn level_layout(labels: &[String], y: i32, cell_w: usize, cell_h: i32, scale: f64) -> Vec<TabRect> {
-    let h = tab_h(cell_h, scale);
-    let padding = crate::render::scaled(TAB_PADDING, scale);
-    let gap = crate::render::scaled(TAB_GAP, scale);
-    let mut rects = Vec::new();
-    let mut x = crate::render::scaled(LEFT_MARGIN, scale);
-    for (i, label) in labels.iter().enumerate() {
-        let label_w = (label.chars().count().max(1) * cell_w) as i32;
-        let tab_w = label_w + padding * 2;
-        rects.push(TabRect {
-            index: i,
-            rect: Rectangle::new(Point::from((x, y)), Size::from((tab_w, h))),
-        });
-        x += tab_w + gap;
-    }
-    rects
 }
 
 /// Total height of the Hut-level tab-strip stack along the active
@@ -143,7 +97,7 @@ pub fn handle_click(
     }
     let labels: Vec<String> = children.iter().map(|&c| child_label(graph, c)).collect();
     let point = Point::from(pos);
-    for TabRect { index: i, rect } in level_layout(&labels, y, cell_w, cell_h, scale) {
+    for TabRect { index: i, rect } in tab_row_layout(&labels, y, cell_w, cell_h, scale) {
         if rect.contains(point) {
             if let Some(tab) = graph.downcast_mut::<TabNode>(village) {
                 *tab.active = i;
@@ -180,7 +134,7 @@ pub fn build(
     }
 
     let labels: Vec<String> = children.iter().map(|&c| child_label(graph, c)).collect();
-    let rects = level_layout(&labels, y, cell_w, cell_h, scale);
+    let rects = tab_row_layout(&labels, y, cell_w, cell_h, scale);
     let padding = crate::render::scaled(TAB_PADDING, scale);
 
     let mut elements = Vec::new();

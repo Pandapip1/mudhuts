@@ -216,8 +216,9 @@ fn accumulate_discrete_units(accum: f64, delta: f64, unit: f64) -> (f64, i32) {
 /// order they're enumerated. Pulled out of `try_click_chrome`'s Tile-pane
 /// hit-test as a pure function so the round-to-pixel-then-contains logic
 /// that turns a raw click into a pane index is directly testable, same
-/// reasoning as `village_chrome.rs`'s `level_layout`/`chrome.rs`'s
-/// `tab_layout` already being shared between drawing and hit-testing.
+/// reasoning as `chrome.rs`'s `tab_row_layout` already being shared
+/// between drawing and hit-testing (`village_chrome.rs`'s `build`/
+/// `handle_click`, `chrome.rs`'s own `tab_layout`).
 fn hit_pane_index(pixel: Point<i32, Physical>, rects: impl Iterator<Item = (i32, i32, i32, i32)>) -> Option<usize> {
     rects
         .enumerate()

@@ -24,8 +24,13 @@ use crate::theme::Theme;
 
 /// Base sizes (scale 1.0) — scaled via `crate::render::scaled` wherever
 /// they're actually used, so this chrome stays the same apparent size
-/// regardless of the output's real DPI scale.
-const TAB_PADDING: i32 = 12;
+/// regardless of the output's real DPI scale. `TAB_PADDING` alone is
+/// `pub(crate)`: `village_chrome.rs`'s `build` also needs it directly
+/// (to offset a label within its tab rect), while `TAB_GAP`/
+/// `LEFT_MARGIN` stay private — every other consumer of this chrome's
+/// exact layout goes through `tab_row_layout`, which already bakes them
+/// in.
+pub(crate) const TAB_PADDING: i32 = 12;
 const TAB_GAP: i32 = 4;
 const LEFT_MARGIN: i32 = 16;
 const MAX_TITLE_CHARS: usize = 24;
@@ -99,7 +104,7 @@ pub fn strip_height(hut: &ConsoleHut, scale: f64) -> i32 {
     if hut.main_window_count() == 0 {
         return 0;
     }
-    hut.glyphs.cell_height().max(1) as i32 + crate::render::scaled(TAB_PADDING, scale) * 2
+    tab_h(hut.glyphs.cell_height().max(1) as i32, scale)
 }
 
 /// One tab's clickable/drawable rectangle, plus which tab it is — `0` is
@@ -107,9 +112,48 @@ pub fn strip_height(hut: &ConsoleHut, scale: f64) -> i32 {
 /// (matching `build`'s own indexing). Shared between `build` (rendering)
 /// and `input.rs` (click hit-testing), so the two can never disagree
 /// about where a tab actually is — the same reasoning as `docks::Handle`.
+/// Also reused as-is by `village_chrome.rs`'s Hut-level tab strips
+/// (`tab_row_layout`), which lay out the exact same shape of thing one
+/// level up the Tab-Hut hierarchy.
 pub struct TabRect {
     pub index: usize,
     pub rect: Rectangle<i32, Physical>,
+}
+
+/// One tab-strip row's height for a strip whose cells are `cell_h`
+/// physical pixels tall — shared by `chrome.rs`'s own per-ConsoleHut
+/// strip (`strip_height`) and `village_chrome.rs`'s per-Tab-Hut-level
+/// strips (`village_chrome::stack_height`), which must agree on this
+/// exactly or the two kinds of strip would visibly mismatch in height
+/// when stacked on top of each other.
+pub(crate) fn tab_h(cell_h: i32, scale: f64) -> i32 {
+    cell_h + crate::render::scaled(TAB_PADDING, scale) * 2
+}
+
+/// Lay out one row of tabs, left to right starting at physical-pixel row
+/// `y`, sized to fit each of `labels` at `cell_w` pixels/char plus
+/// padding — the shared arithmetic behind both `tab_layout` (this
+/// module, one row per ConsoleHut's Main Windows) and
+/// `village_chrome.rs`'s `build`/`handle_click` (one row per Tab-Hut
+/// level's children), which need to lay out visually-identical strips
+/// over two different label sources. Empty `labels` produces an empty
+/// result.
+pub(crate) fn tab_row_layout(labels: &[String], y: i32, cell_w: usize, cell_h: i32, scale: f64) -> Vec<TabRect> {
+    let h = tab_h(cell_h, scale);
+    let padding = crate::render::scaled(TAB_PADDING, scale);
+    let gap = crate::render::scaled(TAB_GAP, scale);
+    let mut rects = Vec::new();
+    let mut x = crate::render::scaled(LEFT_MARGIN, scale);
+    for (i, label) in labels.iter().enumerate() {
+        let label_w = (label.chars().count().max(1) * cell_w) as i32;
+        let tab_w = label_w + padding * 2;
+        rects.push(TabRect {
+            index: i,
+            rect: Rectangle::new(Point::from((x, y)), Size::from((tab_w, h))),
+        });
+        x += tab_w + gap;
+    }
+    rects
 }
 
 /// Compute this ConsoleHut's tab strip layout, starting at physical-pixel row
@@ -121,25 +165,12 @@ pub fn tab_layout(hut: &ConsoleHut, y: i32, scale: f64) -> Vec<TabRect> {
         return Vec::new();
     }
     let cell_w = hut.glyphs.cell_width().max(1);
-    let tab_h = strip_height(hut, scale);
-    let padding = crate::render::scaled(TAB_PADDING, scale);
-    let gap = crate::render::scaled(TAB_GAP, scale);
+    let cell_h = hut.glyphs.cell_height().max(1) as i32;
 
     let mut labels = vec!["Terminal".to_string()];
     labels.extend(hut.main_windows().iter().map(|entry| window_title(&entry.window)));
 
-    let mut rects = Vec::new();
-    let mut x = crate::render::scaled(LEFT_MARGIN, scale);
-    for (i, label) in labels.iter().enumerate() {
-        let label_w = (label.chars().count().max(1) * cell_w) as i32;
-        let tab_w = label_w + padding * 2;
-        rects.push(TabRect {
-            index: i,
-            rect: Rectangle::new(Point::from((x, y)), Size::from((tab_w, tab_h))),
-        });
-        x += tab_w + gap;
-    }
-    rects
+    tab_row_layout(&labels, y, cell_w, cell_h, scale)
 }
 
 /// Build the tab strip's render elements in front-to-back order, starting
@@ -249,4 +280,56 @@ pub fn build(hut: &mut ConsoleHut, renderer: &mut GlesRenderer, y: i32, scale: f
     }
 
     elements
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tab_h_adds_padding_on_both_sides_of_the_cell_height() {
+        assert_eq!(tab_h(20, 1.0), 20 + TAB_PADDING * 2);
+    }
+
+    #[test]
+    fn tab_h_scales_the_padding_but_not_the_cell_height() {
+        // `cell_h` already comes in as physical pixels for the actual
+        // (already-scaled) font — only the constant padding around it
+        // needs its own separate scaling.
+        assert_eq!(tab_h(20, 2.0), 20 + TAB_PADDING * 2 * 2);
+    }
+
+    #[test]
+    fn tab_row_layout_of_no_labels_is_empty() {
+        assert!(tab_row_layout(&[], 0, 8, 20, 1.0).is_empty());
+    }
+
+    #[test]
+    fn tab_row_layout_starts_at_the_left_margin_and_the_given_row() {
+        let rects = tab_row_layout(&["a".to_string()], 40, 8, 20, 1.0);
+        assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0].index, 0);
+        assert_eq!(rects[0].rect.loc, Point::from((LEFT_MARGIN, 40)));
+        assert_eq!(rects[0].rect.size.h, tab_h(20, 1.0));
+    }
+
+    #[test]
+    fn tab_row_layout_widens_for_longer_labels() {
+        let rects = tab_row_layout(&["a".to_string(), "much longer label".to_string()], 0, 8, 20, 1.0);
+        assert!(rects[1].rect.size.w > rects[0].rect.size.w);
+    }
+
+    #[test]
+    fn tab_row_layout_places_each_tab_after_the_previous_ones_gap() {
+        let rects = tab_row_layout(&["a".to_string(), "b".to_string()], 0, 8, 20, 1.0);
+        let first = &rects[0].rect;
+        let second = &rects[1].rect;
+        assert_eq!(second.loc.x, first.loc.x + first.size.w + TAB_GAP);
+    }
+
+    #[test]
+    fn tab_row_layout_indexes_rects_in_label_order() {
+        let rects = tab_row_layout(&["a".to_string(), "b".to_string(), "c".to_string()], 0, 8, 20, 1.0);
+        assert_eq!(rects.iter().map(|r| r.index).collect::<Vec<_>>(), vec![0, 1, 2]);
+    }
 }
