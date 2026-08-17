@@ -34,6 +34,51 @@ const HIGHLIGHT_MARGIN: i32 = 6;
 
 type Element = OutputRenderElements<GlesRenderer, HutSpaceRenderElement>;
 
+/// Panel and thumbnail-row geometry, in physical pixels, for `count`
+/// entries centered on an output of `output_size` — pulled out of
+/// `build` as pure arithmetic over primitives so it's directly testable
+/// without needing a `GraphStack`/`GlesRenderer`.
+struct PanelLayout {
+    panel: Rectangle<i32, Physical>,
+    thumb_w: i32,
+    thumb_h: i32,
+    padding: i32,
+    gap: i32,
+    highlight_margin: i32,
+}
+
+impl PanelLayout {
+    fn new(count: i32, output_size: (i32, i32), scale: f64) -> Self {
+        let thumb_w = crate::render::scaled(THUMB_SIZE.0, scale);
+        let thumb_h = crate::render::scaled(THUMB_SIZE.1, scale);
+        let gap = crate::render::scaled(GAP, scale);
+        let padding = crate::render::scaled(PADDING, scale);
+        let highlight_margin = crate::render::scaled(HIGHLIGHT_MARGIN, scale);
+        let count = count.max(1);
+        let panel_w = count * thumb_w + (count - 1).max(0) * gap + 2 * padding;
+        let panel_h = thumb_h + 2 * padding;
+        let panel_x = (output_size.0 - panel_w) / 2;
+        let panel_y = (output_size.1 - panel_h) / 2;
+        Self {
+            panel: Rectangle::new(Point::from((panel_x, panel_y)), Size::from((panel_w, panel_h))),
+            thumb_w,
+            thumb_h,
+            padding,
+            gap,
+            highlight_margin,
+        }
+    }
+
+    /// The `index`-th thumbnail's top-left position — left to right,
+    /// starting just inside the panel's padded top-left corner.
+    fn thumb_position(&self, index: i32) -> (i32, i32) {
+        (
+            self.panel.loc.x + self.padding + index * (self.thumb_w + self.gap),
+            self.panel.loc.y + self.padding,
+        )
+    }
+}
+
 /// Build the popup's render elements in front-to-back order (see
 /// `winit_backend.rs`, which pushes these ahead of the normal background
 /// elements — index 0 renders on top), or an empty list if no preview
@@ -48,24 +93,14 @@ pub fn build(stack: &GraphStack, output_index: usize, output_size: (i32, i32), r
     // directly, since none of it flows through an `Element::geometry`
     // call that would otherwise re-apply the output scale on its own
     // (unlike the thumbnail's own `size` below).
-    let thumb_w = crate::render::scaled(THUMB_SIZE.0, scale);
-    let thumb_h = crate::render::scaled(THUMB_SIZE.1, scale);
-    let gap = crate::render::scaled(GAP, scale);
-    let padding = crate::render::scaled(PADDING, scale);
-    let highlight_margin = crate::render::scaled(HIGHLIGHT_MARGIN, scale);
-
-    let count = stack.len_for(output_index).max(1) as i32;
-    let panel_w = count * thumb_w + (count - 1).max(0) * gap + 2 * padding;
-    let panel_h = thumb_h + 2 * padding;
-    let panel_x = (output_size.0 - panel_w) / 2;
-    let panel_y = (output_size.1 - panel_h) / 2;
+    let layout = PanelLayout::new(stack.len_for(output_index) as i32, output_size, scale);
+    let (thumb_w, thumb_h, highlight_margin) = (layout.thumb_w, layout.thumb_h, layout.highlight_margin);
 
     let preview_index = stack.preview_index_for(output_index);
     let mut elements = Vec::new();
 
     for (i, &entry) in stack.top_level_entries_for(output_index).enumerate() {
-        let x = panel_x + padding + i as i32 * (thumb_w + gap);
-        let y = panel_y + padding;
+        let (x, y) = layout.thumb_position(i as i32);
         let Some(console) = stack.graph().downcast::<ConsoleNode>(stack.graph().focused_leaf(entry)) else {
             continue;
         };
@@ -145,10 +180,7 @@ pub fn build(stack: &GraphStack, output_index: usize, output_size: (i32, i32), r
 
     let panel = SolidColorRenderElement::new(
         stack.panel_id_for(output_index),
-        Rectangle::<i32, Physical>::new(
-            Point::from((panel_x, panel_y)),
-            Size::from((panel_w, panel_h)),
-        ),
+        layout.panel,
         smithay::backend::renderer::utils::CommitCounter::default(),
         [0.05, 0.05, 0.05, 0.85],
         Kind::Unspecified,
@@ -156,4 +188,69 @@ pub fn build(stack: &GraphStack, output_index: usize, output_size: (i32, i32), r
     elements.push(Element::from(panel));
 
     elements
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_single_entrys_panel_fits_one_thumbnail_plus_padding() {
+        let layout = PanelLayout::new(1, (1920, 1080), 1.0);
+        assert_eq!(layout.panel.size.w, THUMB_SIZE.0 + 2 * PADDING);
+        assert_eq!(layout.panel.size.h, THUMB_SIZE.1 + 2 * PADDING);
+    }
+
+    #[test]
+    fn additional_entries_widen_the_panel_by_a_thumbnail_and_a_gap_each() {
+        let one = PanelLayout::new(1, (1920, 1080), 1.0);
+        let three = PanelLayout::new(3, (1920, 1080), 1.0);
+        assert_eq!(three.panel.size.w, one.panel.size.w + 2 * (THUMB_SIZE.0 + GAP));
+        // Height never depends on entry count.
+        assert_eq!(three.panel.size.h, one.panel.size.h);
+    }
+
+    #[test]
+    fn zero_entries_is_treated_as_one() {
+        let zero = PanelLayout::new(0, (1920, 1080), 1.0);
+        let one = PanelLayout::new(1, (1920, 1080), 1.0);
+        assert_eq!(zero.panel, one.panel);
+    }
+
+    #[test]
+    fn the_panel_is_centered_on_the_output() {
+        let layout = PanelLayout::new(2, (1920, 1080), 1.0);
+        assert_eq!(layout.panel.loc.x, (1920 - layout.panel.size.w) / 2);
+        assert_eq!(layout.panel.loc.y, (1080 - layout.panel.size.h) / 2);
+    }
+
+    #[test]
+    fn scale_multiplies_every_base_dimension() {
+        let unscaled = PanelLayout::new(2, (1920, 1080), 1.0);
+        let scaled = PanelLayout::new(2, (1920, 1080), 2.0);
+        assert_eq!(scaled.thumb_w, unscaled.thumb_w * 2);
+        assert_eq!(scaled.thumb_h, unscaled.thumb_h * 2);
+        assert_eq!(scaled.padding, unscaled.padding * 2);
+        assert_eq!(scaled.gap, unscaled.gap * 2);
+        assert_eq!(scaled.highlight_margin, unscaled.highlight_margin * 2);
+    }
+
+    #[test]
+    fn the_first_thumbnail_sits_just_inside_the_panels_padded_corner() {
+        let layout = PanelLayout::new(2, (1920, 1080), 1.0);
+        assert_eq!(
+            layout.thumb_position(0),
+            (layout.panel.loc.x + layout.padding, layout.panel.loc.y + layout.padding)
+        );
+    }
+
+    #[test]
+    fn later_thumbnails_are_spaced_by_a_thumbnail_width_plus_a_gap() {
+        let layout = PanelLayout::new(3, (1920, 1080), 1.0);
+        let first = layout.thumb_position(0);
+        let second = layout.thumb_position(1);
+        assert_eq!(second.0, first.0 + layout.thumb_w + layout.gap);
+        // Y never changes across a single row.
+        assert_eq!(second.1, first.1);
+    }
 }
