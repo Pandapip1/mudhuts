@@ -710,6 +710,12 @@ pub struct GpuTermRenderer {
     /// clone) is the correct way to hand it to a render element each frame.
     color_texture: Option<GlesTexture>,
     tex_size: (i32, i32),
+    /// Scratch buffer for [`Self::redraw`]'s instance list — `clear()`ed
+    /// and rebuilt every call rather than allocated fresh, so a steady-state
+    /// terminal (same rough cell count frame to frame) settles into reusing
+    /// one already-grown allocation forever instead of round-tripping the
+    /// allocator at up to 120Hz.
+    instances_scratch: Vec<Instance>,
 }
 
 impl Drop for GpuTermRenderer {
@@ -749,6 +755,7 @@ impl GpuTermRenderer {
                     fbo,
                     color_texture: None,
                     tex_size: (0, 0),
+                    instances_scratch: Vec::new(),
                 }
             })
             .map_err(|e| e.to_string())
@@ -818,9 +825,11 @@ impl GpuTermRenderer {
         let resized = self.ensure_size(renderer, width, height)?;
 
         let white = self.atlas.borrow().white;
-        let mut instances = Vec::with_capacity(cells.len());
+        // Reuse last frame's backing allocation (`clear()` keeps capacity)
+        // instead of allocating fresh every redraw — see the field doc.
+        self.instances_scratch.clear();
         for cell in cells {
-            instances.push(Instance {
+            self.instances_scratch.push(Instance {
                 dst_pos: [(cell.col * cell_w) as f32, (cell.row * cell_h) as f32],
                 dst_size: [cell_w as f32, cell_h as f32],
                 uv_pos: white.uv_pos,
@@ -828,23 +837,24 @@ impl GpuTermRenderer {
                 color: rgb_f32(cell.bg),
             });
         }
-        let bg_count = instances.len();
+        let bg_count = self.instances_scratch.len();
         let tex_size = self.tex_size;
 
         // Resolve glyph atlas entries (may upload new glyphs) directly
-        // into placed instances — no placeholder pass first: an earlier
-        // version pushed a blank `Instance` per glyph cell up front, only
-        // to `truncate`/discard all of them once this real pass built the
-        // actual list, wasted allocation and writes on every redraw. One
-        // `with_context` for the whole batch, not one per cell either —
-        // it does a real `eglMakeCurrent` every call with no already-
-        // current short-circuit, so calling it per-glyph turned a redraw
-        // of e.g. ~200 visible glyphs into ~200 driver calls instead of 1.
+        // into placed instances, appended into the same scratch buffer —
+        // no placeholder pass first: an earlier version pushed a blank
+        // `Instance` per glyph cell up front, only to `truncate`/discard
+        // all of them once this real pass built the actual list, wasted
+        // allocation and writes on every redraw. One `with_context` for
+        // the whole batch, not one per cell either — it does a real
+        // `eglMakeCurrent` every call with no already-current
+        // short-circuit, so calling it per-glyph turned a redraw of e.g.
+        // ~200 visible glyphs into ~200 driver calls instead of 1.
         let atlas = &self.atlas;
-        let glyph_instances: Vec<Instance> = renderer
+        let scratch = &mut self.instances_scratch;
+        renderer
             .with_context(|gl| {
                 let mut atlas = atlas.borrow_mut();
-                let mut out = Vec::with_capacity(cells.len());
                 for cell in cells {
                     if cell.c == ' ' || cell.c == '\0' {
                         continue;
@@ -855,7 +865,7 @@ impl GpuTermRenderer {
                     let glyph_x = (cell.col * cell_w) as i32 + entry.xmin;
                     let glyph_y =
                         (cell.row * cell_h) as i32 + baseline as i32 - entry.height as i32 - entry.ymin;
-                    out.push(Instance {
+                    scratch.push(Instance {
                         dst_pos: [glyph_x as f32, glyph_y as f32],
                         dst_size: [entry.width as f32, entry.height as f32],
                         uv_pos: entry.uv_pos,
@@ -863,11 +873,8 @@ impl GpuTermRenderer {
                         color: rgb_f32(cell.fg),
                     });
                 }
-                out
             })
             .map_err(|e| e.to_string())?;
-        instances.reserve(glyph_instances.len());
-        instances.extend(glyph_instances);
 
         // A freshly (re)allocated target has no prior content to preserve
         // at all — `ensure_size`'s own doc comment: "returns `true` if it
@@ -898,6 +905,8 @@ impl GpuTermRenderer {
             atlas.atlas_tex,
         );
         drop(atlas);
+        let instance_capacity = &mut self.instance_capacity;
+        let instances = &self.instances_scratch;
         renderer
             .with_context(|gl| {
                 draw_instances(
@@ -907,10 +916,10 @@ impl GpuTermRenderer {
                     quad_vbo,
                     atlas_tex,
                     instance_vbo,
-                    &mut self.instance_capacity,
+                    instance_capacity,
                     fbo,
                     tex_size,
-                    &instances,
+                    instances,
                     bg_count,
                     scissor,
                 )
@@ -930,17 +939,23 @@ impl GpuTermRenderer {
 
 /// Renders one short standalone string (no wrapping, single line) into its
 /// own texture sized to fit it exactly — used for Phase 4's tab-strip
-/// chrome (window titles), not the terminal grid. Unlike
-/// [`GpuTermRenderer`], always allocates a fresh target texture per call
-/// rather than reusing one when the size matches: labels are small,
-/// low-frequency (only rebuilt when the tab strip's contents change), so
-/// the reuse optimization that matters for the full-screen terminal path
-/// isn't worth the complexity here.
+/// chrome (window titles), not the terminal grid. Calls are already
+/// low-frequency (gated by `render::LabelCache::is_stale` — only rebuilt
+/// when a label's text/active-state actually changes, not every frame),
+/// but same-size re-renders (e.g. a tab going active/inactive with the
+/// same title, so only colors change) still reuse the target texture
+/// rather than tearing it down and recreating it — same reuse-on-same-size
+/// pattern as [`GpuTermRenderer::ensure_size`], just without that one's
+/// damage/scissor tracking, since a label always fully redraws anyway.
 pub struct LabelRenderer {
     atlas: Rc<RefCell<GlyphAtlas>>,
     instance_vbo: ffi::types::GLuint,
     instance_capacity: usize,
     fbo: ffi::types::GLuint,
+    /// The last-rendered target + its pixel size, reused verbatim when a
+    /// new call needs the same size — see the struct doc.
+    color_texture: Option<GlesTexture>,
+    tex_size: (i32, i32),
 }
 
 impl Drop for LabelRenderer {
@@ -971,6 +986,8 @@ impl LabelRenderer {
                     instance_vbo,
                     instance_capacity: 0,
                     fbo,
+                    color_texture: None,
+                    tex_size: (0, 0),
                 }
             })
             .map_err(|e| e.to_string())
@@ -996,7 +1013,20 @@ impl LabelRenderer {
         let width = (chars.len().max(1) * cell_w) as i32;
         let height = cell_h.max(1) as i32;
 
-        let texture = alloc_color_target(renderer, self.fbo, width, height)?;
+        // Reuse the existing target when its size already matches (e.g. a
+        // same-length title just changing active/inactive color) instead
+        // of tearing down and recreating the texture + FBO attachment —
+        // see the struct doc. A size change (almost always: a different
+        // text length) still reallocates below.
+        let texture = match (&self.color_texture, self.tex_size) {
+            (Some(tex), sz) if sz == (width, height) => tex.clone(),
+            _ => {
+                let texture = alloc_color_target(renderer, self.fbo, width, height)?;
+                self.color_texture = Some(texture.clone());
+                self.tex_size = (width, height);
+                texture
+            }
+        };
 
         let white = self.atlas.borrow().white;
         let mut instances = vec![Instance {
