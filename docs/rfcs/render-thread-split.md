@@ -280,11 +280,28 @@ by commit hash):
    around a value type it doesn't need to know about yet — real, separate scope, not free to
    fold in here. Behavior-preserving: same GL calls, same order, same one `with_context` scope
    per label.
-3. **Extend the same split to `GpuTermRenderer`'s terminal-grid upload step**, since it shares
-   the atlas — otherwise step 2's split is fighting a still-fused terminal-content path for the
-   same underlying resource.
+3. **DONE** (commit `686983a`) — **extended the decide/apply split to `GpuTermRenderer`'s
+   terminal-grid glyph resolution**, since it shares the atlas with labels and Step 2's split
+   would otherwise be fighting a still-fused terminal-content path for the same resource.
+   `redraw()`'s glyph loop now calls `GlyphAtlas::decide_entry` directly (GL-free) instead of the
+   old fused `atlas_entry` wrapper (removed — both real call sites had moved off it, so it was
+   genuinely dead rather than worth keeping around). **Deliberately a different shape from
+   Step 2**, and a real finding worth recording: `redraw()` is a genuine per-frame hot path (up
+   to 120Hz), where `LabelRenderer`'s pattern of returning an *owned* `ResolvedLabel` value was
+   fine (labels are cache-gated, rarely re-resolved) but would be a real, avoidable allocation
+   here. So `GpuTermRenderer` keeps using `&mut self` scratch buffers (a new
+   `pending_uploads_scratch` field, same clear-not-reallocate pattern as the existing
+   `instances_scratch`) rather than an owned intermediate value — the GL-free/GL-only split is
+   real (decide_entry needs no `with_context` at all now, down from two calls per redraw to
+   one), but **the actual `Send`-compatible cross-thread transport shape for terminal content
+   is still an open question for Step 4**, not something this step decided. Whatever it ends up
+   being (a double-buffered scratch structure handed across a channel? something else?) has to
+   respect this same hot-path constraint — a fresh owned `Vec` every redraw is not an option.
+   Behavior-preserving, and a real side-effect win: one `eglMakeCurrent` call per redraw instead
+   of two, since the glyph-resolve pass no longer needs a context at all.
 4. **Only then**, with both label and terminal-grid rendering already split into "decide"/"draw"
-   halves that don't need a live renderer to produce their `Send` intermediate values, attempt
+   halves — labels via an owned `Send` value, terminal-grid via a still-open-question transport
+   shape that has to stay allocation-free per frame (see Step 3 above) — attempt
    the real thread split: render thread does its own full `init_udev` setup from scratch (per
    the `GlesRenderer: !Send` finding above), core forwards input via channel (per the
    `LibSeatSession: !Send` finding above), and `capture.rs`/session-lock confirmation convert to
