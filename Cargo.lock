@@ -1174,6 +1174,7 @@ name = "mudhuts"
 version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
+ "libc",
  "mudhuts-protocols",
  "mudhuts-term",
  "rand",

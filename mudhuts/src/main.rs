@@ -17,8 +17,10 @@ mod keybindings;
 mod main_window;
 mod malloc;
 mod ownership;
+mod perf_config;
 mod redraw;
 mod render;
+mod rt_sched;
 mod space_element;
 mod state;
 mod switcher;
@@ -142,6 +144,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // this would spawn a user's entire real desktop autostart set
         // into a throwaway test window every time, which nobody wants.
         autostart::run(&mut state.stack);
+        // Same real-session gating, for a different reason: SCHED_FIFO
+        // is only useful for the thread actually driving DRM
+        // commits/input under real hardware, and grabbing real-time
+        // scheduling on a host desktop just to run a nested dev/test
+        // instance has no upside and a real (if unlikely) downside —
+        // see `perf_config.rs`'s `PerfConfig::sched_fifo` doc comment.
+        // Applied before `init_udev` so the whole session-setup/render
+        // path runs under it from the start; still a plain no-op unless
+        // `[performance]` opts in (default off) and the launching
+        // session/service granted the needed capability/limit.
+        if state.perf_config.sched_fifo {
+            rt_sched::apply(state.perf_config.sched_fifo_priority);
+        }
         udev_backend::init_udev(&mut event_loop, &mut state, redraw_ping_source)?;
     } else {
         winit_backend::init_winit(&mut event_loop, &mut state, redraw_ping_source)?;
