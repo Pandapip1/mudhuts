@@ -456,41 +456,18 @@ impl GlyphAtlas {
             .map_err(|e| e.to_string())?
     }
 
-    /// Look up (or rasterize + upload) the atlas entry for `(c, bold)` —
-    /// [`Self::decide_entry`] immediately followed by [`Self::apply_upload`]
-    /// if it produced one. Preserved as one call for [`GpuTermRenderer`]'s
-    /// still-fused per-glyph usage; `LabelRenderer::resolve`/`draw` call
-    /// the two halves separately instead — see the render-thread-split
-    /// RFC's "Step 2" (Step 3 splits `GpuTermRenderer`'s own usage too,
-    /// not done yet).
-    fn atlas_entry(
-        &mut self,
-        gl: &ffi::Gles2,
-        glyph_cache: &mut GlyphCache,
-        c: char,
-        bold: bool,
-    ) -> Option<AtlasEntry> {
-        let (entry, upload) = self.decide_entry(glyph_cache, c, bold)?;
-        if let Some(upload) = &upload {
-            self.apply_upload(gl, upload);
-        }
-        Some(entry)
-    }
-
-    /// The GPU-free half of [`Self::atlas_entry`]: look up `(c, bold)`, or
-    /// rasterize (`glyph_cache.glyph`, itself GPU-free) and decide its
-    /// atlas placement (`place_glyph`, also GPU-free) — same logic
-    /// `atlas_entry` always had, just stopping short of the actual
-    /// texture upload. On a genuinely new placement, `self.glyphs` is
+    /// Look up (or rasterize) the atlas entry for `(c, bold)`, deferring
+    /// any actual texture upload to [`Self::apply_upload`] — see that
+    /// method's own doc comment for who calls it and when. On a
+    /// genuinely new placement, `self.glyphs` is
     /// updated immediately (optimistically — nothing here ever needs to
     /// roll a placement back once decided, since the only reason
     /// [`Self::apply_upload`] could fail is the same GL-context misuse
     /// that would already be a bug regardless of when the upload
     /// happens), and the caller gets a [`PendingGlyphUpload`] to apply
     /// whenever a GL context is next available — not necessarily here,
-    /// not necessarily now. `None` for the same two cases `atlas_entry`
-    /// already returned `None` for: a whitespace-shaped glyph, or an
-    /// atlas that's completely full.
+    /// not necessarily now. `None` only ever means one of two things: a
+    /// whitespace-shaped glyph, or an atlas that's completely full.
     fn decide_entry(
         &mut self,
         glyph_cache: &mut GlyphCache,
@@ -796,6 +773,13 @@ pub struct GpuTermRenderer {
     /// one already-grown allocation forever instead of round-tripping the
     /// allocator at up to 120Hz.
     instances_scratch: Vec<Instance>,
+    /// Same reuse-not-reallocate reasoning as `instances_scratch`, for
+    /// [`Self::redraw`]'s glyph-decide pass (`GlyphAtlas::decide_entry`) —
+    /// see the render-thread-split RFC's "Step 3". Almost always empty by
+    /// the time it matters: a glyph only ever lands here on the rare
+    /// redraw that sees a character not already in the shared atlas, not
+    /// on every redraw the way `instances_scratch` is rebuilt.
+    pending_uploads_scratch: Vec<PendingGlyphUpload>,
 }
 
 impl Drop for GpuTermRenderer {
@@ -836,6 +820,7 @@ impl GpuTermRenderer {
                     color_texture: None,
                     tex_size: (0, 0),
                     instances_scratch: Vec::new(),
+                    pending_uploads_scratch: Vec::new(),
                 }
             })
             .map_err(|e| e.to_string())
@@ -920,41 +905,44 @@ impl GpuTermRenderer {
         let bg_count = self.instances_scratch.len();
         let tex_size = self.tex_size;
 
-        // Resolve glyph atlas entries (may upload new glyphs) directly
-        // into placed instances, appended into the same scratch buffer —
-        // no placeholder pass first: an earlier version pushed a blank
-        // `Instance` per glyph cell up front, only to `truncate`/discard
-        // all of them once this real pass built the actual list, wasted
-        // allocation and writes on every redraw. One `with_context` for
-        // the whole batch, not one per cell either — it does a real
-        // `eglMakeCurrent` every call with no already-current
-        // short-circuit, so calling it per-glyph turned a redraw of e.g.
-        // ~200 visible glyphs into ~200 driver calls instead of 1.
-        let atlas = &self.atlas;
-        let scratch = &mut self.instances_scratch;
-        renderer
-            .with_context(|gl| {
-                let mut atlas = atlas.borrow_mut();
-                for cell in cells {
-                    if cell.c == ' ' || cell.c == '\0' {
-                        continue;
-                    }
-                    let Some(entry) = atlas.atlas_entry(gl, glyph_cache, cell.c, cell.bold) else {
-                        continue;
-                    };
-                    let glyph_x = (cell.col * cell_w) as i32 + entry.xmin;
-                    let glyph_y =
-                        (cell.row * cell_h) as i32 + baseline as i32 - entry.height as i32 - entry.ymin;
-                    scratch.push(Instance {
-                        dst_pos: [glyph_x as f32, glyph_y as f32],
-                        dst_size: [entry.width as f32, entry.height as f32],
-                        uv_pos: entry.uv_pos,
-                        uv_size: entry.uv_size,
-                        color: rgb_f32(cell.fg),
-                    });
+        // Resolve glyph atlas entries directly into placed instances,
+        // appended into the same scratch buffer — no placeholder pass
+        // first: an earlier version pushed a blank `Instance` per glyph
+        // cell up front, only to `truncate`/discard all of them once this
+        // real pass built the actual list, wasted allocation and writes
+        // on every redraw. GL-free — routes through `GlyphAtlas::
+        // decide_entry`, not `atlas_entry` (see the render-thread-split
+        // RFC's "Step 3"), so no `with_context` is needed here at all;
+        // any newly-rasterized glyphs collect into
+        // `pending_uploads_scratch` (reused across calls, same "clear,
+        // don't reallocate" reasoning as `instances_scratch` — see its
+        // own field doc) for the single `with_context` call below to
+        // actually upload.
+        self.pending_uploads_scratch.clear();
+        {
+            let mut atlas = self.atlas.borrow_mut();
+            for cell in cells {
+                if cell.c == ' ' || cell.c == '\0' {
+                    continue;
                 }
-            })
-            .map_err(|e| e.to_string())?;
+                let Some((entry, upload)) = atlas.decide_entry(glyph_cache, cell.c, cell.bold) else {
+                    continue;
+                };
+                if let Some(upload) = upload {
+                    self.pending_uploads_scratch.push(upload);
+                }
+                let glyph_x = (cell.col * cell_w) as i32 + entry.xmin;
+                let glyph_y =
+                    (cell.row * cell_h) as i32 + baseline as i32 - entry.height as i32 - entry.ymin;
+                self.instances_scratch.push(Instance {
+                    dst_pos: [glyph_x as f32, glyph_y as f32],
+                    dst_size: [entry.width as f32, entry.height as f32],
+                    uv_pos: entry.uv_pos,
+                    uv_size: entry.uv_size,
+                    color: rgb_f32(cell.fg),
+                });
+            }
+        }
 
         // A freshly (re)allocated target has no prior content to preserve
         // at all — `ensure_size`'s own doc comment: "returns `true` if it
@@ -977,6 +965,7 @@ impl GpuTermRenderer {
         let scissor = touched.map(|r| (r.loc.x, r.loc.y, r.size.w, r.size.h));
 
         let (instance_vbo, fbo) = (self.instance_vbo, self.fbo);
+        let atlas_rc = &self.atlas;
         let atlas = self.atlas.borrow();
         let (program, u_target_size, quad_vbo, atlas_tex) = (
             atlas.program,
@@ -987,8 +976,21 @@ impl GpuTermRenderer {
         drop(atlas);
         let instance_capacity = &mut self.instance_capacity;
         let instances = &self.instances_scratch;
+        let pending_uploads = &self.pending_uploads_scratch;
+        // One `with_context` (real `eglMakeCurrent`) for both the pending
+        // atlas uploads and the draw itself — same "it does a real
+        // `eglMakeCurrent` every call with no already-current
+        // short-circuit" reasoning the glyph-resolve pass above used to
+        // need this for; now that pass is GL-free, this is the *only*
+        // context acquisition `redraw` makes per call, down from two.
         renderer
             .with_context(|gl| {
+                if !pending_uploads.is_empty() {
+                    let atlas = atlas_rc.borrow();
+                    for upload in pending_uploads {
+                        atlas.apply_upload(gl, upload);
+                    }
+                }
                 draw_instances(
                     gl,
                     program,
