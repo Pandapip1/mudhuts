@@ -219,13 +219,19 @@ type Element = OutputRenderElements<GlesRenderer, HutSpaceRenderElement>;
 /// this loses no popup fidelity versus the pre-graph
 /// `space_render_elements`-based path, which delegates to the exact same
 /// `Window` impl under the hood.
+///
+/// Appends into `elements` rather than returning an owned `Vec` — see
+/// `switcher::build`'s doc comment on why; `elements` is expected to
+/// already be positioned correctly by the caller (this function never
+/// clears it), matching every other producer this module and
+/// `switcher.rs`/`village_chrome.rs`/`chrome.rs`/`docks.rs` fill this way.
 pub(crate) fn content_pieces_to_elements(
     pieces: Vec<crate::graph::ContentPiece>,
     renderer: &mut GlesRenderer,
     origin: smithay::utils::Point<f64, smithay::utils::Physical>,
     scale: f64,
-) -> Vec<Element> {
-    let mut elements = Vec::new();
+    elements: &mut Vec<Element>,
+) {
     for piece in pieces {
         match piece {
             crate::graph::ContentPiece::Texture { id, texture, damage, position } => {
@@ -270,7 +276,6 @@ pub(crate) fn content_pieces_to_elements(
             }
         }
     }
-    elements
 }
 
 /// Stable identity for [`composite_normal_content`]'s single composited
@@ -627,16 +632,22 @@ fn border_strips((x, y, w, h): (i32, i32, i32, i32), border: i32) -> [(i32, i32,
 /// same `hut::pane_rects` call `TileNode`'s own `resolve`/
 /// `resize_to_pixels` already use, so this can never disagree with where
 /// a pane actually is.
+///
+/// Clears (then refills) `elements` itself, unlike
+/// [`content_pieces_to_elements`] — this is the entry point that owns
+/// `elements` for the duration of one call (see [`composite_normal_content`],
+/// its only caller, for the persistent buffer `elements` actually is).
 fn content_elements(
     state: &mut State,
     renderer: &mut GlesRenderer,
     content: Vec<crate::graph::ContentPiece>,
     output_index: usize,
-) -> Vec<Element> {
+    elements: &mut Vec<Element>,
+) {
+    elements.clear();
     let area = state.usable_area_for(output_index);
     let scale = state.output_scale_for(output_index);
-    let mut elements =
-        content_pieces_to_elements(content, renderer, area.loc.to_f64(), scale);
+    content_pieces_to_elements(content, renderer, area.loc.to_f64(), scale, elements);
 
     let top = state.stack.focused_top_level_for(output_index);
     if let Some(tile) = state.stack.graph().downcast::<crate::graph_nodes::TileNode>(top) {
@@ -674,8 +685,6 @@ fn content_elements(
             }
         }
     }
-
-    elements
 }
 
 /// Composite [`content_elements`]'s current output into one offscreen
@@ -729,7 +738,17 @@ fn composite_normal_content(
         return None;
     }
     let scale = state.output_scale_for(output_index);
-    let elements = content_elements(state, renderer, content, output_index);
+
+    // Persistent per-output scratch buffer for [`content_elements`]'s
+    // output — `clear()`ed (inside `content_elements` itself) and
+    // rebuilt every call rather than allocated fresh, so a steady-state
+    // frame (same rough element count as last frame) settles into
+    // reusing one already-grown allocation instead of round-tripping the
+    // allocator every frame. Keyed by output index for the same real-
+    // multi-monitor reason [`TARGETS`] below is.
+    thread_local! {
+        static CONTENT_ELEMENTS: RefCell<HashMap<usize, Vec<Element>>> = RefCell::new(HashMap::new());
+    }
 
     // Keyed by output index, not a single unkeyed slot — see
     // `normal_content_id`'s own doc comment for why real multi-monitor
@@ -738,76 +757,82 @@ fn composite_normal_content(
         static TARGETS: RefCell<HashMap<usize, ContentTarget>> = RefCell::new(HashMap::new());
     }
 
-    let (texture, snapshot) = TARGETS.with(|cell| {
-        let mut targets = cell.borrow_mut();
-        let target = ensure_content_target(&mut targets, output_index, "normal-content", renderer, size, scale)?;
+    let (texture, snapshot) = CONTENT_ELEMENTS.with(|content_cell| {
+        let mut content_all = content_cell.borrow_mut();
+        let elements = content_all.entry(output_index).or_default();
+        content_elements(state, renderer, content, output_index, elements);
 
-        let mut bound = renderer
-            .bind(&mut target.texture)
-            .inspect_err(|err| tracing::warn!("failed to bind offscreen buffer for normal content: {err}"))
-            .ok()?;
-        // `age = 1`, not `0` — Smithay's own damage-tracker semantics
-        // (`OutputDamageTracker::damage_output_internal`) treat `age == 0`
-        // as "buffer state unknown, redraw everything," unconditionally
-        // reporting the *entire* output geometry as damaged on every
-        // single call regardless of whether any element actually changed
-        // — see this function's own damage-snapshot comment below for why
-        // that made this whole offscreen composite always look "changed."
-        // `1` is correct here specifically because `target.texture` is one
-        // persistently-reused buffer, not a multi-buffer swapchain being
-        // cycled through — its content really is exactly what the
-        // *immediately preceding* call left there, every time.
-        let result = target
-            .tracker
-            .render_output(renderer, &mut bound, 1, &elements, [0.0, 0.0, 0.0, 0.0])
-            .inspect_err(|err| tracing::warn!("failed to render normal content offscreen: {err}"))
-            .ok()?;
-        // The tracker's *own* real per-region damage — `Physical` here is
-        // numerically identical to this offscreen buffer's own pixel grid
-        // (the synthetic output backing `target.tracker` was built with
-        // `mode.size == size == buffer_size`, so no separate buffer-vs-
-        // physical scale factor exists to convert through), so this is a
-        // direct field copy, not a scaled conversion. Collected into an
-        // owned `Vec` *before* `bound`/`result` (which borrows
-        // `target.tracker`) are dropped.
-        let real_damage: Vec<Rectangle<i32, Buffer>> = result
-            .damage
-            .into_iter()
-            .flatten()
-            .map(|r| Rectangle::new((r.loc.x, r.loc.y).into(), (r.size.w, r.size.h).into()))
-            .collect();
-        drop(bound);
+        TARGETS.with(|cell| {
+            let mut targets = cell.borrow_mut();
+            let target = ensure_content_target(&mut targets, output_index, "normal-content", renderer, size, scale)?;
 
-        // A real, persistent damage snapshot — see `with_normal_content_damage`'s
-        // doc comment for why a fresh `DamageBag::default()` built right
-        // here (an earlier version of this function did exactly that) is
-        // wrong, not just redundant. **Real** damage from the render pass
-        // above, not an unconditional whole-buffer rect — a previous
-        // version of this function always marked the whole buffer damaged
-        // on every call, reasoning that "this function only ever runs
-        // during an actual demand-driven redraw pass, so something real
-        // already triggered it" — true of the *first* call in a chain, but
-        // `DamageBag::add`'s own commit-counter bump on every non-empty
-        // call meant this element's `current_commit()` changed on *every*
-        // single call, so the outer `DrmCompositor` never once saw zero
-        // damage — `render_frame`'s `is_empty` stayed permanently `false`,
-        // `queue_frame` always fired, and `udev_backend.rs::frame_finish`
-        // (which unconditionally re-renders after every completed commit)
-        // chained into the next vblank forever: a genuine infinite
-        // full-vblank-rate redraw loop from the very first frame ever
-        // drawn, confirmed live via `perf record` showing ~90% of CPU
-        // samples inside `render_surface`'s call tree over an arbitrary
-        // multi-second idle window. `DamageBag::add` already declines to
-        // bump its commit counter for a genuinely empty damage set (see
-        // its own doc comment), so feeding it the real per-region damage
-        // here — most calls end up empty when nothing actually changed —
-        // is what actually lets the loop terminate.
-        let snapshot = with_normal_content_damage(output_index, |damage| {
-            damage.add(real_damage);
-            damage.snapshot()
-        });
+            let mut bound = renderer
+                .bind(&mut target.texture)
+                .inspect_err(|err| tracing::warn!("failed to bind offscreen buffer for normal content: {err}"))
+                .ok()?;
+            // `age = 1`, not `0` — Smithay's own damage-tracker semantics
+            // (`OutputDamageTracker::damage_output_internal`) treat `age == 0`
+            // as "buffer state unknown, redraw everything," unconditionally
+            // reporting the *entire* output geometry as damaged on every
+            // single call regardless of whether any element actually changed
+            // — see this function's own damage-snapshot comment below for why
+            // that made this whole offscreen composite always look "changed."
+            // `1` is correct here specifically because `target.texture` is one
+            // persistently-reused buffer, not a multi-buffer swapchain being
+            // cycled through — its content really is exactly what the
+            // *immediately preceding* call left there, every time.
+            let result = target
+                .tracker
+                .render_output(renderer, &mut bound, 1, elements.as_slice(), [0.0, 0.0, 0.0, 0.0])
+                .inspect_err(|err| tracing::warn!("failed to render normal content offscreen: {err}"))
+                .ok()?;
+            // The tracker's *own* real per-region damage — `Physical` here is
+            // numerically identical to this offscreen buffer's own pixel grid
+            // (the synthetic output backing `target.tracker` was built with
+            // `mode.size == size == buffer_size`, so no separate buffer-vs-
+            // physical scale factor exists to convert through), so this is a
+            // direct field copy, not a scaled conversion. Collected into an
+            // owned `Vec` *before* `bound`/`result` (which borrows
+            // `target.tracker`) are dropped.
+            let real_damage: Vec<Rectangle<i32, Buffer>> = result
+                .damage
+                .into_iter()
+                .flatten()
+                .map(|r| Rectangle::new((r.loc.x, r.loc.y).into(), (r.size.w, r.size.h).into()))
+                .collect();
+            drop(bound);
 
-        Some((target.texture.clone(), snapshot))
+            // A real, persistent damage snapshot — see `with_normal_content_damage`'s
+            // doc comment for why a fresh `DamageBag::default()` built right
+            // here (an earlier version of this function did exactly that) is
+            // wrong, not just redundant. **Real** damage from the render pass
+            // above, not an unconditional whole-buffer rect — a previous
+            // version of this function always marked the whole buffer damaged
+            // on every call, reasoning that "this function only ever runs
+            // during an actual demand-driven redraw pass, so something real
+            // already triggered it" — true of the *first* call in a chain, but
+            // `DamageBag::add`'s own commit-counter bump on every non-empty
+            // call meant this element's `current_commit()` changed on *every*
+            // single call, so the outer `DrmCompositor` never once saw zero
+            // damage — `render_frame`'s `is_empty` stayed permanently `false`,
+            // `queue_frame` always fired, and `udev_backend.rs::frame_finish`
+            // (which unconditionally re-renders after every completed commit)
+            // chained into the next vblank forever: a genuine infinite
+            // full-vblank-rate redraw loop from the very first frame ever
+            // drawn, confirmed live via `perf record` showing ~90% of CPU
+            // samples inside `render_surface`'s call tree over an arbitrary
+            // multi-second idle window. `DamageBag::add` already declines to
+            // bump its commit counter for a genuinely empty damage set (see
+            // its own doc comment), so feeding it the real per-region damage
+            // here — most calls end up empty when nothing actually changed —
+            // is what actually lets the loop terminate.
+            let snapshot = with_normal_content_damage(output_index, |damage| {
+                damage.add(real_damage);
+                damage.snapshot()
+            });
+
+            Some((target.texture.clone(), snapshot))
+        })
     })?;
 
     Some(CompositedTexture::new(normal_content_id(output_index), texture, scale, snapshot))
@@ -840,7 +865,8 @@ fn lock_screen_elements(
     renderer: &mut GlesRenderer,
     size: (i32, i32),
     output_index: usize,
-) -> Vec<Element> {
+    elements: &mut Vec<Element>,
+) {
     let this_output = state.stack.outputs().get(output_index).map(|slot| &slot.output);
     let matching = this_output
         .and_then(|output| state.lock_surfaces.iter().find(|(o, _)| o == output))
@@ -857,10 +883,8 @@ fn lock_screen_elements(
             Kind::Unspecified,
         );
         if !elems.is_empty() {
-            return elems
-                .into_iter()
-                .map(|e| Element::from(SpaceRenderElements::Surface(e)))
-                .collect();
+            elements.extend(elems.into_iter().map(|e| Element::from(SpaceRenderElements::Surface(e))));
+            return;
         }
     }
 
@@ -874,7 +898,7 @@ fn lock_screen_elements(
         [0.0, 0.0, 0.0, 1.0],
         Kind::Unspecified,
     );
-    vec![Element::from(background)]
+    elements.push(Element::from(background));
 }
 
 /// The combined Hut-level + Main-Window tab strip's total height for
@@ -977,13 +1001,25 @@ fn tab_strip_visible_formula(auto_hide: bool, is_focused_output: bool, revealed:
 /// has input focus, since every output renders its own live content
 /// every frame regardless of focus. A single-output session always
 /// passes `0`.
+///
+/// Writes into `elements` (cleared here, at the very top, before
+/// anything else) rather than returning an owned `Vec` — the caller owns
+/// a persistent buffer (`udev_backend.rs`'s `SurfaceData::elements`, one
+/// per crtc; `winit_backend.rs`'s own loop-local equivalent) that gets
+/// reused frame over frame via this `clear()` instead of round-tripping
+/// the allocator every frame, matching the out-param convention every
+/// producer this function calls (`switcher::build`, `village_chrome::build`,
+/// `chrome::build`, `docks::build`) now also follows.
 pub fn build_frame_elements(
     state: &mut State,
     renderer: &mut GlesRenderer,
     size: (i32, i32),
     content: Vec<crate::graph::ContentPiece>,
     output_index: usize,
-) -> Vec<OutputRenderElements<GlesRenderer, HutSpaceRenderElement>> {
+    elements: &mut Vec<OutputRenderElements<GlesRenderer, HutSpaceRenderElement>>,
+) {
+    elements.clear();
+
     // First, always — regardless of what else this frame does (even a
     // locked session below still has a live renderer here): reclaim
     // whatever GL objects a ConsoleHut closed since the last frame queued
@@ -1000,10 +1036,10 @@ pub fn build_frame_elements(
     // succeeded. Session lock stays a whole-compositor concept (every
     // output blanks together), not per-output.
     if state.locked {
-        let elements = lock_screen_elements(state, renderer, size, output_index);
+        lock_screen_elements(state, renderer, size, output_index, elements);
         // See the matching call at this function's other exit point below.
         crate::malloc::trim(0);
-        return elements;
+        return;
     }
 
     // Every output that reaches this point, every real redraw pass, on
@@ -1057,7 +1093,6 @@ pub fn build_frame_elements(
     let is_tile = crate::graph_nodes::is_effectively_tiled(state.stack.graph(), top);
     let show_terminal = state.stack.shows_terminal_effective_given_tiled(top, is_tile);
     let scale = state.output_scale_for(output_index);
-    let mut elements = Vec::new();
 
     // Only the focused ConsoleHut normally gets redrawn (see Phase 2.6's
     // damage-avoidance work) — but the Alt-Tab popup shows every ConsoleHut's
@@ -1121,7 +1156,7 @@ pub fn build_frame_elements(
     // elements in front-to-back order) so the popup sits on top of
     // whatever's below, regardless of whether that's the terminal or a
     // client window; empty when no preview session is open.
-    elements.extend(switcher::build(&state.stack, output_index, size, renderer, scale));
+    switcher::build(&state.stack, output_index, size, renderer, scale, elements);
 
     // Tile-Hut (Phase 6) still bypasses the normal single-ConsoleHut
     // chrome/docks pipeline entirely — every pane is visible
@@ -1146,7 +1181,7 @@ pub fn build_frame_elements(
             // children; `next_y` is unchanged (0) in that case.
             let cell_w = state.stack.focused_for(output_index).glyphs.cell_width().max(1);
             let cell_h = state.stack.focused_for(output_index).glyphs.cell_height().max(1) as i32;
-            let (village_tab_elements, next_y) = village_chrome::build(
+            let next_y = village_chrome::build(
                 state.stack.graph_mut(),
                 top,
                 renderer,
@@ -1155,27 +1190,21 @@ pub fn build_frame_elements(
                 cell_h,
                 scale,
                 &state.theme,
+                elements,
             );
-            elements.extend(village_tab_elements);
 
             // Tab-strip chrome (Phase 4) — pushed below any Hut-level strips
             // above it, still on top of the terminal/window content and still
             // below the Alt-Tab popup above. Empty when the focused ConsoleHut has no
             // Main Windows.
-            elements.extend(chrome::build(
-                state.stack.focused_mut_for(output_index),
-                renderer,
-                next_y,
-                scale,
-                &state.theme,
-            ));
+            chrome::build(state.stack.focused_mut_for(output_index), renderer, next_y, scale, &state.theme, elements);
         }
 
         // Docked Floating Window handles (Phase 5) — same z-order slot as the tab
         // strip, only shown alongside the Main Window they belong to (never
         // while the terminal itself is the visible view).
         if !show_terminal {
-            elements.extend(docks::build(state.stack.focused_mut_for(output_index), renderer, size, scale, &state.theme));
+            docks::build(state.stack.focused_mut_for(output_index), renderer, size, scale, &state.theme, elements);
         }
     }
 
@@ -1220,8 +1249,6 @@ pub fn build_frame_elements(
     // to real work (mirroring COSMIC's own `App::view`/`App::update` call
     // sites) matters here, not just calling this occasionally.
     crate::malloc::trim(0);
-
-    elements
 }
 
 /// Tells every client something on `output` can draw again, and flushes

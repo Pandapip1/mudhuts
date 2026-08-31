@@ -204,6 +204,14 @@ struct SurfaceData {
     /// module doc's "Adaptive refresh rate" section and
     /// `connector_connected`'s own setup of this field.
     adaptive_refresh: Option<AdaptiveRefresh>,
+    /// This crtc's persistent scratch buffer for
+    /// `render::build_frame_elements`'s output — `clear()`ed (inside that
+    /// function itself) and rebuilt every `render_surface` call rather
+    /// than allocated fresh, so a steady-state frame (same rough element
+    /// count as last frame) settles into reusing one already-grown
+    /// allocation instead of round-tripping the allocator every frame,
+    /// same reasoning as `GpuTermRenderer::instances_scratch`.
+    elements: Vec<Elements>,
 }
 
 /// Per-connector adaptive-refresh-rate state — see the module doc's
@@ -1050,6 +1058,7 @@ fn connector_connected(
             frame_pending: false,
             gamma_control_bound: false,
             adaptive_refresh,
+            elements: Vec::new(),
         },
     );
 
@@ -1248,7 +1257,7 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
         state.showing_terminal_effective_for(output_index),
     );
 
-    let mut elements = render::build_frame_elements(state, renderer, size, content, output_index);
+    render::build_frame_elements(state, renderer, size, content, output_index, &mut surface.elements);
 
     // Prepended, not appended — elements render front-to-back (index 0
     // on top, per the same convention `switcher::build`'s doc comment
@@ -1262,7 +1271,7 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
         pointer_image_cache,
         output_index,
     );
-    elements.splice(0..0, cursor_elements);
+    surface.elements.splice(0..0, cursor_elements);
 
     // `FrameFlags::empty()`, not `::DEFAULT` — `DEFAULT` allows the
     // `DrmCompositor` to attempt direct scanout via overlay/cursor
@@ -1299,7 +1308,7 @@ fn render_surface(state: &mut State, inner: &Rc<RefCell<Inner>>, crtc: crtc::Han
 
     match surface
         .drm_output
-        .render_frame(renderer, &elements, [0.0, 0.0, 0.0, 1.0], FrameFlags::empty())
+        .render_frame(renderer, &surface.elements, [0.0, 0.0, 0.0, 1.0], FrameFlags::empty())
     {
         Ok(result) => {
             if !result.is_empty {

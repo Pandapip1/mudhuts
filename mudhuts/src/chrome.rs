@@ -188,11 +188,13 @@ pub fn tab_layout(hut: &ConsoleHut, y: i32, scale: f64) -> Vec<TabRect> {
 }
 
 /// Build the tab strip's render elements in front-to-back order, starting
-/// at physical-pixel row `y`, or an empty list if the focused ConsoleHut has no
-/// Main Windows.
-pub fn build(hut: &mut ConsoleHut, renderer: &mut GlesRenderer, y: i32, scale: f64, theme: &Theme) -> Vec<Element> {
+/// at physical-pixel row `y`, appending into `elements` (a no-op if the
+/// focused ConsoleHut has no Main Windows) — see `switcher::build`'s doc
+/// comment on why this takes an out-param rather than returning an owned
+/// `Vec`.
+pub fn build(hut: &mut ConsoleHut, renderer: &mut GlesRenderer, y: i32, scale: f64, theme: &Theme, elements: &mut Vec<Element>) {
     if hut.main_window_count() == 0 {
-        return Vec::new();
+        return;
     }
     let cell_w = hut.glyphs.cell_width().max(1);
     let cell_h = hut.glyphs.cell_height().max(1) as i32;
@@ -208,7 +210,7 @@ pub fn build(hut: &mut ConsoleHut, renderer: &mut GlesRenderer, y: i32, scale: f
 
     let rects = tab_row_layout(&char_counts, y, cell_w, cell_h, scale);
     if rects.is_empty() {
-        return Vec::new();
+        return;
     }
     let padding = crate::render::scaled(TAB_PADDING, scale);
 
@@ -228,7 +230,6 @@ pub fn build(hut: &mut ConsoleHut, renderer: &mut GlesRenderer, y: i32, scale: f
     text_ids.extend(hut.main_windows().iter().map(|entry| entry.tab_text_id.clone()));
     bg_ids.extend(hut.main_windows().iter().map(|entry| entry.tab_bg_id.clone()));
 
-    let mut elements = Vec::new();
     for TabRect { index: i, rect } in rects {
         let label = labels[i].clone();
         let active = i == active_index;
@@ -303,8 +304,6 @@ pub fn build(hut: &mut ConsoleHut, renderer: &mut GlesRenderer, y: i32, scale: f
         );
         elements.push(Element::from(background));
     }
-
-    elements
 }
 
 #[cfg(test)]

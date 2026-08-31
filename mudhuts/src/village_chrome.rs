@@ -114,10 +114,13 @@ pub fn handle_click(
 }
 
 /// Build the Hut-level tab-strip stack's render elements, recursing
-/// down the active path (see this module's doc) — empty if `village`
-/// isn't a Tab node with 2+ children. Returns the elements plus the Y
-/// where whatever's next (a deeper level, or `chrome.rs`'s own strip)
-/// should start.
+/// down the active path (see this module's doc) — appends into
+/// `elements` (a no-op if `village` isn't a Tab node with 2+ children),
+/// mirroring `switcher::build`'s doc comment on why this takes an
+/// out-param rather than returning an owned `Vec`. Returns the Y where
+/// whatever's next (a deeper level, or `chrome.rs`'s own strip) should
+/// start.
+#[allow(clippy::too_many_arguments)]
 pub fn build(
     graph: &mut Graph<RenderEnv>,
     village: NodeId,
@@ -127,13 +130,14 @@ pub fn build(
     cell_h: i32,
     scale: f64,
     theme: &Theme,
-) -> (Vec<Element>, i32) {
+    elements: &mut Vec<Element>,
+) -> i32 {
     if graph.downcast::<TabNode>(village).is_none() {
-        return (Vec::new(), y);
+        return y;
     }
     let children = graph.hut_list_input(village, "children");
     if children.len() < 2 {
-        return (Vec::new(), y);
+        return y;
     }
 
     // Unlike `handle_click`, the label text itself is needed below (for
@@ -145,7 +149,6 @@ pub fn build(
     let rects = tab_row_layout(&char_counts, y, cell_w, cell_h, scale);
     let padding = crate::render::scaled(TAB_PADDING, scale);
 
-    let mut elements = Vec::new();
     let mut active_index = 0;
 
     // `with_node_mut`, not a plain `downcast_mut` — this loop needs
@@ -224,8 +227,5 @@ pub fn build(
     });
 
     let next = children[active_index.min(children.len() - 1)];
-    let (deeper_elements, next_y) =
-        build(graph, next, renderer, y + tab_h(cell_h, scale), cell_w, cell_h, scale, theme);
-    elements.extend(deeper_elements);
-    (elements, next_y)
+    build(graph, next, renderer, y + tab_h(cell_h, scale), cell_w, cell_h, scale, theme, elements)
 }

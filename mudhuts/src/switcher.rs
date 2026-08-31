@@ -81,11 +81,21 @@ impl PanelLayout {
 
 /// Build the popup's render elements in front-to-back order (see
 /// `winit_backend.rs`, which pushes these ahead of the normal background
-/// elements — index 0 renders on top), or an empty list if no preview
-/// session is open.
-pub fn build(stack: &GraphStack, output_index: usize, output_size: (i32, i32), renderer: &GlesRenderer, scale: f64) -> Vec<Element> {
+/// elements — index 0 renders on top), appending into `elements` (a
+/// no-op if no preview session is open) rather than returning an owned
+/// `Vec` — `render.rs`'s `build_frame_elements` passes its own persistent,
+/// per-frame-reused accumulator through here instead of `.extend()`ing a
+/// fresh one every call.
+pub fn build(
+    stack: &GraphStack,
+    output_index: usize,
+    output_size: (i32, i32),
+    renderer: &GlesRenderer,
+    scale: f64,
+    elements: &mut Vec<Element>,
+) {
     if !stack.is_previewing_for(output_index) {
-        return Vec::new();
+        return;
     }
 
     // Physical-pixel math throughout this function (panel/thumbnail
@@ -97,7 +107,6 @@ pub fn build(stack: &GraphStack, output_index: usize, output_size: (i32, i32), r
     let (thumb_w, thumb_h, highlight_margin) = (layout.thumb_w, layout.thumb_h, layout.highlight_margin);
 
     let preview_index = stack.preview_index_for(output_index);
-    let mut elements = Vec::new();
 
     for (i, &entry) in stack.top_level_entries_for(output_index).enumerate() {
         let (x, y) = layout.thumb_position(i as i32);
@@ -186,8 +195,6 @@ pub fn build(stack: &GraphStack, output_index: usize, output_size: (i32, i32), r
         Kind::Unspecified,
     );
     elements.push(Element::from(panel));
-
-    elements
 }
 
 #[cfg(test)]

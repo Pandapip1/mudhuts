@@ -228,7 +228,14 @@ impl State {
         content: Vec<crate::graph::ContentPiece>,
         output_index: usize,
     ) -> Result<Vec<u8>, FailureReason> {
-        let elements = render::build_frame_elements(self, renderer, size, content, output_index);
+        // A plain local `Vec`, not a persistent scratch buffer — unlike
+        // the real per-frame render path (`winit_backend.rs`/
+        // `udev_backend.rs`, which reuse one via `build_frame_elements`'s
+        // `elements` out-param), a screenshot capture is a rare, one-off
+        // event, not something worth threading a long-lived buffer
+        // through `State` for.
+        let mut elements = Vec::new();
+        render::build_frame_elements(self, renderer, size, content, output_index, &mut elements);
 
         let buffer_size: Size<i32, BufferCoord> = (size.0, size.1).into();
         let mut texture = Offscreen::<GlesTexture>::create_buffer(renderer, fourcc, buffer_size)

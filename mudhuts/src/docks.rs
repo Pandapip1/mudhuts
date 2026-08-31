@@ -228,18 +228,20 @@ fn truncate(title: &str) -> String {
     crate::chrome::truncate_with_ellipsis(title, MAX_TITLE_CHARS)
 }
 
-/// Build the docked-handle chrome's render elements, or an empty list if
-/// there's nothing docked right now.
+/// Build the docked-handle chrome's render elements, appending into
+/// `elements` (a no-op if there's nothing docked right now) — see
+/// `switcher::build`'s doc comment on why this takes an out-param rather
+/// than returning an owned `Vec`.
 pub fn build(
     hut: &mut ConsoleHut,
     renderer: &mut GlesRenderer,
     output_size: (i32, i32),
     scale: f64,
     theme: &crate::theme::Theme,
-) -> Vec<Element> {
+    elements: &mut Vec<Element>,
+) {
     let handles = handle_layout(hut, output_size, scale);
     let text_inset = crate::render::scaled(6, scale);
-    let mut elements = Vec::new();
 
     for handle in &handles {
         let title = truncate(&handle.title);
@@ -313,8 +315,6 @@ pub fn build(
         );
         elements.push(Element::from(background));
     }
-
-    elements
 }
 
 /// Start dragging `handle`'s Floating Window out from its dock, if the pointer

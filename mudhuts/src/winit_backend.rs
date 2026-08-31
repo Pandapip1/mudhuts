@@ -74,6 +74,15 @@ pub fn init_winit(
     state.output = Some(output.clone());
 
     let mut damage_tracker = OutputDamageTracker::from_output(&output);
+    // This backend's own persistent scratch buffer for
+    // `render::build_frame_elements`'s output — `clear()`ed (inside that
+    // function itself) and rebuilt every redraw rather than allocated
+    // fresh, so a steady-state frame (same rough element count as last
+    // frame) settles into reusing one already-grown allocation instead of
+    // round-tripping the allocator every frame, matching
+    // `udev_backend.rs`'s per-crtc `SurfaceData::elements`.
+    let mut elements: Vec<render::OutputRenderElements<GlesRenderer, crate::space_element::HutSpaceRenderElement>> =
+        Vec::new();
 
     // Redraws are demand-driven, not continuous: nothing here calls
     // `request_redraw()` unconditionally on every frame. Instead, each
@@ -173,12 +182,13 @@ pub fn init_winit(
                             // ideally with KDE's SVG cursor support) is
                             // still a gap in the udev/DRM backend too —
                             // tracked as a fast-follow there, not blocking.
-                            let elements = render::build_frame_elements(
+                            render::build_frame_elements(
                                 state,
                                 renderer,
                                 (size.w, size.h),
                                 content,
                                 0,
+                                &mut elements,
                             );
 
                             match damage_tracker.render_output(
