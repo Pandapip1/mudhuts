@@ -736,6 +736,18 @@ impl State {
                 // response until some unrelated redraw happened to flush
                 // it.
                 let _ = state.display_handle.flush_clients();
+                // Same backstop `input.rs`'s `process_input_event` runs
+                // after every input event, for the same reason: a client
+                // request (an xdg_shell toplevel destroy, a mudhuts_
+                // shell_v1 retag, ...) can shift which view should hold
+                // keyboard focus just as easily as an input event can —
+                // see `sync_keyboard_focus_to_view`'s own doc comment for
+                // why this has to run through a chokepoint every real
+                // mutation flows through, not a call each mutation site
+                // has to remember on its own.
+                if !state.locked {
+                    state.sync_keyboard_focus_to_view();
+                }
                 Ok(PostAction::Continue)
             },
         )?;

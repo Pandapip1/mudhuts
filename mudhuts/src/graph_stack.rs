@@ -96,50 +96,6 @@ pub struct GraphStack {
     /// deferred simplification.
     scale: f64,
     redraw: RedrawHandle,
-    /// Whether `State::sync_keyboard_focus_to_view` still needs to run
-    /// for the current frame — reset alongside `graph.begin_frame`'s own
-    /// per-frame resolve cache by [`Self::begin_frame`]. That method
-    /// scans every output's own layer map looking for the current
-    /// keyboard focus, and (per `render.rs::build_frame_elements`'s own
-    /// doc comment) has to be called once for every output that renders
-    /// during a real frame, not deduplicated to a fixed output index —
-    /// but a real multi-monitor frame typically renders every output
-    /// together in one synchronous pass, so without this gate the same
-    /// full scan ran once per output, making total per-frame cost
-    /// O(outputs^2) instead of O(outputs) (caught in review). One run
-    /// per frame already satisfies that invariant, since every output
-    /// rendered this frame does so after the same `begin_frame` call.
-    ///
-    /// A [`FrameGate`], not a bare `bool` folded into `graph.rs`'s own
-    /// `Graph::cache` (a keyed per-`(NodeId, port)` *resolve-value*
-    /// memoization, a genuinely different kind of thing than "has this
-    /// one-shot side effect already run this frame") — but still a
-    /// small, named, reusable primitive rather than an ad hoc flag, so
-    /// a future second "run at most once per real frame" need (this is
-    /// currently the only one) has an obvious precedent to reuse instead
-    /// of inventing its own (caught in review).
-    keyboard_focus_synced: FrameGate,
-}
-
-/// A one-shot "has this already run for the current frame" gate, reset
-/// by [`GraphStack::begin_frame`] — see `keyboard_focus_synced`'s own
-/// doc comment for why this exists as a small named type rather than a
-/// bare `bool`.
-#[derive(Default)]
-struct FrameGate(bool);
-
-impl FrameGate {
-    fn reset(&mut self) {
-        self.0 = false;
-    }
-
-    /// `true` (and marks it done) only the first call since the last
-    /// [`Self::reset`].
-    fn take(&mut self) -> bool {
-        let needed = !self.0;
-        self.0 = true;
-        needed
-    }
 }
 
 /// Which shape to wrap the focused leaf into — see [`GraphStack::wrap`].
@@ -189,7 +145,6 @@ impl GraphStack {
             extra_env,
             scale: 1.0,
             redraw,
-            keyboard_focus_synced: FrameGate::default(),
         };
         stack.insert_channel(id, first_events)?;
         Ok(stack)
@@ -226,21 +181,6 @@ impl GraphStack {
 
     pub fn begin_frame(&mut self) {
         self.graph.begin_frame();
-        self.keyboard_focus_synced.reset();
-    }
-
-    /// `true` (and marks it done) only the first time this is called
-    /// since the last [`Self::begin_frame`] — see `keyboard_focus_synced`'s
-    /// own doc comment. `render.rs::build_frame_elements` is this
-    /// field's only real gate; the other, mutation-time call sites of
-    /// `sync_keyboard_focus_to_view` (`sync_hut_space`/
-    /// `sync_visible_main_window`) deliberately stay ungated — they run
-    /// once per mutation event, not once per output per frame, so
-    /// they're not the O(outputs) pattern this exists to fix, and
-    /// calling `sync_keyboard_focus_to_view` again redundantly is always
-    /// safe regardless (see its own doc comment).
-    pub(crate) fn take_needs_keyboard_focus_sync(&mut self) -> bool {
-        self.keyboard_focus_synced.take()
     }
 
     /// Fills in the real output for slot `index` once a backend creates
@@ -1454,16 +1394,6 @@ mod tests {
         let stack = new_stack();
         assert_eq!(stack.len(), 1);
         assert!(!stack.focused().touched());
-    }
-
-    #[test]
-    fn keyboard_focus_sync_is_needed_once_then_not_again_until_the_next_frame() {
-        let mut stack = new_stack();
-        assert!(stack.take_needs_keyboard_focus_sync(), "first call this frame should need a sync");
-        assert!(!stack.take_needs_keyboard_focus_sync(), "a second call in the same frame is redundant");
-        assert!(!stack.take_needs_keyboard_focus_sync(), "still redundant on a third call");
-        stack.begin_frame();
-        assert!(stack.take_needs_keyboard_focus_sync(), "a new frame needs its own sync again");
     }
 
     #[test]

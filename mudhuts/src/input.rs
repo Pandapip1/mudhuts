@@ -441,33 +441,34 @@ impl State {
     ///
     /// Called automatically from `state.rs`'s `sync_visible_main_window`/
     /// `sync_hut_space` themselves (immediate correction right at the
-    /// mutation site — always ungated, since each only runs once per
-    /// mutation event, not once per output per frame), *and*, more
-    /// importantly, from `render.rs`'s `build_frame_elements` on every
-    /// real redraw pass — the single point both backends' otherwise-
-    /// separate redraw paths converge on, so no mutation path can skip it
-    /// the way several turned up missing the first two call sites across
-    /// review rounds (most recently `GraphStack::remove_exited` — a shell
-    /// exit shifting/collapsing focus; see its own doc comment).
-    /// Logically needed for *every* output that reaches
-    /// `build_frame_elements` on a given redraw pass, not deduplicated to
-    /// just one — a per-crtc bail (the udev backend's own `frame_pending`
-    /// check, see `render_surface`'s doc comment) means not every output
-    /// necessarily reaches it on every tick, so "only once, however
-    /// that's chosen" can't safely assume any specific output reliably
-    /// does. Redundant calls are logically safe — this method only ever
-    /// *repairs* a genuinely stale focus, never force-overrides a still-
-    /// legitimate one — but **not free**: it scans every output's own
-    /// layer map internally, so `build_frame_elements` doesn't call this
-    /// method directly. It goes through `GraphStack::
-    /// take_needs_keyboard_focus_sync` instead, which runs this at most
-    /// once per real frame (a frame that renders every output together,
-    /// the common case, previously paid for that scan once per output —
-    /// an O(outputs^2) cost with no correctness benefit, caught in
-    /// review; see that gate's own doc comment). Any *new* per-output
-    /// render-path call site should go through that same gate, not call
-    /// this method directly — the two existing mutation-time call sites
-    /// above are the deliberate exception, not a precedent to copy.
+    /// mutation site), *and* from the two real chokepoints every core-
+    /// side mutation ultimately flows through: [`Self::process_input_
+    /// event`] (the *only* public way to feed in a real input event —
+    /// its private `_unsynced` half does the actual work, so there's no
+    /// way to process an event from outside this module without also
+    /// running this backstop afterward) and `state.rs`'s Wayland-
+    /// dispatch closure (same shape, after `Display::dispatch_clients`
+    /// returns). Deliberately *not* a call every focus-changing mutation
+    /// site has to remember to pair with `sync_hut_space`/
+    /// `sync_visible_main_window` — several turned up missing exactly
+    /// that pairing across review rounds (most recently `GraphStack::
+    /// remove_exited` — a shell exit shifting/collapsing focus; see its
+    /// own doc comment) — so the two chokepoints above exist specifically
+    /// so a *new* mutation path can't reintroduce that bug class: it has
+    /// no way to run at all except through one of them, and both already
+    /// repair focus once they're done. Redundant calls are logically
+    /// safe regardless — this method only ever *repairs* a genuinely
+    /// stale focus, never force-overrides a still-legitimate one — so
+    /// running it after every single input event/dispatch batch, rather
+    /// than gating it to once per rendered frame the way an earlier
+    /// version did (when the only chokepoint was inside `render.rs`'s
+    /// own per-output frame-building loop, gating mattered to avoid an
+    /// O(outputs^2) cost — see that version's history if it's ever worth
+    /// revisiting), costs an O(outputs) layer-map scan per event instead
+    /// of per frame; negligible at this codebase's realistic output/
+    /// layer-surface counts, and neither chokepoint here sits inside a
+    /// per-output loop the way that old call site did, so there's
+    /// nothing left to gate against.
     ///
     /// **This must NOT unconditionally force-set focus to "the terminal or
     /// the active Main Window" every time it runs** — an earlier version
@@ -495,8 +496,8 @@ impl State {
     /// `wlr-layer-shell` one, and stays correct for an unrelated reason:
     /// `process_locked_input_event` re-asserts `keyboard.set_focus` on
     /// every single locked keystroke, a wholly separate mechanism this
-    /// method never runs alongside — `build_frame_elements` returns
-    /// early, before this call, whenever `state.locked` is set.)
+    /// method never runs alongside — [`Self::process_input_event`]
+    /// itself skips calling this while `state.locked` is set.)
     ///
     /// "Legitimate" means one of:
     /// - a real, *currently mapped* layer-shell surface — checked via
@@ -1019,7 +1020,28 @@ impl State {
         }
     }
 
+    /// The only sanctioned entry point for a real input event — thin on
+    /// purpose. [`Self::process_input_event_unsynced`] (private, can't be
+    /// reached any other way from outside this module) does the actual
+    /// work; every one of its own early-return paths still runs through
+    /// here first, so the keyboard-focus backstop below can't be skipped
+    /// by a future new branch the way a bare call at the end of a long
+    /// `match` could be forgotten — see `sync_keyboard_focus_to_view`'s
+    /// own doc comment for the bug class this closes for good (the same
+    /// reasoning `state.rs`'s Wayland-dispatch closure applies for
+    /// client requests). Skipped while locked: `process_locked_input_
+    /// event` (called from inside the unsynced half above) already
+    /// re-asserts real focus on every single locked keystroke through a
+    /// wholly separate mechanism this one must never run alongside — see
+    /// `sync_keyboard_focus_to_view`'s own doc comment.
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
+        self.process_input_event_unsynced(event);
+        if !self.locked {
+            self.sync_keyboard_focus_to_view();
+        }
+    }
+
+    fn process_input_event_unsynced<I: InputBackend>(&mut self, event: InputEvent<I>) {
         if self.locked {
             // Checked before the match below even starts, not threaded
             // into each of its arms individually — see
