@@ -24,14 +24,17 @@ pub struct PerfConfig {
     /// "disruptive features default off, explicit opt-in via
     /// `config.toml`" posture this codebase uses for anything with a
     /// real, if unlikely, cost to a live session: a `SCHED_FIFO` thread
-    /// that ever spins instead of blocking can wedge the whole system
-    /// solidly enough that nothing short of a hard reset recovers it.
-    /// Applying it is
-    /// also a plain no-op (logged, not fatal — see `rt_sched::apply`)
-    /// unless the process actually has `CAP_SYS_NICE` or a raised
-    /// `RLIMIT_RTPRIO`, neither of which mudhuts grants itself; the
-    /// session/service that launches it (e.g. its systemd unit) has to
-    /// grant that separately for this to do anything at all.
+    /// that ever spins instead of blocking can hold the CPU indefinitely,
+    /// since nothing of lower priority can preempt it. `rt_sched::apply`
+    /// also caps `RLIMIT_RTTIME` as a backstop against exactly that (the
+    /// kernel kills the process rather than the whole system wedging
+    /// solid), but that's a safety net for a bug that shouldn't exist in
+    /// the first place, not a reason to treat this as risk-free. Applying
+    /// it is also a plain no-op (logged, not fatal — see
+    /// `rt_sched::apply`) unless the process actually has `CAP_SYS_NICE`
+    /// or a raised `RLIMIT_RTPRIO`, neither of which mudhuts grants
+    /// itself; the session/service that launches it (e.g. its systemd
+    /// unit) has to grant that separately for this to do anything at all.
     pub sched_fifo: bool,
     /// The `SCHED_FIFO` priority to request when `sched_fifo` is on.
     /// Only meaningful together with `sched_fifo`; not itself gated
