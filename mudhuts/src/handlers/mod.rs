@@ -10,7 +10,6 @@ use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
 use smithay::backend::allocator::dmabuf::Dmabuf;
-use smithay::backend::renderer::ImportDma;
 use smithay::input::dnd::DndGrabHandler;
 use smithay::input::keyboard::LedState;
 use smithay::input::pointer::CursorImageStatus;
@@ -160,21 +159,22 @@ impl DmabufHandler for State {
     }
 
     fn dmabuf_imported(&mut self, _global: &DmabufGlobal, dmabuf: Dmabuf, notifier: ImportNotifier) {
-        let Some(renderer) = self.dmabuf_renderer.as_ref() else {
+        // Sent to whoever actually owns the renderer instead of importing
+        // inline here — see `udev_backend.rs`'s `DmabufImportRequest` doc
+        // comment (Phase 2a of the "Decouple mudhuts' subsystems" plan).
+        // `ImportNotifier` is explicitly documented `Send`/safe to resolve
+        // from elsewhere, at any later point — this isn't racing anything.
+        let request = crate::udev_backend::DmabufImportRequest::new(dmabuf, notifier);
+        let Some(sender) = self.dmabuf_import_sender.as_ref() else {
             // Shouldn't happen — this handler is only ever reachable once
             // `init_udev` has both created the global and set this — but
             // stay panic-free rather than assume it.
-            notifier.failed();
+            request.fail();
             return;
         };
-        match renderer.borrow_mut().import_dmabuf(&dmabuf, None) {
-            Ok(_texture) => {
-                let _ = notifier.successful::<State>();
-            }
-            Err(err) => {
-                tracing::warn!("failed to import client dmabuf: {err}");
-                notifier.failed();
-            }
+        if let Err(err) = sender.send(request) {
+            tracing::warn!("dmabuf-import channel is gone, failing the request");
+            err.0.fail();
         }
     }
 }

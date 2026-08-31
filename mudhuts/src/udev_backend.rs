@@ -85,6 +85,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use smithay::backend::allocator::Fourcc;
+use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::drm::compositor::FrameFlags;
 use smithay::backend::drm::exporter::gbm::{GbmFramebufferExporter, NodeFilter};
@@ -101,6 +102,7 @@ use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{self, UdevBackend, UdevEvent};
 use smithay::input::pointer::{CursorIcon, CursorImageAttributes, CursorImageStatus};
 use smithay::output::{Mode as WlMode, Output, PhysicalProperties, Scale as OutputScale};
+use smithay::reexports::calloop::channel;
 use smithay::reexports::calloop::ping::PingSource;
 use smithay::reexports::calloop::{EventLoop, LoopHandle};
 use smithay::reexports::drm::control::{Device as _, ModeTypeFlags, connector, crtc};
@@ -117,7 +119,7 @@ use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::{Client, DataInit, DisplayHandle, New};
 use smithay::utils::{DeviceFd, IsAlive, Point, Scale, Transform};
 use smithay::wayland::compositor::with_states;
-use smithay::wayland::dmabuf::DmabufFeedbackBuilder;
+use smithay::wayland::dmabuf::{DmabufFeedbackBuilder, ImportNotifier};
 use smithay::wayland::drm_lease::{
     DrmLease, DrmLeaseBuilder, DrmLeaseHandler, DrmLeaseRequest, DrmLeaseState, LeaseRejected,
 };
@@ -229,6 +231,37 @@ pub(crate) struct Inner {
     /// rather than trying to preserve a lease through a switch that's
     /// about to take DRM master away regardless.
     active_leases: Vec<DrmLease>,
+}
+
+/// A client's dmabuf import request, handed from `handlers/mod.rs`'s
+/// `DmabufHandler::dmabuf_imported` to whoever actually owns the renderer,
+/// over `State::dmabuf_import_sender` — Phase 2a prep for the
+/// render-thread split (see the "Decouple mudhuts' subsystems" plan):
+/// proves the request/response channel shape works while everything is
+/// still single-threaded (the receiver below runs on this same event
+/// loop, one real dispatch tick later — see the module doc's opening
+/// paragraphs on why that's already how `redraw_ping`/PTY events work
+/// here, not a new kind of indirection), so Phase 2b only has to move
+/// *where* the receiver runs, not redesign the handoff. Both fields are
+/// exactly what `dmabuf_imported` received from Smithay; nothing added.
+pub(crate) struct DmabufImportRequest {
+    dmabuf: Dmabuf,
+    notifier: ImportNotifier,
+}
+
+impl DmabufImportRequest {
+    pub(crate) fn new(dmabuf: Dmabuf, notifier: ImportNotifier) -> Self {
+        Self { dmabuf, notifier }
+    }
+
+    /// Fail this request without ever having reached a renderer — no
+    /// channel to send it down, or the receiving end is gone. Its own
+    /// small wrapper (rather than the caller reaching into `notifier`
+    /// directly) so both of `handlers/mod.rs`'s failure paths — no sender
+    /// set up yet, and the channel disconnected — go through one place.
+    pub(crate) fn fail(self) {
+        self.notifier.failed();
+    }
 }
 
 pub fn init_udev(
@@ -381,6 +414,35 @@ pub fn init_udev(
                 "failed to build dmabuf feedback, client dmabuf import unavailable (falling back to SHM): {err}"
             );
         }
+    }
+
+    // Client dmabuf-import requests arrive through this channel instead
+    // of `dmabuf_imported` (`handlers/mod.rs`) importing inline — see
+    // `DmabufImportRequest`'s own doc comment. Registered here, once,
+    // alongside `dmabuf_renderer`/`dmabuf_global` above, rather than
+    // lazily inside `dmabuf_imported` itself — same "only ever set up
+    // once udev is the active backend" shape those two already have.
+    let (dmabuf_tx, dmabuf_rx) = channel::channel();
+    state.dmabuf_import_sender = Some(dmabuf_tx);
+    {
+        let renderer = renderer.clone();
+        event_loop
+            .handle()
+            .insert_source(dmabuf_rx, move |event, _, _state| {
+                let channel::Event::Msg(request) = event else {
+                    return;
+                };
+                match renderer.borrow_mut().import_dmabuf(&request.dmabuf, None) {
+                    Ok(_texture) => {
+                        let _ = request.notifier.successful::<State>();
+                    }
+                    Err(err) => {
+                        tracing::warn!("failed to import client dmabuf: {err}");
+                        request.notifier.failed();
+                    }
+                }
+            })
+            .map_err(|err| format!("failed to register the dmabuf-import request channel: {err}"))?;
     }
 
     let inner = Rc::new(RefCell::new(Inner {

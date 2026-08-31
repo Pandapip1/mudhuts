@@ -10,6 +10,7 @@ use smithay::desktop::{PopupManager, Window, WindowSurfaceType, layer_map_for_ou
 use smithay::input::pointer::CursorImageStatus;
 use smithay::input::{Seat, SeatState};
 use smithay::output::Output;
+use smithay::reexports::calloop::channel::Sender;
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::ping::Ping;
 use smithay::reexports::calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction};
@@ -263,6 +264,17 @@ pub struct State {
     /// attempt the import; `State` doesn't otherwise have a renderer of
     /// its own; that's normally backend-private state.
     pub dmabuf_renderer: Option<Rc<RefCell<GlesRenderer>>>,
+    /// Where `DmabufHandler::dmabuf_imported` (`handlers/mod.rs`) actually
+    /// sends a client's import request, instead of calling
+    /// `dmabuf_renderer` inline — see `udev_backend.rs`'s
+    /// `DmabufImportRequest` doc comment for why: this is Phase 2a prep
+    /// for the render-thread split (see the "Decouple mudhuts'
+    /// subsystems" plan), proving the request/response channel shape
+    /// works before a real second thread exists to receive on the other
+    /// end. `None` until `init_udev` sets it up alongside
+    /// `dmabuf_renderer`/`dmabuf_global` (and permanently `None` under
+    /// `winit_backend.rs`, which never creates the dmabuf global at all).
+    pub(crate) dmabuf_import_sender: Option<Sender<crate::udev_backend::DmabufImportRequest>>,
     /// Mirrors `dmabuf_renderer` above, but for the winit backend: nothing
     /// under `winit_backend.rs` otherwise stores a renderer/backend handle
     /// reachable from a Wayland `Dispatch` callback (the renderer there
@@ -594,6 +606,7 @@ impl State {
             dmabuf_state: DmabufState::new(),
             dmabuf_global: None,
             dmabuf_renderer: None,
+            dmabuf_import_sender: None,
             drm_leasing_global: None,
             udev_inner: None,
             winit_backend: None,
