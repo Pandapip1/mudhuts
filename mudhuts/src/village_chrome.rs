@@ -95,9 +95,12 @@ pub fn handle_click(
     if children.len() < 2 {
         return false;
     }
-    let labels: Vec<String> = children.iter().map(|&c| child_label(graph, c)).collect();
+    // Only widths matter for a hit test, not the label text itself, so
+    // there's no reason to collect a `Vec<String>` just to read each
+    // one's length and throw it away.
+    let char_counts: Vec<usize> = children.iter().map(|&c| child_label(graph, c).chars().count()).collect();
     let point = Point::from(pos);
-    for TabRect { index: i, rect } in tab_row_layout(&labels, y, cell_w, cell_h, scale) {
+    for TabRect { index: i, rect } in tab_row_layout(&char_counts, y, cell_w, cell_h, scale) {
         if rect.contains(point) {
             if let Some(tab) = graph.downcast_mut::<TabNode>(village) {
                 *tab.active = i;
@@ -133,8 +136,13 @@ pub fn build(
         return (Vec::new(), y);
     }
 
+    // Unlike `handle_click`, the label text itself is needed below (for
+    // rendering/cache keys), so it's computed once here and reused for
+    // both the layout pass and the render pass instead of being
+    // recomputed.
     let labels: Vec<String> = children.iter().map(|&c| child_label(graph, c)).collect();
-    let rects = tab_row_layout(&labels, y, cell_w, cell_h, scale);
+    let char_counts: Vec<usize> = labels.iter().map(|label| label.chars().count()).collect();
+    let rects = tab_row_layout(&char_counts, y, cell_w, cell_h, scale);
     let padding = crate::render::scaled(TAB_PADDING, scale);
 
     let mut elements = Vec::new();

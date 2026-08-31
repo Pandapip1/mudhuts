@@ -139,21 +139,22 @@ pub(crate) fn tab_h(cell_h: i32, scale: f64) -> i32 {
 }
 
 /// Lay out one row of tabs, left to right starting at physical-pixel row
-/// `y`, sized to fit each of `labels` at `cell_w` pixels/char plus
-/// padding — the shared arithmetic behind both `tab_layout` (this
-/// module, one row per ConsoleHut's Main Windows) and
-/// `village_chrome.rs`'s `build`/`handle_click` (one row per Tab-Hut
-/// level's children), which need to lay out visually-identical strips
-/// over two different label sources. Empty `labels` produces an empty
-/// result.
-pub(crate) fn tab_row_layout(labels: &[String], y: i32, cell_w: usize, cell_h: i32, scale: f64) -> Vec<TabRect> {
+/// `y`, sized to fit each tab's label — given as `char_counts` rather
+/// than the label text itself, since layout only ever needs a label's
+/// length, never its content — at `cell_w` pixels/char plus padding.
+/// The shared arithmetic behind both `tab_layout` (this module, one row
+/// per ConsoleHut's Main Windows) and `village_chrome.rs`'s `build`/
+/// `handle_click` (one row per Tab-Hut level's children), which need to
+/// lay out visually-identical strips over two different label sources.
+/// Empty `char_counts` produces an empty result.
+pub(crate) fn tab_row_layout(char_counts: &[usize], y: i32, cell_w: usize, cell_h: i32, scale: f64) -> Vec<TabRect> {
     let h = tab_h(cell_h, scale);
     let padding = crate::render::scaled(TAB_PADDING, scale);
     let gap = crate::render::scaled(TAB_GAP, scale);
     let mut rects = Vec::new();
     let mut x = crate::render::scaled(LEFT_MARGIN, scale);
-    for (i, label) in labels.iter().enumerate() {
-        let label_w = (label.chars().count().max(1) * cell_w) as i32;
+    for (i, &count) in char_counts.iter().enumerate() {
+        let label_w = (count.max(1) * cell_w) as i32;
         let tab_w = label_w + padding * 2;
         rects.push(TabRect {
             index: i,
@@ -167,7 +168,12 @@ pub(crate) fn tab_row_layout(labels: &[String], y: i32, cell_w: usize, cell_h: i
 /// Compute this ConsoleHut's tab strip layout, starting at physical-pixel row
 /// `y` (pushed down by however many Hut-level tab strips are stacked
 /// above it — see `village_chrome.rs`'s module doc) — empty if there's
-/// nothing to show.
+/// nothing to show. Only needs each label's length (for `tab_row_layout`),
+/// never its text, so callers that only want hit-test/geometry rects
+/// (`input.rs`) don't pay for a `Vec<String>` they'd throw away; `build`
+/// below computes labels itself instead of going through this, since it
+/// actually needs the text too and doing both in the same pass avoids
+/// calling `window_title` twice per window.
 pub fn tab_layout(hut: &ConsoleHut, y: i32, scale: f64) -> Vec<TabRect> {
     if hut.main_window_count() == 0 {
         return Vec::new();
@@ -175,17 +181,32 @@ pub fn tab_layout(hut: &ConsoleHut, y: i32, scale: f64) -> Vec<TabRect> {
     let cell_w = hut.glyphs.cell_width().max(1);
     let cell_h = hut.glyphs.cell_height().max(1) as i32;
 
-    let mut labels = vec!["Terminal".to_string()];
-    labels.extend(hut.main_windows().iter().map(|entry| window_title(&entry.window)));
+    let mut char_counts = vec!["Terminal".chars().count()];
+    char_counts.extend(hut.main_windows().iter().map(|entry| window_title(&entry.window).chars().count()));
 
-    tab_row_layout(&labels, y, cell_w, cell_h, scale)
+    tab_row_layout(&char_counts, y, cell_w, cell_h, scale)
 }
 
 /// Build the tab strip's render elements in front-to-back order, starting
 /// at physical-pixel row `y`, or an empty list if the focused ConsoleHut has no
 /// Main Windows.
 pub fn build(hut: &mut ConsoleHut, renderer: &mut GlesRenderer, y: i32, scale: f64, theme: &Theme) -> Vec<Element> {
-    let rects = tab_layout(hut, y, scale);
+    if hut.main_window_count() == 0 {
+        return Vec::new();
+    }
+    let cell_w = hut.glyphs.cell_width().max(1);
+    let cell_h = hut.glyphs.cell_height().max(1) as i32;
+
+    // Computed once here (not via `tab_layout`, which would need to call
+    // `window_title` again just to get lengths) and reused below both for
+    // layout and for the actual rendered text — `window_title` reads
+    // Wayland toplevel surface state via `with_states`, not free, so it's
+    // worth not paying for it twice per window per frame.
+    let mut labels = vec!["Terminal".to_string()];
+    labels.extend(hut.main_windows().iter().map(|entry| window_title(&entry.window)));
+    let char_counts: Vec<usize> = labels.iter().map(|label| label.chars().count()).collect();
+
+    let rects = tab_row_layout(&char_counts, y, cell_w, cell_h, scale);
     if rects.is_empty() {
         return Vec::new();
     }
@@ -209,11 +230,7 @@ pub fn build(hut: &mut ConsoleHut, renderer: &mut GlesRenderer, y: i32, scale: f
 
     let mut elements = Vec::new();
     for TabRect { index: i, rect } in rects {
-        let label = if i == 0 {
-            "Terminal".to_string()
-        } else {
-            window_title(&hut.main_windows()[i - 1].window)
-        };
+        let label = labels[i].clone();
         let active = i == active_index;
         let (fg, bg) = if active {
             (theme.tab_active_fg, theme.tab_active_bg)
@@ -314,7 +331,7 @@ mod tests {
 
     #[test]
     fn tab_row_layout_starts_at_the_left_margin_and_the_given_row() {
-        let rects = tab_row_layout(&["a".to_string()], 40, 8, 20, 1.0);
+        let rects = tab_row_layout(&[1], 40, 8, 20, 1.0);
         assert_eq!(rects.len(), 1);
         assert_eq!(rects[0].index, 0);
         assert_eq!(rects[0].rect.loc, Point::from((LEFT_MARGIN, 40)));
@@ -323,13 +340,13 @@ mod tests {
 
     #[test]
     fn tab_row_layout_widens_for_longer_labels() {
-        let rects = tab_row_layout(&["a".to_string(), "much longer label".to_string()], 0, 8, 20, 1.0);
+        let rects = tab_row_layout(&[1, "much longer label".chars().count()], 0, 8, 20, 1.0);
         assert!(rects[1].rect.size.w > rects[0].rect.size.w);
     }
 
     #[test]
     fn tab_row_layout_places_each_tab_after_the_previous_ones_gap() {
-        let rects = tab_row_layout(&["a".to_string(), "b".to_string()], 0, 8, 20, 1.0);
+        let rects = tab_row_layout(&[1, 1], 0, 8, 20, 1.0);
         let first = &rects[0].rect;
         let second = &rects[1].rect;
         assert_eq!(second.loc.x, first.loc.x + first.size.w + TAB_GAP);
@@ -337,7 +354,7 @@ mod tests {
 
     #[test]
     fn tab_row_layout_indexes_rects_in_label_order() {
-        let rects = tab_row_layout(&["a".to_string(), "b".to_string(), "c".to_string()], 0, 8, 20, 1.0);
+        let rects = tab_row_layout(&[1, 1, 1], 0, 8, 20, 1.0);
         assert_eq!(rects.iter().map(|r| r.index).collect::<Vec<_>>(), vec![0, 1, 2]);
     }
 }
