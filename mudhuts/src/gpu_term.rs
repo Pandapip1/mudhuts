@@ -456,14 +456,13 @@ impl GlyphAtlas {
             .map_err(|e| e.to_string())?
     }
 
-    /// Look up (or rasterize + upload) the atlas entry for `(c, bold)`.
-    /// Only the `gl.TexSubImage2D` upload below actually needs a live GL
-    /// context — the cache lookup, rasterization (`glyph_cache.glyph`,
-    /// itself GPU-free — see its own doc comment), and atlas-placement
-    /// decision (`place_glyph`) are all already GPU-free, just not
-    /// currently split out from the upload step. `place_glyph` is pulled
-    /// into its own function for exactly this reason (see its own doc
-    /// comment) — the render-thread-split RFC's "Step 1".
+    /// Look up (or rasterize + upload) the atlas entry for `(c, bold)` —
+    /// [`Self::decide_entry`] immediately followed by [`Self::apply_upload`]
+    /// if it produced one. Preserved as one call for [`GpuTermRenderer`]'s
+    /// still-fused per-glyph usage; `LabelRenderer::resolve`/`draw` call
+    /// the two halves separately instead — see the render-thread-split
+    /// RFC's "Step 2" (Step 3 splits `GpuTermRenderer`'s own usage too,
+    /// not done yet).
     fn atlas_entry(
         &mut self,
         gl: &ffi::Gles2,
@@ -471,8 +470,35 @@ impl GlyphAtlas {
         c: char,
         bold: bool,
     ) -> Option<AtlasEntry> {
+        let (entry, upload) = self.decide_entry(glyph_cache, c, bold)?;
+        if let Some(upload) = &upload {
+            self.apply_upload(gl, upload);
+        }
+        Some(entry)
+    }
+
+    /// The GPU-free half of [`Self::atlas_entry`]: look up `(c, bold)`, or
+    /// rasterize (`glyph_cache.glyph`, itself GPU-free) and decide its
+    /// atlas placement (`place_glyph`, also GPU-free) — same logic
+    /// `atlas_entry` always had, just stopping short of the actual
+    /// texture upload. On a genuinely new placement, `self.glyphs` is
+    /// updated immediately (optimistically — nothing here ever needs to
+    /// roll a placement back once decided, since the only reason
+    /// [`Self::apply_upload`] could fail is the same GL-context misuse
+    /// that would already be a bug regardless of when the upload
+    /// happens), and the caller gets a [`PendingGlyphUpload`] to apply
+    /// whenever a GL context is next available — not necessarily here,
+    /// not necessarily now. `None` for the same two cases `atlas_entry`
+    /// already returned `None` for: a whitespace-shaped glyph, or an
+    /// atlas that's completely full.
+    fn decide_entry(
+        &mut self,
+        glyph_cache: &mut GlyphCache,
+        c: char,
+        bold: bool,
+    ) -> Option<(AtlasEntry, Option<PendingGlyphUpload>)> {
         if let Some(entry) = self.glyphs.get(&(c, bold)) {
-            return Some(*entry);
+            return Some((*entry, None));
         }
 
         let (metrics, bitmap) = glyph_cache.glyph(c, bold);
@@ -489,27 +515,48 @@ impl GlyphAtlas {
             return None;
         };
 
+        self.glyphs.insert((c, bold), entry);
+        Some((entry, Some(PendingGlyphUpload { bitmap: bitmap.clone(), x, y, width, height })))
+    }
+
+    /// The one real GPU half of [`Self::decide_entry`]'s split: upload an
+    /// already-rasterized, already-placed glyph's bitmap into the atlas
+    /// texture. Safe to call any time after `decide_entry` produced
+    /// `upload`, on whichever thread owns the GL context — the placement
+    /// it uploads to was already reserved (in `self.packer`) the moment
+    /// `decide_entry` returned it, so nothing else can race for the same
+    /// atlas region in the meantime.
+    fn apply_upload(&self, gl: &ffi::Gles2, upload: &PendingGlyphUpload) {
         unsafe {
             gl.BindTexture(ffi::TEXTURE_2D, self.atlas_tex);
             gl.TexSubImage2D(
                 ffi::TEXTURE_2D,
                 0,
-                x as i32,
-                y as i32,
-                width as i32,
-                height as i32,
+                upload.x as i32,
+                upload.y as i32,
+                upload.width as i32,
+                upload.height as i32,
                 ffi::RED,
                 ffi::UNSIGNED_BYTE,
-                bitmap.as_ptr() as *const _,
+                upload.bitmap.as_ptr() as *const _,
             );
         }
-
-        self.glyphs.insert((c, bold), entry);
-        Some(entry)
     }
 }
 
-/// The pure half of [`GlyphAtlas::atlas_entry`]: given an already-known
+/// One glyph's rasterized coverage bitmap, already placed within the
+/// atlas (by [`GlyphAtlas::decide_entry`]) but not yet uploaded there —
+/// see that method's own doc comment. Plain owned data, no GL handles —
+/// `Send`, unlike everything else in this module that touches the atlas.
+struct PendingGlyphUpload {
+    bitmap: Vec<u8>,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+/// The packing half of [`GlyphAtlas::decide_entry`]: given an already-known
 /// glyph size (from `fontdue::Metrics`, itself computed with no GL
 /// involved) and the atlas's own packer state, decide where — if
 /// anywhere — this glyph goes, and precompute the `AtlasEntry` that
@@ -1030,6 +1077,9 @@ impl LabelRenderer {
     /// fits its layout) with `fg`-colored glyphs over a `bg`-colored
     /// background, `cell_w`/`cell_h`/`baseline` matching the compositor's
     /// glyph metrics so labels visually match the terminal's own type.
+    /// [`Self::resolve`] immediately followed by [`Self::draw`] — kept as
+    /// one call so every existing call site stays unchanged; see those
+    /// two methods' own doc comments for why the split exists at all.
     #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
@@ -1042,9 +1092,77 @@ impl LabelRenderer {
         fg: Rgb,
         bg: Rgb,
     ) -> Result<GlesTexture, String> {
+        let resolved = self.resolve(glyph_cache, text, cell_w, cell_h, baseline, fg, bg);
+        self.draw(renderer, resolved)
+    }
+
+    /// Decide everything about how `text` should look — target size and
+    /// the instance list [`draw_instances`] needs — with no live GL
+    /// context involved: glyph rasterization/atlas-placement decisions
+    /// all route through [`GlyphAtlas::decide_entry`], itself GL-free.
+    /// Split from [`Self::draw`] specifically so the two can eventually
+    /// run on different threads — a resolved label carries only plain
+    /// owned data (`Send`, unlike `LabelRenderer`/`GlesRenderer` — see
+    /// [`ResolvedLabel`]'s own doc comment) — see the render-thread-split
+    /// RFC's "Step 2".
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn resolve(
+        &self,
+        glyph_cache: &mut GlyphCache,
+        text: &str,
+        cell_w: usize,
+        cell_h: usize,
+        baseline: usize,
+        fg: Rgb,
+        bg: Rgb,
+    ) -> ResolvedLabel {
         let chars: Vec<char> = text.chars().collect();
         let width = (chars.len().max(1) * cell_w) as i32;
         let height = cell_h.max(1) as i32;
+
+        let mut atlas = self.atlas.borrow_mut();
+        let white = atlas.white;
+        let mut instances = vec![Instance {
+            dst_pos: [0.0, 0.0],
+            dst_size: [width as f32, height as f32],
+            uv_pos: white.uv_pos,
+            uv_size: white.uv_size,
+            color: rgb_f32(bg),
+        }];
+        let bg_count = instances.len();
+
+        let mut pending_uploads = Vec::new();
+        for (i, &c) in chars.iter().enumerate() {
+            if c == ' ' {
+                continue;
+            }
+            let Some((entry, upload)) = atlas.decide_entry(glyph_cache, c, false) else {
+                continue;
+            };
+            if let Some(upload) = upload {
+                pending_uploads.push(upload);
+            }
+            let glyph_x = (i * cell_w) as i32 + entry.xmin;
+            let glyph_y = baseline as i32 - entry.height as i32 - entry.ymin;
+            instances.push(Instance {
+                dst_pos: [glyph_x as f32, glyph_y as f32],
+                dst_size: [entry.width as f32, entry.height as f32],
+                uv_pos: entry.uv_pos,
+                uv_size: entry.uv_size,
+                color: rgb_f32(fg),
+            });
+        }
+
+        ResolvedLabel { size: (width, height), instances, bg_count, pending_uploads }
+    }
+
+    /// Turn an already-[`Self::resolve`]d label into a real texture — the
+    /// one GPU half of the split: upload any newly-rasterized glyphs into
+    /// the shared atlas (`GlyphAtlas::apply_upload`), then run the
+    /// already-decided instance list through the same [`draw_instances`]
+    /// [`GpuTermRenderer::redraw`] uses.
+    pub(crate) fn draw(&mut self, renderer: &mut GlesRenderer, resolved: ResolvedLabel) -> Result<GlesTexture, String> {
+        let ResolvedLabel { size: (width, height), instances, bg_count, pending_uploads } = resolved;
 
         // Reuse the existing target when its size already matches (e.g. a
         // same-length title just changing active/inactive color) instead
@@ -1061,46 +1179,6 @@ impl LabelRenderer {
             }
         };
 
-        let white = self.atlas.borrow().white;
-        let mut instances = vec![Instance {
-            dst_pos: [0.0, 0.0],
-            dst_size: [width as f32, height as f32],
-            uv_pos: white.uv_pos,
-            uv_size: white.uv_size,
-            color: rgb_f32(bg),
-        }];
-        let bg_count = instances.len();
-
-        // One `with_context` (real `eglMakeCurrent`) for the whole label,
-        // not one per glyph — see `GpuTermRenderer::redraw`'s identical
-        // fix/doc comment for why that matters.
-        let atlas = &self.atlas;
-        let glyph_instances: Vec<Instance> = renderer
-            .with_context(|gl| {
-                let mut atlas = atlas.borrow_mut();
-                let mut out = Vec::with_capacity(chars.len());
-                for (i, &c) in chars.iter().enumerate() {
-                    if c == ' ' {
-                        continue;
-                    }
-                    let Some(entry) = atlas.atlas_entry(gl, glyph_cache, c, false) else {
-                        continue;
-                    };
-                    let glyph_x = (i * cell_w) as i32 + entry.xmin;
-                    let glyph_y = baseline as i32 - entry.height as i32 - entry.ymin;
-                    out.push(Instance {
-                        dst_pos: [glyph_x as f32, glyph_y as f32],
-                        dst_size: [entry.width as f32, entry.height as f32],
-                        uv_pos: entry.uv_pos,
-                        uv_size: entry.uv_size,
-                        color: rgb_f32(fg),
-                    });
-                }
-                out
-            })
-            .map_err(|e| e.to_string())?;
-        instances.extend(glyph_instances);
-
         let (instance_vbo, fbo) = (self.instance_vbo, self.fbo);
         let atlas = self.atlas.borrow();
         let (program, u_target_size, quad_vbo, atlas_tex) = (
@@ -1110,8 +1188,19 @@ impl LabelRenderer {
             atlas.atlas_tex,
         );
         drop(atlas);
+        let atlas = &self.atlas;
+        // One `with_context` (real `eglMakeCurrent`) for the whole label
+        // — uploads plus the draw itself — not one per glyph, matching
+        // `GpuTermRenderer::redraw`'s identical fix/doc comment for why
+        // that matters.
         renderer
             .with_context(|gl| {
+                if !pending_uploads.is_empty() {
+                    let atlas = atlas.borrow();
+                    for upload in &pending_uploads {
+                        atlas.apply_upload(gl, upload);
+                    }
+                }
                 draw_instances(
                     gl,
                     program,
@@ -1134,6 +1223,23 @@ impl LabelRenderer {
 
         Ok(texture)
     }
+}
+
+/// A label's fully-decided appearance — everything [`LabelRenderer::draw`]
+/// needs to actually produce a texture, computed by
+/// [`LabelRenderer::resolve`] with no live GL context involved. Plain
+/// owned data (`Vec<Instance>`/`Vec<PendingGlyphUpload>` are both `Send`
+/// — see [`PendingGlyphUpload`]'s own doc comment; `Instance` is a
+/// `#[repr(C)]` struct of plain `f32` arrays), unlike `LabelRenderer`
+/// itself (which owns real GL objects). See the render-thread-split RFC's
+/// "Step 2" — this is `ContentPiece::Texture`'s treatment applied to
+/// chrome labels: resolve once, draw wherever a GL context ends up
+/// living.
+pub(crate) struct ResolvedLabel {
+    size: (i32, i32),
+    instances: Vec<Instance>,
+    bg_count: usize,
+    pending_uploads: Vec<PendingGlyphUpload>,
 }
 
 fn rgb_f32(rgb: Rgb) -> [f32; 3] {
