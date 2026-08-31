@@ -198,6 +198,24 @@ pub enum ContentPiece {
 /// nothing to show yet, or before a real renderer has ever run.
 pub type RenderedContent = Vec<ContentPiece>;
 
+/// Compile-time proof that a resolved [`RenderedContent`] can cross a
+/// thread boundary — both `ContentPiece` variants turn out to already be
+/// `Arc`-backed internally (`GlesTexture(Arc<GlesTextureInternal>)`,
+/// `Window(Arc<WindowInner>)` in this pinned Smithay rev), unlike
+/// `GraphStack`/`State` themselves, which carry `Rc`-based state and are
+/// deliberately *not* `Send` — see the "Decouple mudhuts' subsystems"
+/// plan. This is the load-bearing fact a render-thread split's published
+/// snapshot design depends on: a resolved `RenderedContent` can be
+/// hip-shot straight to another thread with no wrapper type needed,
+/// while the `GraphStack` that produced it stays behind. A future
+/// Smithay bump that ever changed either variant back to `Rc`-based
+/// storage would break this at compile time here, not silently at the
+/// point some future render-thread code tries to `Send` it.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<RenderedContent>();
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeId(u64);
 
