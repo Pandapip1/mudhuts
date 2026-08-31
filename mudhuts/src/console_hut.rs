@@ -20,7 +20,7 @@ use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle};
 use mudhuts_term::{GlyphCache, TermEvent, Terminal};
 use mudhuts_term::palette::Rgb;
 
-use crate::gpu_term::{GpuTermRenderer, LabelRenderer};
+use crate::gpu_term::{AtlasPlacement, GpuTermRenderer, LabelRenderer};
 use crate::main_window::MainWindowEntry;
 use crate::redraw::{Redrawable, RedrawHandle, Signal};
 use crate::render::{ChangeTracker, LabelCache};
@@ -56,6 +56,16 @@ pub struct ConsoleHut {
     /// tab-strip chrome) — shares `gpu`'s glyph atlas rather than
     /// rasterizing the same glyphs into a second one.
     label_renderer: Option<LabelRenderer>,
+    /// The `Send`, GL-free half of `gpu`/`label_renderer`'s shared glyph
+    /// atlas — see [`AtlasPlacement`]'s own doc comment for why this
+    /// lives directly on `ConsoleHut` rather than inside either of them
+    /// (the render-thread-split RFC's "Step 4a": this is exactly the
+    /// core-appropriate data that needs to keep living wherever
+    /// `ConsoleHut` itself does). Created together with `gpu` on first
+    /// use (`GpuTermRenderer::new` returns both halves at once, since
+    /// they start out synchronized — see its own doc comment), so this
+    /// is `None` for exactly as long as `gpu` is.
+    atlas_placement: Option<AtlasPlacement>,
     /// What `redraw` returned last time, reused when nothing changed
     /// (cheap: an `Arc` clone, not a re-render).
     last_texture: Option<GlesTexture>,
@@ -242,6 +252,7 @@ impl ConsoleHut {
                 glyphs,
                 touched: false,
                 gpu: None,
+                atlas_placement: None,
                 last_texture: None,
                 pixel_size,
                 space,
@@ -726,11 +737,12 @@ impl ConsoleHut {
 
     /// Rebuild this ConsoleHut's glyph cache for a newly-known real output scale,
     /// re-deriving its terminal grid's cols/lines from the new cell size
-    /// at the same physical `pixel_size`, and dropping its GPU glyph atlas
-    /// (`gpu`/`label_renderer`) so it's rebuilt from scratch at the new
-    /// glyph size the next time this ConsoleHut is drawn — a `GlyphCache` can't
-    /// be rescaled in place (see its own doc comment: every cached glyph
-    /// bitmap was rasterized at the size it was built for).
+    /// at the same physical `pixel_size`, and dropping its glyph atlas
+    /// (`gpu`/`label_renderer`/`atlas_placement`) so it's rebuilt from
+    /// scratch at the new glyph size the next time this ConsoleHut is
+    /// drawn — a `GlyphCache` can't be rescaled in place (see its own doc
+    /// comment: every cached glyph bitmap was rasterized at the size it
+    /// was built for).
     ///
     /// Only ever needed once per ConsoleHut, right after the real output scale
     /// becomes known for the first time — `main.rs` spawns the very first
@@ -741,6 +753,11 @@ impl ConsoleHut {
         self.glyphs = GlyphCache::new(scale)?;
         self.gpu = None;
         self.label_renderer = None;
+        // Every cached `AtlasEntry` in here refers to a glyph bitmap sized
+        // for the old scale too — stale the moment `self.glyphs` above is,
+        // for the same reason. `gpu`/`label_renderer`'s own reset already
+        // drops the GL-holding half of the atlas; this drops the other.
+        self.atlas_placement = None;
 
         // `space_output`'s own reported scale (not just its mode/pixel
         // size) has to track the real one too — `space_render_elements`
@@ -798,7 +815,10 @@ impl ConsoleHut {
 
         if self.gpu.is_none() {
             match GpuTermRenderer::new(renderer) {
-                Ok(gpu) => self.gpu = Some(gpu),
+                Ok((gpu, placement)) => {
+                    self.gpu = Some(gpu);
+                    self.atlas_placement = Some(placement);
+                }
                 Err(err) => {
                     tracing::error!("failed to initialize GPU terminal renderer: {err}");
                     return None;
@@ -806,6 +826,7 @@ impl ConsoleHut {
             }
         }
         let gpu = self.gpu.as_mut()?;
+        let atlas_placement = self.atlas_placement.as_mut()?;
 
         let Some((cells, damage)) = self.terminal.take_dirty_cells() else {
             return self.last_texture.clone();
@@ -816,6 +837,7 @@ impl ConsoleHut {
         let baseline = self.glyphs.baseline();
         match gpu.redraw(
             renderer,
+            atlas_placement,
             &mut self.glyphs,
             cells,
             &damage,
@@ -870,7 +892,9 @@ impl ConsoleHut {
         bg: mudhuts_term::palette::Rgb,
     ) -> Result<GlesTexture, String> {
         if self.gpu.is_none() {
-            self.gpu = Some(GpuTermRenderer::new(renderer)?);
+            let (gpu, placement) = GpuTermRenderer::new(renderer)?;
+            self.gpu = Some(gpu);
+            self.atlas_placement = Some(placement);
         }
         let Some(gpu) = self.gpu.as_ref() else {
             return Err("terminal GPU renderer unavailable".to_string());
@@ -881,11 +905,15 @@ impl ConsoleHut {
         let Some(label_renderer) = self.label_renderer.as_mut() else {
             return Err("label renderer unavailable".to_string());
         };
+        let Some(atlas_placement) = self.atlas_placement.as_mut() else {
+            return Err("atlas placement unavailable".to_string());
+        };
         let cell_w = self.glyphs.cell_width();
         let cell_h = self.glyphs.cell_height();
         let baseline = self.glyphs.baseline();
         label_renderer.render(
             renderer,
+            atlas_placement,
             &mut self.glyphs,
             text,
             cell_w,

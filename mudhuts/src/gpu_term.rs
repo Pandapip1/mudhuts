@@ -334,18 +334,126 @@ fn link_program(
     }
 }
 
-/// The shader program, glyph-coverage atlas texture, and rasterization
-/// cache shared by every renderer that draws text (currently
-/// [`GpuTermRenderer`] and [`LabelRenderer`]) — see the module doc for why
-/// this is split out and shared rather than duplicated per renderer.
+/// The `Send`, GL-free half of what a text-rendering atlas needs: packer
+/// state, the per-`(char, bold)` placement cache, and the one reserved
+/// solid-white slot every atlas texture needs (used for background
+/// quads) — everything [`Self::decide_entry`] operates on, and nothing
+/// else. Lives per-`ConsoleHut`, core-owned (see the render-thread-split
+/// RFC's "Step 4a") — unlike [`GlyphAtlas`], which holds the real GL
+/// resources (shader program, the atlas texture itself) this bookkeeping
+/// describes, and stays render-thread-only.
+pub(crate) struct AtlasPlacement {
+    packer: ShelfPacker,
+    glyphs: HashMap<(char, bool), AtlasEntry, FxBuildHasher>,
+    white: AtlasEntry,
+}
+
+/// Compile-time proof this half of the old `GlyphAtlas` really is `Send`
+/// — the load-bearing fact the render-thread-split RFC's "Step 4a" exists
+/// to establish, mirroring `graph.rs`'s identical `RenderedContent`
+/// assertion. A future field added here that broke this would fail the
+/// build right here, not silently at whatever future call site first
+/// tries to send an `AtlasPlacement` across a thread.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<AtlasPlacement>();
+};
+
+impl AtlasPlacement {
+    /// Reserves the fixed 2×2 solid-white slot every fresh atlas texture
+    /// needs and returns the one real upload it implies, for
+    /// [`GlyphAtlas::new`] to apply through the same [`GlyphAtlas::
+    /// apply_upload`] path every other glyph's upload goes through
+    /// (rather than a bespoke one-off GL call, which is what this
+    /// replaces). Pure arithmetic, no GL context needed: a freshly
+    /// constructed [`ShelfPacker`]'s very first allocation is always
+    /// `(0, 0)`, so this placement is deterministic.
+    fn new() -> (Self, PendingGlyphUpload) {
+        let mut packer = ShelfPacker::new();
+        // Reserves a 2x2 region (matching the upload below) but the
+        // `AtlasEntry` itself deliberately describes only its own 1x1
+        // sub-region — preserved exactly from the pre-split code, whose
+        // own reasoning for the 2x2-reserved/1x1-reported split isn't
+        // recorded here or there; not this step's place to change it.
+        let (x, y) = packer
+            .alloc(2, 2)
+            .expect("a freshly constructed ATLAS_SIZE-sized atlas always has room for a 2x2 reserved pixel");
+        let white = AtlasEntry {
+            uv_pos: [x as f32 / ATLAS_SIZE as f32, y as f32 / ATLAS_SIZE as f32],
+            uv_size: [1.0 / ATLAS_SIZE as f32, 1.0 / ATLAS_SIZE as f32],
+            xmin: 0,
+            ymin: 0,
+            width: 1,
+            height: 1,
+        };
+        let upload = PendingGlyphUpload { bitmap: vec![255u8; 4], x, y, width: 2, height: 2 };
+        (Self { packer, glyphs: HashMap::default(), white }, upload)
+    }
+
+    /// The reserved solid-white atlas entry — used for background quads,
+    /// which sample the atlas the same way glyphs do rather than a
+    /// separate untextured draw path (see [`LabelRenderer::resolve`]/
+    /// [`GpuTermRenderer::redraw`]'s own background-`Instance` setup).
+    fn white(&self) -> AtlasEntry {
+        self.white
+    }
+
+    /// Look up (or rasterize) the atlas entry for `(c, bold)`, deferring
+    /// any actual texture upload to [`GlyphAtlas::apply_upload`] — see
+    /// that method's own doc comment for who calls it and when. On a
+    /// genuinely new placement, `self.glyphs` is updated immediately
+    /// (optimistically — nothing here ever needs to roll a placement
+    /// back once decided, since the only reason `apply_upload` could
+    /// fail is the same GL-context misuse that would already be a bug
+    /// regardless of when the upload happens), and the caller gets a
+    /// [`PendingGlyphUpload`] to apply whenever a GL context is next
+    /// available — not necessarily here, not necessarily now, not
+    /// necessarily even on this thread. `None` only ever means one of
+    /// two things: a whitespace-shaped glyph, or an atlas that's
+    /// completely full.
+    fn decide_entry(
+        &mut self,
+        glyph_cache: &mut GlyphCache,
+        c: char,
+        bold: bool,
+    ) -> Option<(AtlasEntry, Option<PendingGlyphUpload>)> {
+        if let Some(entry) = self.glyphs.get(&(c, bold)) {
+            return Some((*entry, None));
+        }
+
+        let (metrics, bitmap) = glyph_cache.glyph(c, bold);
+        let (width, height) = (metrics.width as u32, metrics.height as u32);
+        if width == 0 || height == 0 {
+            // Whitespace-shaped glyphs (e.g. space itself, though callers
+            // skip those already) — nothing to draw, nothing to cache.
+            return None;
+        }
+
+        let Some((x, y, entry)) = place_glyph(&mut self.packer, metrics.xmin, metrics.ymin, width, height)
+        else {
+            tracing::warn!("glyph atlas is full; {c:?} (bold={bold}) won't render until it grows");
+            return None;
+        };
+
+        self.glyphs.insert((c, bold), entry);
+        Some((entry, Some(PendingGlyphUpload { bitmap: bitmap.clone(), x, y, width, height })))
+    }
+}
+
+/// The shader program and the atlas texture itself — the real GL
+/// resources every renderer that draws text (currently
+/// [`GpuTermRenderer`] and [`LabelRenderer`]) shares, so a glyph seen by
+/// one is uploaded once and available to the other too. See the module
+/// doc for why sharing matters, and [`AtlasPlacement`]'s own doc comment
+/// for why the placement bookkeeping this used to also hold now lives
+/// separately: this half is unconditionally render-thread-only (raw
+/// `GLuint`s mean nothing on a thread that doesn't own the GL context
+/// that created them), `AtlasPlacement` is not.
 pub struct GlyphAtlas {
     program: ffi::types::GLuint,
     u_target_size: ffi::types::GLint,
     quad_vbo: ffi::types::GLuint,
     atlas_tex: ffi::types::GLuint,
-    packer: ShelfPacker,
-    glyphs: HashMap<(char, bool), AtlasEntry, FxBuildHasher>,
-    white: AtlasEntry,
 }
 
 impl Drop for GlyphAtlas {
@@ -360,8 +468,17 @@ impl Drop for GlyphAtlas {
 }
 
 impl GlyphAtlas {
-    pub fn new(renderer: &mut GlesRenderer) -> Result<Self, String> {
-        renderer
+    /// Creates the real GL resources *and* the fresh [`AtlasPlacement`]
+    /// bookkeeping they start out synchronized with (the reserved white
+    /// slot's placement and its one real upload, applied here via the
+    /// same [`Self::apply_upload`] every later glyph upload uses) — the
+    /// two halves are only ever created together, even though they're
+    /// owned separately from here on (see [`AtlasPlacement`]'s own doc
+    /// comment: it moves onto whatever owns the `ConsoleHut`, not this
+    /// `GlyphAtlas`).
+    pub fn new(renderer: &mut GlesRenderer) -> Result<(Self, AtlasPlacement), String> {
+        let (placement, white_upload) = AtlasPlacement::new();
+        let atlas = renderer
             .with_context(|gl| unsafe {
                 let program = link_program(gl, VERTEX_SHADER, FRAGMENT_SHADER)?;
                 // A C-string literal (not `CString::new(...).unwrap()`) —
@@ -418,91 +535,22 @@ impl GlyphAtlas {
                     blank.as_ptr() as *const _,
                 );
 
-                let mut packer = ShelfPacker::new();
-                let (wx, wy) = packer
-                    .alloc(2, 2)
-                    .ok_or("atlas too small for the reserved solid pixel")?;
-                let white_px = [255u8; 4];
-                gl.TexSubImage2D(
-                    ffi::TEXTURE_2D,
-                    0,
-                    wx as i32,
-                    wy as i32,
-                    2,
-                    2,
-                    ffi::RED,
-                    ffi::UNSIGNED_BYTE,
-                    white_px.as_ptr() as *const _,
-                );
-                let white = AtlasEntry {
-                    uv_pos: [wx as f32 / ATLAS_SIZE as f32, wy as f32 / ATLAS_SIZE as f32],
-                    uv_size: [1.0 / ATLAS_SIZE as f32, 1.0 / ATLAS_SIZE as f32],
-                    xmin: 0,
-                    ymin: 0,
-                    width: 1,
-                    height: 1,
-                };
-
-                Ok(GlyphAtlas {
-                    program,
-                    u_target_size,
-                    quad_vbo,
-                    atlas_tex,
-                    packer,
-                    glyphs: HashMap::default(),
-                    white,
-                })
+                let atlas = GlyphAtlas { program, u_target_size, quad_vbo, atlas_tex };
+                atlas.apply_upload(gl, &white_upload);
+                Ok::<GlyphAtlas, String>(atlas)
             })
-            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())??;
+        Ok((atlas, placement))
     }
 
-    /// Look up (or rasterize) the atlas entry for `(c, bold)`, deferring
-    /// any actual texture upload to [`Self::apply_upload`] — see that
-    /// method's own doc comment for who calls it and when. On a
-    /// genuinely new placement, `self.glyphs` is
-    /// updated immediately (optimistically — nothing here ever needs to
-    /// roll a placement back once decided, since the only reason
-    /// [`Self::apply_upload`] could fail is the same GL-context misuse
-    /// that would already be a bug regardless of when the upload
-    /// happens), and the caller gets a [`PendingGlyphUpload`] to apply
-    /// whenever a GL context is next available — not necessarily here,
-    /// not necessarily now. `None` only ever means one of two things: a
-    /// whitespace-shaped glyph, or an atlas that's completely full.
-    fn decide_entry(
-        &mut self,
-        glyph_cache: &mut GlyphCache,
-        c: char,
-        bold: bool,
-    ) -> Option<(AtlasEntry, Option<PendingGlyphUpload>)> {
-        if let Some(entry) = self.glyphs.get(&(c, bold)) {
-            return Some((*entry, None));
-        }
-
-        let (metrics, bitmap) = glyph_cache.glyph(c, bold);
-        let (width, height) = (metrics.width as u32, metrics.height as u32);
-        if width == 0 || height == 0 {
-            // Whitespace-shaped glyphs (e.g. space itself, though callers
-            // skip those already) — nothing to draw, nothing to cache.
-            return None;
-        }
-
-        let Some((x, y, entry)) = place_glyph(&mut self.packer, metrics.xmin, metrics.ymin, width, height)
-        else {
-            tracing::warn!("glyph atlas is full; {c:?} (bold={bold}) won't render until it grows");
-            return None;
-        };
-
-        self.glyphs.insert((c, bold), entry);
-        Some((entry, Some(PendingGlyphUpload { bitmap: bitmap.clone(), x, y, width, height })))
-    }
-
-    /// The one real GPU half of [`Self::decide_entry`]'s split: upload an
-    /// already-rasterized, already-placed glyph's bitmap into the atlas
-    /// texture. Safe to call any time after `decide_entry` produced
-    /// `upload`, on whichever thread owns the GL context — the placement
-    /// it uploads to was already reserved (in `self.packer`) the moment
-    /// `decide_entry` returned it, so nothing else can race for the same
-    /// atlas region in the meantime.
+    /// The one real GPU half of [`AtlasPlacement::decide_entry`]'s split:
+    /// upload an already-rasterized, already-placed glyph's bitmap into
+    /// the atlas texture. Safe to call any time after `decide_entry`
+    /// produced `upload`, on whichever thread owns the GL context — the
+    /// placement it uploads to was already reserved (in the
+    /// `AtlasPlacement` that decided it) the moment `decide_entry`
+    /// returned it, so nothing else can race for the same atlas region
+    /// in the meantime.
     fn apply_upload(&self, gl: &ffi::Gles2, upload: &PendingGlyphUpload) {
         unsafe {
             gl.BindTexture(ffi::TEXTURE_2D, self.atlas_tex);
@@ -794,12 +842,17 @@ impl Drop for GpuTermRenderer {
 }
 
 impl GpuTermRenderer {
-    /// Creates its own atlas. Most callers want [`Self::with_atlas`]
-    /// instead, sharing one with the same ConsoleHut's [`LabelRenderer`] (if any)
-    /// so glyphs aren't rasterized/uploaded twice.
-    pub fn new(renderer: &mut GlesRenderer) -> Result<Self, String> {
-        let atlas = Rc::new(RefCell::new(GlyphAtlas::new(renderer)?));
-        Self::with_atlas(renderer, atlas)
+    /// Creates its own atlas — and the fresh [`AtlasPlacement`] it starts
+    /// out synchronized with, which the caller owns from here on (see
+    /// that type's own doc comment for where it belongs: alongside
+    /// whatever owns the `ConsoleHut`, not this renderer). Most callers
+    /// want [`Self::with_atlas`] instead, sharing the GL-holding half
+    /// with the same ConsoleHut's [`LabelRenderer`] (if any) so glyphs
+    /// aren't rasterized/uploaded twice.
+    pub fn new(renderer: &mut GlesRenderer) -> Result<(Self, AtlasPlacement), String> {
+        let (atlas, placement) = GlyphAtlas::new(renderer)?;
+        let gpu = Self::with_atlas(renderer, Rc::new(RefCell::new(atlas)))?;
+        Ok((gpu, placement))
     }
 
     pub fn with_atlas(
@@ -878,6 +931,7 @@ impl GpuTermRenderer {
     pub fn redraw(
         &mut self,
         renderer: &mut GlesRenderer,
+        atlas_placement: &mut AtlasPlacement,
         glyph_cache: &mut GlyphCache,
         cells: &[CellInfo],
         damage: &Damage,
@@ -889,7 +943,7 @@ impl GpuTermRenderer {
     ) -> Result<(GlesTexture, Option<Rectangle<i32, Buffer>>), String> {
         let resized = self.ensure_size(renderer, width, height)?;
 
-        let white = self.atlas.borrow().white;
+        let white = atlas_placement.white();
         // Reuse last frame's backing allocation (`clear()` keeps capacity)
         // instead of allocating fresh every redraw — see the field doc.
         self.instances_scratch.clear();
@@ -910,38 +964,33 @@ impl GpuTermRenderer {
         // first: an earlier version pushed a blank `Instance` per glyph
         // cell up front, only to `truncate`/discard all of them once this
         // real pass built the actual list, wasted allocation and writes
-        // on every redraw. GL-free — routes through `GlyphAtlas::
-        // decide_entry`, not `atlas_entry` (see the render-thread-split
-        // RFC's "Step 3"), so no `with_context` is needed here at all;
-        // any newly-rasterized glyphs collect into
-        // `pending_uploads_scratch` (reused across calls, same "clear,
-        // don't reallocate" reasoning as `instances_scratch` — see its
-        // own field doc) for the single `with_context` call below to
-        // actually upload.
+        // on every redraw. GL-free — routes through `AtlasPlacement::
+        // decide_entry` (see the render-thread-split RFC's "Step 3"/
+        // "Step 4a"), so no `with_context` is needed here at all; any
+        // newly-rasterized glyphs collect into `pending_uploads_scratch`
+        // (reused across calls, same "clear, don't reallocate" reasoning
+        // as `instances_scratch` — see its own field doc) for the single
+        // `with_context` call below to actually upload.
         self.pending_uploads_scratch.clear();
-        {
-            let mut atlas = self.atlas.borrow_mut();
-            for cell in cells {
-                if cell.c == ' ' || cell.c == '\0' {
-                    continue;
-                }
-                let Some((entry, upload)) = atlas.decide_entry(glyph_cache, cell.c, cell.bold) else {
-                    continue;
-                };
-                if let Some(upload) = upload {
-                    self.pending_uploads_scratch.push(upload);
-                }
-                let glyph_x = (cell.col * cell_w) as i32 + entry.xmin;
-                let glyph_y =
-                    (cell.row * cell_h) as i32 + baseline as i32 - entry.height as i32 - entry.ymin;
-                self.instances_scratch.push(Instance {
-                    dst_pos: [glyph_x as f32, glyph_y as f32],
-                    dst_size: [entry.width as f32, entry.height as f32],
-                    uv_pos: entry.uv_pos,
-                    uv_size: entry.uv_size,
-                    color: rgb_f32(cell.fg),
-                });
+        for cell in cells {
+            if cell.c == ' ' || cell.c == '\0' {
+                continue;
             }
+            let Some((entry, upload)) = atlas_placement.decide_entry(glyph_cache, cell.c, cell.bold) else {
+                continue;
+            };
+            if let Some(upload) = upload {
+                self.pending_uploads_scratch.push(upload);
+            }
+            let glyph_x = (cell.col * cell_w) as i32 + entry.xmin;
+            let glyph_y = (cell.row * cell_h) as i32 + baseline as i32 - entry.height as i32 - entry.ymin;
+            self.instances_scratch.push(Instance {
+                dst_pos: [glyph_x as f32, glyph_y as f32],
+                dst_size: [entry.width as f32, entry.height as f32],
+                uv_pos: entry.uv_pos,
+                uv_size: entry.uv_size,
+                color: rgb_f32(cell.fg),
+            });
         }
 
         // A freshly (re)allocated target has no prior content to preserve
@@ -1086,6 +1135,7 @@ impl LabelRenderer {
     pub fn render(
         &mut self,
         renderer: &mut GlesRenderer,
+        atlas_placement: &mut AtlasPlacement,
         glyph_cache: &mut GlyphCache,
         text: &str,
         cell_w: usize,
@@ -1094,22 +1144,24 @@ impl LabelRenderer {
         fg: Rgb,
         bg: Rgb,
     ) -> Result<GlesTexture, String> {
-        let resolved = self.resolve(glyph_cache, text, cell_w, cell_h, baseline, fg, bg);
+        let resolved = Self::resolve(atlas_placement, glyph_cache, text, cell_w, cell_h, baseline, fg, bg);
         self.draw(renderer, resolved)
     }
 
     /// Decide everything about how `text` should look — target size and
     /// the instance list [`draw_instances`] needs — with no live GL
-    /// context involved: glyph rasterization/atlas-placement decisions
-    /// all route through [`GlyphAtlas::decide_entry`], itself GL-free.
-    /// Split from [`Self::draw`] specifically so the two can eventually
-    /// run on different threads — a resolved label carries only plain
-    /// owned data (`Send`, unlike `LabelRenderer`/`GlesRenderer` — see
+    /// context, and nothing GL-adjacent in scope at all: `atlas_placement`
+    /// (see [`AtlasPlacement`]'s own doc comment) and `glyph_cache` are
+    /// both plain, `Send`-safe, core-appropriate values, not fields on
+    /// `self` — this doesn't even need a `LabelRenderer` to call. Split
+    /// from [`Self::draw`] specifically so the two can eventually run on
+    /// different threads — a resolved label carries only plain owned data
+    /// (`Send`, unlike `LabelRenderer`/`GlesRenderer` — see
     /// [`ResolvedLabel`]'s own doc comment) — see the render-thread-split
-    /// RFC's "Step 2".
+    /// RFC's "Step 2"/"Step 4a".
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn resolve(
-        &self,
+        atlas_placement: &mut AtlasPlacement,
         glyph_cache: &mut GlyphCache,
         text: &str,
         cell_w: usize,
@@ -1122,8 +1174,7 @@ impl LabelRenderer {
         let width = (chars.len().max(1) * cell_w) as i32;
         let height = cell_h.max(1) as i32;
 
-        let mut atlas = self.atlas.borrow_mut();
-        let white = atlas.white;
+        let white = atlas_placement.white();
         let mut instances = vec![Instance {
             dst_pos: [0.0, 0.0],
             dst_size: [width as f32, height as f32],
@@ -1138,7 +1189,7 @@ impl LabelRenderer {
             if c == ' ' {
                 continue;
             }
-            let Some((entry, upload)) = atlas.decide_entry(glyph_cache, c, false) else {
+            let Some((entry, upload)) = atlas_placement.decide_entry(glyph_cache, c, false) else {
                 continue;
             };
             if let Some(upload) = upload {
