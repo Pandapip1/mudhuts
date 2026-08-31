@@ -262,12 +262,24 @@ by commit hash):
    before, still on one thread. Real new unit test coverage landed alongside it (`place_glyph_
    tests`) that wasn't possible before the split, since exercising the packing decision used to
    require a live `GlesRenderer` just to construct a `GlyphAtlas` at all.
-2. **Give `LabelCache`/label call sites a `Send`-compatible "resolved label" value** analogous to
-   `ContentPiece::Texture` — carrying the decided instance list rather than requiring a live
-   renderer to produce one. `chrome::build`/`docks::build`/`village_chrome::build` start
-   producing this value instead of directly calling into `LabelRenderer`; a separate step
-   (still same-thread for now) consumes it to do the actual upload+draw — proving the seam the
-   same way the dmabuf-import channel conversion proved its own, before any real thread exists.
+2. **DONE** (commit `d903014`) — **`LabelRenderer::render` split into a `Send`-compatible
+   "resolved label" value plus a separate draw step.** Also extended Step 1's `GlyphAtlas` split
+   further while here: `atlas_entry` is now `decide_entry` (GL-free — cache lookup,
+   rasterization, atlas placement) immediately followed by `apply_upload` (the one real GPU
+   call), kept fused for `GpuTermRenderer`'s still-unsplit per-glyph usage (that's Step 3).
+   `LabelRenderer::resolve` calls only the GL-free half for every glyph in a label, producing a
+   new `ResolvedLabel` (target size, the fully-decided instance list, any newly-rasterized
+   glyphs still needing upload — plain owned data, `Send`, no GL objects); `LabelRenderer::draw`
+   applies those pending uploads and runs the unchanged `draw_instances` path. **Scoped smaller
+   than originally sketched here, deliberately**: `chrome::build`/`docks::build`/`village_
+   chrome::build` were *not* changed to call `resolve`/`draw` directly — `render()` stays as
+   `resolve()` immediately followed by `draw()`, so every existing call site is untouched.
+   Rewiring those call sites only actually matters once there's a real thread boundary to send
+   a `ResolvedLabel` across (Step 4); doing it now would've meant either an unused API surface
+   or forcing `LabelCache`'s own caching gate (`is_stale`/`store`/`cached`) to be redesigned
+   around a value type it doesn't need to know about yet — real, separate scope, not free to
+   fold in here. Behavior-preserving: same GL calls, same order, same one `with_context` scope
+   per label.
 3. **Extend the same split to `GpuTermRenderer`'s terminal-grid upload step**, since it shares
    the atlas — otherwise step 2's split is fighting a still-fused terminal-content path for the
    same underlying resource.
