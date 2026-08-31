@@ -6,9 +6,9 @@ Drafted 2026-08-31, after a long research/discussion session establishing the ta
 architecture and closing out every open question except one. This RFC exists so implementation
 can begin from settled facts instead of guessing, the same discipline `typed-graph-hut.md`/
 `composable-hut-hierarchy.md` used. Two small, real pieces of prep work landed on `main` before
-this RFC existed (see "Landed prep work" below); migration Step 1 (see "Migration plan") has
-now landed on the dedicated `render-thread-split` branch. The real thread split itself
-(Steps 2-4) hasn't begun.
+this RFC existed (see "Landed prep work" below); migration Steps 1-3 and 4a (see "Migration
+plan") have since landed on the dedicated `render-thread-split` branch. The real thread spawn
+itself (Step 4b) hasn't begun.
 
 ## Motivation
 
@@ -299,14 +299,40 @@ by commit hash):
    respect this same hot-path constraint — a fresh owned `Vec` every redraw is not an option.
    Behavior-preserving, and a real side-effect win: one `eglMakeCurrent` call per redraw instead
    of two, since the glyph-resolve pass no longer needs a context at all.
-4. **Only then**, with both label and terminal-grid rendering already split into "decide"/"draw"
-   halves — labels via an owned `Send` value, terminal-grid via a still-open-question transport
-   shape that has to stay allocation-free per frame (see Step 3 above) — attempt
-   the real thread split: render thread does its own full `init_udev` setup from scratch (per
-   the `GlesRenderer: !Send` finding above), core forwards input via channel (per the
-   `LibSeatSession: !Send` finding above), and `capture.rs`/session-lock confirmation convert to
-   the same channel pattern dmabuf already uses, now that there's a real snapshot type for them
-   to carry.
+4a. **DONE** (commit `cb6308d`) — **split `GlyphAtlas` into `AtlasPlacement` (`Send`, packer +
+   glyph-placement `HashMap` + the reserved `white` entry — proven `Send` by a compile-time
+   assertion mirroring `graph.rs`'s `RenderedContent` one) and a reduced `GlyphAtlas` (just the
+   GL handles: `program`, `atlas_tex`, `quad_vbo`, `u_target_size`).** Investigated why Step 4b
+   couldn't proceed without this first: `ConsoleHut` directly owns `gpu: Option<
+   GpuTermRenderer>`/`label_renderer: Option<LabelRenderer>`, both holding real GL objects, so
+   neither can live on a `ConsoleHut` that has to keep living inside core-owned `GraphStack` —
+   and even after Steps 1-3, `GlyphAtlas` still bundled GL-free placement bookkeeping together
+   with real GL handles in one struct, so `decide_entry` had no way to run without an
+   `Rc<RefCell<GlyphAtlas>>` in scope regardless. `ConsoleHut` gained a new `atlas_placement:
+   Option<AtlasPlacement>` field (created/reset in lockstep with `gpu`/`label_renderer`);
+   `GpuTermRenderer::redraw`/`LabelRenderer::render`/`resolve` take `atlas_placement: &mut
+   AtlasPlacement` as an explicit parameter now instead of reaching into `self.atlas`.
+   **Scoped smaller than a first pass might assume**: `gpu`/`label_renderer` themselves stay on
+   `ConsoleHut` for now — moving them into a render-thread-owned side table only makes sense
+   once Step 4b's real thread exists to own that table; inventing a placeholder home for it in
+   this still-single-threaded step would mean redoing the move once that thread lands. Caught
+   and fixed a real preserve-behavior-exactly bug on review: an early draft of the reserved
+   white slot's `AtlasEntry` reported a 2×2 `uv_size`/`width`/`height` matching its 2×2 reserved
+   packer region, but the original code deliberately reports only a 1×1 sub-region of that
+   reservation — fixed to match exactly (the visual difference would likely have been nil, the
+   reserved region is uniformly white either way, but this migration's whole premise is
+   behavior-preservation, not "probably fine").
+4b. **Only then**, with `AtlasPlacement`/`GlyphCache` proven sufficient for every decide-side
+   call site with zero GL-adjacent state in scope, attempt the real thread split: render thread
+   does its own full `init_udev` setup from scratch (per the `GlesRenderer: !Send` finding
+   above), owning `gpu`/`label_renderer`/the GL-holding `GlyphAtlas` half in a new per-
+   `ConsoleHut` side table (keyed by `ConsoleHut`'s own stable id — this codebase already has
+   precedent for "core owns the logical entity, a side cache keyed by its id holds render-side
+   state," `switcher.rs`'s thumbnail cache and `render.rs`'s per-id content cache, just
+   extending it across a thread boundary instead of within one). Core forwards input via channel
+   (per the `LibSeatSession: !Send` finding above), and `capture.rs`/session-lock
+   confirmation/terminal-content's still-open transport shape (Step 3) convert to the same
+   channel pattern dmabuf already uses.
 
 Each step should land independently verified (`cargo build`/`clippy --all-targets`/`test` inside
 `nix develop`, plus a live smoke test on `mudhuts --tty` once possible — blocked this session on
