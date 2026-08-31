@@ -817,7 +817,7 @@ impl ConsoleHut {
         match gpu.redraw(
             renderer,
             &mut self.glyphs,
-            &cells,
+            cells,
             &damage,
             cell_w,
             cell_h,

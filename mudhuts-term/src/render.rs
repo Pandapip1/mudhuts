@@ -312,14 +312,23 @@ pub struct CellInfo {
 /// Collect every cell's resolved colors/character within `damage`'s own
 /// bounding box (the whole viewport for [`Damage::Full`], matching
 /// [`damage_bounds`]'s doc comment on why a single box rather than
-/// per-line precision). `capacity` (`columns * screen_lines`, known to
-/// the caller before `content`'s own `GridIterator` is ever walked —
-/// `GridIterator` isn't `ExactSizeIterator`, so this can't be derived
-/// from `content` itself) is a safe upper-bound capacity hint, not an
-/// exact size — real damage is usually well under a full grid, so this
-/// slightly over-allocates for a `Lines` damage rather than under, which
-/// is the cheaper direction to be wrong in.
-pub fn collect_cells(content: RenderableContent<'_>, capacity: usize, damage: &Damage) -> Vec<CellInfo> {
+/// per-line precision) into `out` — `out` is `clear()`ed first, then
+/// refilled, so a caller holding a persistent buffer across calls (see
+/// `Terminal::take_dirty_cells`) reuses its existing allocation instead of
+/// this function allocating a fresh one every call. `capacity`
+/// (`columns * screen_lines`, known to the caller before `content`'s own
+/// `GridIterator` is ever walked — `GridIterator` isn't
+/// `ExactSizeIterator`, so this can't be derived from `content` itself) is
+/// a safe upper-bound capacity hint, not an exact size — real damage is
+/// usually well under a full grid, so this slightly over-reserves for a
+/// `Lines` damage rather than under, which is the cheaper direction to be
+/// wrong in.
+pub fn collect_cells(
+    content: RenderableContent<'_>,
+    capacity: usize,
+    damage: &Damage,
+    out: &mut Vec<CellInfo>,
+) {
     let colors: &Colors = content.colors;
     let cursor_point = content.cursor.point;
     let cursor_shape = content.cursor.shape;
@@ -328,7 +337,8 @@ pub fn collect_cells(content: RenderableContent<'_>, capacity: usize, damage: &D
     let bounds = damage_bounds(damage);
 
     let display_offset = content.display_offset as i32;
-    let mut cells = Vec::with_capacity(capacity);
+    out.clear();
+    out.reserve(capacity);
     for indexed in content.display_iter {
         // A display-iterator point's `line` is in *grid* space, not
         // viewport space — line 0 there is the top of the non-scrolled
@@ -358,7 +368,7 @@ pub fn collect_cells(content: RenderableContent<'_>, capacity: usize, damage: &D
             std::mem::swap(&mut fg, &mut bg);
         }
 
-        cells.push(CellInfo {
+        out.push(CellInfo {
             col,
             row,
             c: cell.c,
@@ -367,7 +377,6 @@ pub fn collect_cells(content: RenderableContent<'_>, capacity: usize, damage: &D
             bg,
         });
     }
-    cells
 }
 
 /// Render the current terminal viewport into an RGBA8 `buf` of size

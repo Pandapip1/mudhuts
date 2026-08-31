@@ -89,6 +89,13 @@ pub struct Terminal {
     /// Set once the shell has exited; kept around so callers can decide
     /// whether to respawn or tear down the owning ConsoleHut.
     pub exited: bool,
+    /// Scratch buffer for [`Self::take_dirty_cells`] — `clear()`ed and
+    /// refilled every call rather than allocated fresh, same reasoning as
+    /// `mudhuts::gpu_term::GpuTermRenderer`'s `instances_scratch` (a
+    /// steady-state grid size settles into reusing one already-grown
+    /// allocation instead of round-tripping the allocator on every dirty
+    /// redraw).
+    cells_scratch: Vec<render::CellInfo>,
 }
 
 fn window_size(size: GridSize, cell_size: (u16, u16)) -> WindowSize {
@@ -163,6 +170,7 @@ impl Terminal {
                 cell_size,
                 shell_pid,
                 exited: false,
+                cells_scratch: Vec::new(),
             },
             rx,
         ))
@@ -271,8 +279,10 @@ impl Terminal {
     /// region instead of the whole terminal, see
     /// [`crate::gpu_term::GpuTermRenderer::redraw`]'s doc comment.
     /// Returns `None` when nothing changed, so the caller can skip
-    /// re-rendering entirely.
-    pub fn take_dirty_cells(&self) -> Option<(Vec<render::CellInfo>, render::Damage)> {
+    /// re-rendering entirely. The cell list borrows a scratch buffer owned
+    /// by `self` rather than allocating a fresh `Vec` every call — valid
+    /// only until the next call to this method.
+    pub fn take_dirty_cells(&mut self) -> Option<(&[render::CellInfo], render::Damage)> {
         let mut term = self.term.lock();
         let cursor_point = term.grid().cursor.point;
         let damage = match term.damage() {
@@ -335,8 +345,8 @@ impl Terminal {
         let damage = if has_selection { render::Damage::Full } else { damage };
 
         let capacity = term.columns() * term.screen_lines();
-        let cells = render::collect_cells(term.renderable_content(), capacity, &damage);
-        Some((cells, damage))
+        render::collect_cells(term.renderable_content(), capacity, &damage, &mut self.cells_scratch);
+        Some((&self.cells_scratch, damage))
     }
 
     /// Rasterize the current grid into `buf` (RGBA8, `width * height * 4`
