@@ -457,6 +457,13 @@ impl GlyphAtlas {
     }
 
     /// Look up (or rasterize + upload) the atlas entry for `(c, bold)`.
+    /// Only the `gl.TexSubImage2D` upload below actually needs a live GL
+    /// context — the cache lookup, rasterization (`glyph_cache.glyph`,
+    /// itself GPU-free — see its own doc comment), and atlas-placement
+    /// decision (`place_glyph`) are all already GPU-free, just not
+    /// currently split out from the upload step. `place_glyph` is pulled
+    /// into its own function for exactly this reason (see its own doc
+    /// comment) — the render-thread-split RFC's "Step 1".
     fn atlas_entry(
         &mut self,
         gl: &ffi::Gles2,
@@ -476,7 +483,8 @@ impl GlyphAtlas {
             return None;
         }
 
-        let Some((x, y)) = self.packer.alloc(width, height) else {
+        let Some((x, y, entry)) = place_glyph(&mut self.packer, metrics.xmin, metrics.ymin, width, height)
+        else {
             tracing::warn!("glyph atlas is full; {c:?} (bold={bold}) won't render until it grows");
             return None;
         };
@@ -496,20 +504,45 @@ impl GlyphAtlas {
             );
         }
 
-        let entry = AtlasEntry {
-            uv_pos: [x as f32 / ATLAS_SIZE as f32, y as f32 / ATLAS_SIZE as f32],
-            uv_size: [
-                width as f32 / ATLAS_SIZE as f32,
-                height as f32 / ATLAS_SIZE as f32,
-            ],
-            xmin: metrics.xmin,
-            ymin: metrics.ymin,
-            width,
-            height,
-        };
         self.glyphs.insert((c, bold), entry);
         Some(entry)
     }
+}
+
+/// The pure half of [`GlyphAtlas::atlas_entry`]: given an already-known
+/// glyph size (from `fontdue::Metrics`, itself computed with no GL
+/// involved) and the atlas's own packer state, decide where — if
+/// anywhere — this glyph goes, and precompute the `AtlasEntry` that
+/// placement implies. `None` only ever means "the atlas is full" (`width`/
+/// `height` are checked by the caller before this is reached, so a
+/// whitespace-shaped glyph never gets here at all). Never touches GL —
+/// pulled out specifically so it's unit-testable against synthetic glyph
+/// dimensions, without needing a real `GlyphCache` (font/fontconfig
+/// resolution — nothing else in this codebase's tests constructs one
+/// either) just to exercise the packing/bookkeeping logic, and so a
+/// future render-thread split can run this same decision on the
+/// core/"decide what to draw" side without carrying a live GL context
+/// along for the ride — see the render-thread-split RFC's "Step 1".
+fn place_glyph(
+    packer: &mut ShelfPacker,
+    metrics_xmin: i32,
+    metrics_ymin: i32,
+    width: u32,
+    height: u32,
+) -> Option<(u32, u32, AtlasEntry)> {
+    let (x, y) = packer.alloc(width, height)?;
+    let entry = AtlasEntry {
+        uv_pos: [x as f32 / ATLAS_SIZE as f32, y as f32 / ATLAS_SIZE as f32],
+        uv_size: [
+            width as f32 / ATLAS_SIZE as f32,
+            height as f32 / ATLAS_SIZE as f32,
+        ],
+        xmin: metrics_xmin,
+        ymin: metrics_ymin,
+        width,
+        height,
+    };
+    Some((x, y, entry))
 }
 
 /// Shared draw sequence: upload `instances` and draw them as two
@@ -1167,5 +1200,44 @@ mod shelf_packer_tests {
         assert!(packer.alloc(ATLAS_SIZE, ATLAS_SIZE).is_some());
         // Anything else forces a wrap past the atlas's bottom edge.
         assert_eq!(packer.alloc(1, 1), None);
+    }
+}
+
+/// Exercises [`place_glyph`] in isolation — no `GlyphAtlas`/`GlesRenderer`/
+/// `GlyphCache` involved, per its own doc comment on why it's pulled out
+/// specifically to be testable this way.
+#[cfg(test)]
+mod place_glyph_tests {
+    use super::*;
+
+    #[test]
+    fn the_first_glyph_lands_at_the_origin_with_correctly_normalized_uvs() {
+        let mut packer = ShelfPacker::new();
+        let (x, y, entry) = place_glyph(&mut packer, -1, 2, 10, 20).unwrap();
+        assert_eq!((x, y), (0, 0));
+        assert_eq!(entry.uv_pos, [0.0, 0.0]);
+        assert_eq!(entry.uv_size, [10.0 / ATLAS_SIZE as f32, 20.0 / ATLAS_SIZE as f32]);
+        assert_eq!((entry.xmin, entry.ymin), (-1, 2));
+        assert_eq!((entry.width, entry.height), (10, 20));
+    }
+
+    #[test]
+    fn a_second_glyph_lands_wherever_the_packer_places_it_with_matching_uvs() {
+        let mut packer = ShelfPacker::new();
+        place_glyph(&mut packer, 0, 0, 10, 20).unwrap();
+        let (x, y, entry) = place_glyph(&mut packer, 0, 0, 15, 20).unwrap();
+        // Same shelf, immediately to the right of the first glyph — same
+        // contract `sequential_allocs_on_the_same_shelf_advance_left_to_
+        // right` above already confirms for the packer alone; this checks
+        // the derived `AtlasEntry`'s UVs agree with that real position,
+        // not just that some entry came back.
+        assert_eq!((x, y), (10, 0));
+        assert_eq!(entry.uv_pos, [10.0 / ATLAS_SIZE as f32, 0.0]);
+    }
+
+    #[test]
+    fn a_glyph_that_does_not_fit_returns_none_without_mutating_the_entry_it_would_have_made() {
+        let mut packer = ShelfPacker::new();
+        assert!(place_glyph(&mut packer, 0, 0, ATLAS_SIZE + 1, 10).is_none());
     }
 }
