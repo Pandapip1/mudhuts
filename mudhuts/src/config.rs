@@ -1,7 +1,7 @@
 //! Shared across every `~/.config/mudhuts/config.toml` reader
 //! (`keybindings.rs`'s `[keybindings]` section, `theme.rs`'s `[theme]`
-//! section, `display_config.rs`'s `[display]` section, `chrome_config.rs`'s
-//! `[chrome]` section) — the path-resolution rule, plus the shared
+//! section, `chrome_config.rs`'s `[chrome]` section, `perf_config.rs`'s
+//! `[performance]` section) — the path-resolution rule, plus the shared
 //! read-the-file-or-fall-back-to-default step, so they can't drift apart
 //! on either.
 

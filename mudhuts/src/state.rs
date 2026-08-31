@@ -143,7 +143,6 @@ pub struct State {
     pub stack: GraphStack,
     pub keymap: Keymap,
     pub theme: crate::theme::Theme,
-    pub display_config: crate::display_config::DisplayConfig,
     pub chrome_config: crate::chrome_config::ChromeConfig,
     pub perf_config: crate::perf_config::PerfConfig,
     /// Whether the combined Hut-level + Main-Window tab strip is
@@ -580,7 +579,6 @@ impl State {
             stack,
             keymap: Keymap::load(&config_file),
             theme: crate::theme::Theme::load(&config_file),
-            display_config: crate::display_config::DisplayConfig::load(&config_file),
             chrome_config: crate::chrome_config::ChromeConfig::load(&config_file),
             perf_config: crate::perf_config::PerfConfig::load(&config_file),
             tab_strip_revealed: false,

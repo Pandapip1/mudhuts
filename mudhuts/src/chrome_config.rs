@@ -1,6 +1,6 @@
 //! Chrome (on-screen UI, as opposed to client window content) settings
 //! overridable via `~/.config/mudhuts/config.toml`'s `[chrome]` section —
-//! same file/mechanism `display_config.rs`'s `[display]` section,
+//! same file/mechanism `perf_config.rs`'s `[performance]` section,
 //! `theme.rs`'s `[theme]` section, and `keybindings.rs`'s `[keybindings]`
 //! section use (see [`crate::config::config_path`]).
 
@@ -12,8 +12,8 @@ pub struct ChromeConfig {
     /// until the pointer touches the top edge of its output, instead of
     /// always being drawn — see `input.rs`'s `update_tab_strip_reveal`
     /// for the reveal/hide logic. On by default: unlike
-    /// `DisplayConfig::adaptive_refresh_rate` (a real hardware mode
-    /// switch — genuinely disruptive, so off by default), this is a
+    /// `PerfConfig::sched_fifo` (a real, genuinely risky system-level
+    /// change — see its own doc comment — so off by default), this is a
     /// purely software overlay change with real, deliberate hysteresis
     /// of its own (stays shown for as long as the pointer is anywhere
     /// within the strip's own rect, not just the few-pixel-wide edge band
@@ -34,7 +34,7 @@ impl ChromeConfig {
     /// Load the default chrome config, then apply overrides from
     /// `~/.config/mudhuts/config.toml`'s `[chrome]` section if present —
     /// same "any problem is logged and skipped, never fatal" convention
-    /// as `DisplayConfig::load`/`Theme::load`/`Keymap::load`. `config_file`
+    /// as `PerfConfig::load`/`Theme::load`/`Keymap::load`. `config_file`
     /// is read once by the caller (`State::new`) and shared across all
     /// four `*Config::load()`s — see `crate::config::read_config_file`'s
     /// own doc comment for why this doesn't read it itself.

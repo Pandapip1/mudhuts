@@ -3,7 +3,6 @@ mod chrome;
 mod chrome_config;
 mod config;
 mod cursor;
-mod display_config;
 mod docks;
 mod gpu_term;
 mod grabs;
