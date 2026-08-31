@@ -3,11 +3,12 @@
 ## Status
 
 Drafted 2026-08-31, after a long research/discussion session establishing the target
-architecture and closing out every open question except one. Not started — this RFC exists so
-implementation can begin from settled facts instead of guessing, the same discipline
-`typed-graph-hut.md`/`composable-hut-hierarchy.md` used. Two small, real, already-landed
-pieces of prep work exist on `main` (see "Landed prep work" below); the actual thread split
-itself has not begun.
+architecture and closing out every open question except one. This RFC exists so implementation
+can begin from settled facts instead of guessing, the same discipline `typed-graph-hut.md`/
+`composable-hut-hierarchy.md` used. Two small, real pieces of prep work landed on `main` before
+this RFC existed (see "Landed prep work" below); migration Step 1 (see "Migration plan") has
+now landed on the dedicated `render-thread-split` branch. The real thread split itself
+(Steps 2-4) hasn't begun.
 
 ## Motivation
 
@@ -240,17 +241,27 @@ rendering depend on), not an isolated corner. It deserves its own staged migrati
 below), landed on its own branch off `main` given `main`'s HEAD is what the user's live nixos
 config pins by commit hash, the same precedent `dag-hut-rearchitecture` set.
 
-## Migration plan (proposed shape, not yet started)
+## Migration plan
 
 Mirroring `typed-graph-hut.md`'s own discipline — one real, working, build/clippy/test-verified
-step at a time, each its own commit:
+step at a time, each its own commit, on the `render-thread-split` branch (off `main`, same
+precedent as `dag-hut-rearchitecture` — `main`'s HEAD is what the user's live nixos config pins
+by commit hash):
 
-1. **Extract the atlas placement/rasterization decision as a pure, `Send`-compatible function**,
-   independent of `GlesRenderer` — given `(char, bold)` and current atlas occupancy, return
-   "already placed at (x,y)" or "needs rasterizing + placing at (x,y), here's the bitmap." No
-   behavior change yet: `GlyphAtlas::atlas_entry` calls this internally, still on one thread.
-   Unit-testable in isolation (pure function over placement state), unlike today's GL-coupled
-   version.
+1. **DONE** (commit `89109af`) — **extracted the atlas placement decision as a pure function**,
+   `place_glyph` (`gpu_term.rs`): given an already-rasterized glyph's size/metrics and the
+   atlas's own `ShelfPacker` state, decides where it goes and precomputes the resulting
+   `AtlasEntry`, with no GL context involved. Ended up a slightly different shape than first
+   sketched here — the cache lookup and rasterization (`glyph_cache.glyph`) stayed inline in
+   `atlas_entry` rather than folding into the pure function too, since both were already trivial/
+   GPU-free on their own and folding them in would have meant either cloning the glyph bitmap
+   unnecessarily or inventing a `GlyphCache` test fixture (real font/fontconfig resolution —
+   nothing else in this codebase's tests does that). Only the packer-allocation arithmetic
+   actually benefited from extraction, so that's the whole diff. Behavior-preserving: `atlas_
+   entry` still calls it inline, immediately followed by the same `TexSubImage2D` upload as
+   before, still on one thread. Real new unit test coverage landed alongside it (`place_glyph_
+   tests`) that wasn't possible before the split, since exercising the packing decision used to
+   require a live `GlesRenderer` just to construct a `GlyphAtlas` at all.
 2. **Give `LabelCache`/label call sites a `Send`-compatible "resolved label" value** analogous to
    `ContentPiece::Texture` — carrying the decided instance list rather than requiring a live
    renderer to produce one. `chrome::build`/`docks::build`/`village_chrome::build` start
