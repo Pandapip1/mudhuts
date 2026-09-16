@@ -1,9 +1,9 @@
 //! Shared across every `~/.config/mudhuts/config.toml` reader
 //! (`keybindings.rs`'s `[keybindings]` section, `theme.rs`'s `[theme]`
 //! section, `chrome_config.rs`'s `[chrome]` section, `perf_config.rs`'s
-//! `[performance]` section) — the path-resolution rule, plus the shared
-//! read-the-file-or-fall-back-to-default step, so they can't drift apart
-//! on either.
+//! `[performance]` section, `power_config.rs`'s `[power]` section) — the
+//! path-resolution rule, plus the shared read-the-file-or-fall-back-to-
+//! default step, so they can't drift apart on either.
 
 use std::path::PathBuf;
 
@@ -33,10 +33,10 @@ pub(crate) struct ConfigFileContents {
 /// `*Config::apply_toml_overrides` below already treats an empty/missing
 /// `[section]` as a graceful no-op on its own (`toml::from_str("")` is
 /// valid, empty TOML), so returning a real, always-usable
-/// `ConfigFileContents` here — rather than an `Option` every one of the
-/// four call sites had to unwrap just to special-case something that
-/// already degraded correctly by itself — collapses that unwrap away
-/// entirely (caught in review on an `Option`-returning earlier version).
+/// `ConfigFileContents` here — rather than an `Option` every one of its
+/// call sites had to unwrap just to special-case something that already
+/// degraded correctly by itself — collapses that unwrap away entirely
+/// (caught in review on an `Option`-returning earlier version).
 /// Deliberately doesn't parse the TOML itself: each config type's own
 /// `[section]` shape is different enough, and each has exactly one
 /// caller, that sharing the parse step too would mean a generic/trait
@@ -45,9 +45,9 @@ pub(crate) struct ConfigFileContents {
 /// first caught that).
 ///
 /// Deliberately reads fresh every call, no process-wide caching — an
-/// earlier version cached the result behind a `static OnceLock` (all
-/// four `*Config::load()`s below run back to back at startup, so without
-/// it they'd each independently open+read+UTF-8-validate the same small
+/// earlier version cached the result behind a `static OnceLock` (every
+/// `*Config::load()` below runs back to back at startup, so without it
+/// they'd each independently open+read+UTF-8-validate the same small
 /// file), but review caught that baking a "read once, ever, for the
 /// whole process" assumption into this low-level shared helper — rather
 /// than at the one call site (`State::new`) that actually owns that
@@ -55,8 +55,8 @@ pub(crate) struct ConfigFileContents {
 /// anything violates it (a future config-reload feature, more than one
 /// `State` in a process, or a test that sets `HOME`/`XDG_CONFIG_HOME` and
 /// calls a `load()` more than once with different env). `State::new`
-/// reads this once itself and passes the result to all four `load()`s
-/// instead, which gets the same "don't read 4 times" benefit without the
+/// reads this once itself and passes the result to every `load()`
+/// instead, which gets the same "don't read N times" benefit without the
 /// hazard.
 pub(crate) fn read_config_file() -> ConfigFileContents {
     let Some(path) = config_path() else {

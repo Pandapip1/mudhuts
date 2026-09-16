@@ -259,7 +259,7 @@ impl Keymap {
     /// unparseable chord) is logged and skipped rather than treated as
     /// fatal — the compositor always ends up with at least the defaults.
     /// `config_file` is read once by the caller (`State::new`) and
-    /// shared across all four `*Config::load()`s — see
+    /// shared across every `*Config::load()` — see
     /// `crate::config::read_config_file`'s own doc comment for why this
     /// doesn't read it itself.
     pub(crate) fn load(config_file: &ConfigFileContents) -> Self {

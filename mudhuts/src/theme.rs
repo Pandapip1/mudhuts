@@ -59,7 +59,7 @@ impl Theme {
     /// `~/.config/mudhuts/config.toml`'s `[theme]` section if present —
     /// same "any problem is logged and skipped, never fatal" convention
     /// as `Keymap::load`. `config_file` is read once by the caller
-    /// (`State::new`) and shared across all four `*Config::load()`s —
+    /// (`State::new`) and shared across every `*Config::load()` —
     /// see `crate::config::read_config_file`'s own doc comment for why
     /// this doesn't read it itself.
     pub(crate) fn load(config_file: &ConfigFileContents) -> Self {

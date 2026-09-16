@@ -36,7 +36,7 @@ impl ChromeConfig {
     /// same "any problem is logged and skipped, never fatal" convention
     /// as `PerfConfig::load`/`Theme::load`/`Keymap::load`. `config_file`
     /// is read once by the caller (`State::new`) and shared across all
-    /// four `*Config::load()`s — see `crate::config::read_config_file`'s
+    /// every `*Config::load()` — see `crate::config::read_config_file`'s
     /// own doc comment for why this doesn't read it itself.
     pub(crate) fn load(config_file: &ConfigFileContents) -> Self {
         let mut config = Self::default();
