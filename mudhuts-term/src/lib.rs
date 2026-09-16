@@ -234,15 +234,24 @@ impl Terminal {
 
     /// Start a new text selection anchored at the given 1-based cell
     /// coordinates (see [`mouse::start_selection`] for `left_half`).
+    /// `row` is screen-relative — [`mouse::start_selection`]'s own doc
+    /// comment on why this reads the current scroll position itself
+    /// rather than taking it as a parameter callers would have to
+    /// remember to pass.
     pub fn start_selection(&self, col: usize, row: usize, left_half: bool) {
-        self.term.lock().selection = Some(mouse::start_selection(col, row, left_half));
+        let mut term = self.term.lock();
+        let display_offset = term.grid().display_offset();
+        term.selection = Some(mouse::start_selection(col, row, display_offset, left_half));
     }
 
     /// Extend the in-progress selection, if any, to the given coordinates.
+    /// `row` is screen-relative — see [`Self::start_selection`]'s own doc
+    /// comment.
     pub fn extend_selection(&self, col: usize, row: usize, left_half: bool) {
         let mut term = self.term.lock();
+        let display_offset = term.grid().display_offset();
         if let Some(selection) = term.selection.as_mut() {
-            mouse::extend_selection(selection, col, row, left_half);
+            mouse::extend_selection(selection, col, row, display_offset, left_half);
         }
     }
 

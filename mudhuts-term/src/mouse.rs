@@ -56,23 +56,40 @@ pub fn encode_drag(button: u32, mods: Mods, col: usize, row: usize) -> Vec<u8> {
     encode_button(button + 32, mods, true, col, row)
 }
 
-fn point(col: usize, row: usize) -> Point {
-    Point::new(Line(row as i32), Column(col))
+/// `row` is screen-relative (0 = the top of whatever's currently
+/// visible, matching `pixel_to_cell`'s own contract), but `Selection`'s
+/// `Point`/`Line` is *not* — per `alacritty_terminal`'s own grid module
+/// doc, `Line(0)` is fixed to the top of the live screen regardless of
+/// scroll, and scrolled-into-history content has *negative* `Line`
+/// values; the current viewport only lines up with `Line(0)` when
+/// `display_offset` is `0` (not scrolled back at all). `display_offset`
+/// bridges the two, the same conversion `render.rs`'s own
+/// `line + display_offset` makes in the opposite direction. Missing this
+/// was a real, shipped bug (caught after the fact, not in review): with
+/// no adjustment, dragging a selection while scrolled into history
+/// landed `display_offset` lines below where the cursor actually was,
+/// and the error grew every time the view scrolled further while
+/// dragging.
+fn point(col: usize, row: usize, display_offset: usize) -> Point {
+    Point::new(Line(row as i32 - display_offset as i32), Column(col))
 }
 
 /// Start a new simple (character-granularity) selection anchored at
 /// `(col, row)`. `left_half` indicates which half of the cell was clicked,
 /// which affects selection boundary precision (matches how real terminals
-/// behave when you start dragging from partway into a cell).
-pub fn start_selection(col: usize, row: usize, left_half: bool) -> Selection {
+/// behave when you start dragging from partway into a cell). `row` and
+/// `display_offset` are both screen-relative — see `point`'s own doc
+/// comment.
+pub fn start_selection(col: usize, row: usize, display_offset: usize, left_half: bool) -> Selection {
     let side = if left_half { Side::Left } else { Side::Right };
-    Selection::new(SelectionType::Simple, point(col, row), side)
+    Selection::new(SelectionType::Simple, point(col, row, display_offset), side)
 }
 
-/// Extend an in-progress selection to `(col, row)`.
-pub fn extend_selection(selection: &mut Selection, col: usize, row: usize, left_half: bool) {
+/// Extend an in-progress selection to `(col, row)` — see `point`'s own
+/// doc comment for `display_offset`.
+pub fn extend_selection(selection: &mut Selection, col: usize, row: usize, display_offset: usize, left_half: bool) {
     let side = if left_half { Side::Left } else { Side::Right };
-    selection.update(point(col, row), side);
+    selection.update(point(col, row, display_offset), side);
 }
 
 #[cfg(test)]
@@ -192,12 +209,29 @@ mod tests {
     fn selection_start_and_extend_produce_a_range() {
         // Smoke test of the thin Selection wrapper against a real Term via
         // alacritty_terminal's own test helper, mostly to catch a
-        // Line/Column mixup in `point()`.
+        // Line/Column mixup in `point()`. Not scrolled (`display_offset`
+        // 0), so screen row and grid line coincide.
         let term = alacritty_terminal::term::test::mock_term("hello\nworld");
-        let mut selection = start_selection(0, 0, true);
-        extend_selection(&mut selection, 4, 0, false);
+        let mut selection = start_selection(0, 0, 0, true);
+        extend_selection(&mut selection, 4, 0, 0, false);
         let range = selection.to_range(&term).expect("should produce a range");
         assert_eq!(range.start, Point::new(Line(0), Column(0)));
         assert_eq!(range.end, Point::new(Line(0), Column(4)));
+    }
+
+    #[test]
+    fn point_subtracts_display_offset_from_the_screen_relative_row() {
+        // The exact bug this pins: `row` is screen-relative (0 = top of
+        // the current viewport), but `Point`'s own `Line` isn't — it's
+        // fixed to the live screen regardless of scroll, with history
+        // living at negative lines. Not scrolled: they coincide.
+        assert_eq!(point(0, 5, 0), Point::new(Line(5), Column(0)));
+        // Scrolled 3 lines into history: the same screen row now refers
+        // to a grid line 3 further back than its own row number.
+        assert_eq!(point(0, 5, 3), Point::new(Line(2), Column(0)));
+        // Scrolled back further than the row itself — lands in negative
+        // (historical) grid-line territory, exactly like a real
+        // scrolled-back terminal.
+        assert_eq!(point(0, 2, 5), Point::new(Line(-3), Column(0)));
     }
 }
