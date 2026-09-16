@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="mudhuts_power_button">
+  <copyright>
+    This protocol is part of mudhuts, a from-scratch Wayland compositor.
+    It is not shared with or endorsed by any other project.
+  </copyright>
+
+  <interface name="mudhuts_power_button_manager_v1" version="1">
+    <description summary="get notified of hardware power-button presses">
+      mudhuts never acts on the power button itself while any client holds
+      a mudhuts_power_button_v1 object — deciding what a press (or a held
+      press, or a double press, ...) should do is entirely up to whichever
+      layer-shell client(s) bind this. mudhuts only falls back to its own
+      default action (ending the current session, i.e. a logout — never
+      an immediate poweroff) when *no* client holds one, so a system
+      unaware of the power button at all still fails safe instead of
+      shutting the machine down on a single stray press.
+
+      A hardware power button is also wired into systemd-logind directly
+      (independent of any Wayland client); mudhuts takes logind's
+      handle-power-key inhibitor lock for as long as it's running a real
+      TTY session specifically so logind's own default (an immediate
+      poweroff) never races this protocol's own handling.
+    </description>
+
+    <request name="get_power_button">
+      <description summary="start receiving power-button press/release events">
+        Any client may make this request; there is no ownership limit; every
+        currently-bound mudhuts_power_button_v1 gets every button event.
+      </description>
+      <arg name="id" type="new_id" interface="mudhuts_power_button_v1"/>
+    </request>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy this manager object">
+        Does not affect any mudhuts_power_button_v1 objects already
+        created from it.
+      </description>
+    </request>
+  </interface>
+
+  <interface name="mudhuts_power_button_v1" version="1">
+    <description summary="one client's subscription to power-button events">
+      While this object exists, mudhuts sends it every press and release
+      of the hardware power button and takes no default action of its own
+      on either — entirely this client's call, including whether to act
+      on a bare press at all or wait for some pattern (a hold, a double
+      press, ...) before doing anything.
+    </description>
+
+    <enum name="button_state">
+      <entry name="released" value="0"/>
+      <entry name="pressed" value="1"/>
+    </enum>
+
+    <event name="button">
+      <description summary="the power button was pressed or released">
+        serial is a new serial for this event specifically (usable with
+        requests elsewhere that take a serial, e.g. to grant a session
+        lock, drive a confirmation surface's popup grab, ...); time is the
+        original input event's own millisecond timestamp.
+      </description>
+      <arg name="serial" type="uint"/>
+      <arg name="time" type="uint"/>
+      <arg name="state" type="uint" enum="button_state"/>
+    </event>
+
+    <request name="destroy" type="destructor">
+      <description summary="stop receiving power-button events">
+        Once every client's mudhuts_power_button_v1 has been destroyed,
+        mudhuts resumes handling the power button itself (see
+        mudhuts_power_button_manager_v1's own description) starting with
+        the next press — a press already in progress (pressed sent, no
+        matching released yet) when the last one is destroyed is not
+        retroactively handled.
+      </description>
+    </request>
+  </interface>
+</protocol>
