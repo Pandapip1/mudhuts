@@ -14,3 +14,7 @@ tempfile = "3"
 memmap2 = "0.9"
 png = "0.17"
 pipewire = "0.10"
+# For `config.rs`/`settings.rs`'s `[appearance]` section — same versions
+# `mudhuts`'s own config readers use.
+serde = { version = "1", features = ["derive"] }
+toml = "1"

@@ -24,6 +24,7 @@
 //! Settings/Screenshot/ScreenCast to this backend while leaving
 //! FileChooser (and anything else) to an existing GTK/KDE portal backend.
 
+mod config;
 mod pipewire_stream;
 mod screencast;
 mod screenshot;
@@ -72,7 +73,16 @@ async fn main() -> ExitCode {
 }
 
 async fn start_service(job_tx: mpsc::UnboundedSender<wayland::Job>) -> zbus::Result<zbus::Connection> {
-    let settings = settings::SettingsBackend::new();
+    // `read_config_file` does blocking file I/O directly on whatever
+    // tokio worker thread runs this task — `spawn_blocking` keeps a
+    // slow/hung filesystem (a network home directory, a degraded disk)
+    // from stalling that thread (and with it, D-Bus service
+    // registration) instead of just this one read (caught in review).
+    let config_file = tokio::task::spawn_blocking(config::read_config_file).await.unwrap_or_else(|err| {
+        tracing::error!("mudhuts-portal: config-reading task panicked (using defaults): {err}");
+        config::ConfigFileContents { contents: String::new(), source: String::new() }
+    });
+    let settings = settings::SettingsBackend::load(&config_file);
     let screencast = screencast::ScreenCastBackend::new(job_tx.clone());
     let screenshot = screenshot::ScreenshotBackend::new(job_tx);
 
