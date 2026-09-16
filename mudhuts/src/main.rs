@@ -13,10 +13,12 @@ mod handlers;
 mod console_hut;
 mod input;
 mod keybindings;
+mod logind;
 mod main_window;
 mod malloc;
 mod ownership;
 mod perf_config;
+mod power_config;
 mod redraw;
 mod render;
 mod rt_sched;
@@ -155,6 +157,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // session/service granted the needed capability/limit.
         if state.perf_config.sched_fifo {
             rt_sched::apply(state.perf_config.sched_fifo_priority);
+        }
+        // Same real-session gating as the two above, for the same
+        // reason as both: a nested dev/test instance isn't the seat
+        // logind's power-key handling applies to. Gated a second time on
+        // `[power] inhibit-power-key` (default on) — see
+        // `power_config.rs`'s own doc comment for the one real tradeoff
+        // this makes. `spawn_power_key_inhibitor` returns immediately
+        // (see its own doc comment for why this isn't a blocking D-Bus
+        // round trip on the startup path); it owns the inhibitor fd's
+        // lifetime itself from here on, nothing to keep bound in `run`'s
+        // own scope.
+        if state.power_config.inhibit_power_key {
+            logind::spawn_power_key_inhibitor();
         }
         udev_backend::init_udev(&mut event_loop, &mut state, redraw_ping_source)?;
     } else {

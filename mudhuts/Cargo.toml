@@ -15,6 +15,23 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-journald = "0.3"
 xcursor = "0.3.3"
+# Only for `logind.rs`'s one-shot `handle-power-key` inhibitor call, made
+# with the blocking API since mudhuts' own event loop is calloop-driven,
+# not tokio. `blocking-api` alone doesn't compile — zbus's own `lib.rs`
+# hard-requires `async-io` or `tokio` too (a `compile_error!` otherwise,
+# which `cargo build -p mudhuts` specifically hits, even though a whole-
+# workspace build happens to paper over it via feature unification with
+# `mudhuts-portal`'s own `tokio` feature — caught in review). `async-io`,
+# not `tokio`: `mudhuts-portal` already needs a real async executor
+# (`tokio`) for its D-Bus service loop, but a whole-workspace build
+# unifies zbus's features across every crate that depends on it
+# regardless of which one mudhuts itself picks — so this can't actually
+# avoid a second executor stack building at all in that case, only in the
+# `-p mudhuts`-only build, where `async-io` (lighter than `tokio`) is the
+# smaller of the two to pull in just to satisfy the compile-time gate.
+# Version still matches `mudhuts-portal`'s own dependency to avoid
+# building two `zbus` versions.
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
 smithay-drm-extras = { git = "https://github.com/Smithay/smithay.git", rev = "4cf0b62028039661477d482ec4758b687d8f4392", default-features = false }
 
 [dependencies.smithay]

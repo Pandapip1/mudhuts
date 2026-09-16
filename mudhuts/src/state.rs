@@ -13,12 +13,12 @@ use smithay::output::Output;
 use smithay::reexports::calloop::channel::Sender;
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::ping::Ping;
-use smithay::reexports::calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction};
+use smithay::reexports::calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction, RegistrationToken};
 use smithay::reexports::wayland_protocols::ext::session_lock::v1::server::ext_session_lock_v1::ExtSessionLockV1;
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Display, DisplayHandle};
-use smithay::utils::{Logical, Physical, Point, Rectangle, Size};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Size, SERIAL_COUNTER};
 use smithay::wayland::compositor::{CompositorClientState, CompositorState};
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
@@ -146,6 +146,7 @@ pub struct State {
     pub theme: crate::theme::Theme,
     pub chrome_config: crate::chrome_config::ChromeConfig,
     pub perf_config: crate::perf_config::PerfConfig,
+    pub power_config: crate::power_config::PowerConfig,
     /// Whether the combined Hut-level + Main-Window tab strip is
     /// currently revealed — only meaningful while
     /// `chrome_config.auto_hide_tab_strip` is on, and only ever true for
@@ -425,6 +426,47 @@ pub struct State {
     /// doc for the trust model this establishes.
     pub authority_token: String,
 
+    /// Every currently-bound `mudhuts_power_button_v1` object (see
+    /// `handlers/power_button.rs` and
+    /// `mudhuts-protocols/protocol/mudhuts-power-button.xml`) — a client
+    /// (a layer-shell system-UI surface) that wants to decide for itself
+    /// what a power-button press means, rather than mudhuts' own default
+    /// (see [`Self::notify_power_button`]). Pushed to on
+    /// `get_power_button`, pruned on `destroyed`.
+    pub power_button_objects: Vec<mudhuts_protocols::server::mudhuts_power_button_v1::MudhutsPowerButtonV1>,
+
+    /// Whether the current power-button press has actually been reported
+    /// to at least one bound object as `Pressed` — see
+    /// [`Self::notify_power_button`]'s own doc comment for why a
+    /// matching `Released` is only ever sent when this is `true`.
+    /// `pub(crate)`: also reset directly by `handlers/power_button.rs`'s
+    /// `destroyed` the moment the last bound object disconnects, so a
+    /// stale `true` from some earlier client's press can't leak into a
+    /// later client's own, unrelated one — see that reset's own doc
+    /// comment.
+    pub(crate) power_button_pressed_reported: bool,
+
+    /// The pending "commit to logging out" timer for a power-button press
+    /// currently held past `input.rs`'s hold threshold with no
+    /// `mudhuts_power_button_v1` client bound — see
+    /// `input.rs::start_power_button_hold_timer`'s own doc comment.
+    /// `None` whenever no such press is in progress: not currently held,
+    /// released before the threshold (canceled), or a bound client is
+    /// handling it itself instead of mudhuts' own fallback.
+    pub power_button_hold_timer: Option<RegistrationToken>,
+
+    /// The raw keycode currently auto-repeating into mudhuts' own
+    /// terminal (see `input.rs::start_terminal_repeat`'s own doc
+    /// comment for why this has to be hand-rolled at all), or `None` if
+    /// no key is. Only ever one at a time — matches real keyboard/xkb
+    /// repeat behavior, where pressing a second key takes over from
+    /// whatever was repeating before it.
+    pub terminal_repeat_keycode: Option<u32>,
+
+    /// The pending timer driving `terminal_repeat_keycode`'s repeat, if
+    /// any.
+    pub terminal_repeat_timer: Option<RegistrationToken>,
+
     /// Wakes up the winit backend's redraw handler (see `winit_backend.rs`,
     /// the only place that owns the actual window handle needed to call
     /// its `request_redraw()`) from anywhere else that changes something
@@ -501,6 +543,18 @@ fn usable_area_logical_for_output(output: &Output) -> Rectangle<i32, Logical> {
     layer_map_for_output(output).non_exclusive_zone()
 }
 
+/// Key-repeat delay (ms) and rate (repeats/sec) for the seat's keyboard —
+/// what `wl_keyboard.repeat_info` tells real Wayland clients to use for
+/// their own repeat, and also what `input.rs`'s `TERMINAL_REPEAT_DELAY`/
+/// `TERMINAL_REPEAT_INTERVAL` derive from for mudhuts' own built-in
+/// terminal (which isn't a real Wayland client with a repeat timer of
+/// its own — see that constant's doc comment for why it needs one by
+/// hand). One shared source of truth rather than two independently
+/// hardcoded copies, so the two can't silently drift apart (caught in
+/// review).
+pub(crate) const KEY_REPEAT_DELAY_MS: i32 = 200;
+pub(crate) const KEY_REPEAT_RATE_HZ: i32 = 25;
+
 impl State {
     /// `socket` must already be listening (see [`create_socket`]) — created
     /// separately so `main` can export `WAYLAND_DISPLAY` for the ConsoleHut's
@@ -508,7 +562,7 @@ impl State {
     /// rather than after, which would leave it pointed at whatever
     /// compositor mudhuts itself is nested in.
     pub fn new(
-        event_loop: &mut EventLoop<Self>,
+        event_loop: &mut EventLoop<'static, Self>,
         display: Display<Self>,
         stack: GraphStack,
         socket: (ListeningSocketSource, OsString),
@@ -537,6 +591,10 @@ impl State {
             2,
             smithay::wayland::GlobalData,
         );
+        dh.create_global::<Self, mudhuts_protocols::server::mudhuts_power_button_manager_v1::MudhutsPowerButtonManagerV1, _>(
+            1,
+            smithay::wayland::GlobalData,
+        );
         let foreign_toplevel_list_state = ForeignToplevelListState::new::<Self>(&dh);
         let layer_shell_state = WlrLayerShellState::new::<Self>(&dh);
         let keyboard_shortcuts_inhibit_state = KeyboardShortcutsInhibitState::new::<Self>(&dh);
@@ -556,14 +614,14 @@ impl State {
 
         let mut seat_state = SeatState::new();
         let mut seat: Seat<Self> = seat_state.new_wl_seat(&dh, "mudhuts");
-        seat.add_keyboard(Default::default(), 200, 25)?;
+        seat.add_keyboard(Default::default(), KEY_REPEAT_DELAY_MS, KEY_REPEAT_RATE_HZ)?;
         seat.add_pointer();
 
         let (listening_socket, socket_name) = socket;
         Self::init_wayland_listener(display, event_loop, listening_socket)?;
         let loop_signal = event_loop.get_signal();
 
-        // Read once, shared by all four `*Config::load()`s below —
+        // Read once, shared by every `*Config::load()` below —
         // see `crate::config::read_config_file`'s own doc comment for
         // why that function itself doesn't cache this.
         let config_file = crate::config::read_config_file();
@@ -593,6 +651,7 @@ impl State {
             theme: crate::theme::Theme::load(&config_file),
             chrome_config: crate::chrome_config::ChromeConfig::load(&config_file),
             perf_config: crate::perf_config::PerfConfig::load(&config_file),
+            power_config: crate::power_config::PowerConfig::load(&config_file),
             tab_strip_revealed: false,
             output_size: (0, 0),
             text_selecting: false,
@@ -625,6 +684,11 @@ impl State {
             pending_lock_confirmed_outputs: Vec::new(),
             lock_backdrop_id: Id::new(),
             authority_token,
+            power_button_objects: Vec::new(),
+            power_button_pressed_reported: false,
+            power_button_hold_timer: None,
+            terminal_repeat_keycode: None,
+            terminal_repeat_timer: None,
             redraw_ping,
         })
     }
@@ -641,6 +705,42 @@ impl State {
     /// `State` itself — see that module's doc comment.
     pub fn redraw_handle(&self) -> crate::redraw::RedrawHandle {
         crate::redraw::RedrawHandle::new(self.redraw_ping.clone())
+    }
+
+    /// Forward one power-button press/release to every bound
+    /// `mudhuts_power_button_v1` object (see `handlers/power_button.rs`),
+    /// and report back whether there was at least one to forward to.
+    /// `input.rs`'s power-button handling only falls back to mudhuts' own
+    /// default action (a logout, never an immediate poweroff — see
+    /// `mudhuts-protocols/protocol/mudhuts-power-button.xml`'s
+    /// `mudhuts_power_button_manager_v1` doc) when this returns `false`:
+    /// as soon as any client cares enough to bind the protocol, deciding
+    /// what a press means becomes entirely its call.
+    ///
+    /// A `Released` is only ever actually sent if a matching `Pressed`
+    /// for the *same* press was already reported — tracked via
+    /// `power_button_pressed_reported`, not just "is `power_button_
+    /// objects` non-empty right now". Without this, a client that binds
+    /// only *after* a press already began (no client was bound yet when
+    /// it started) would get a bare `Released` with no `Pressed` of its
+    /// own ever having preceded it — a real, if narrow, protocol
+    /// inconsistency a client's own press/release state machine could
+    /// choke on (caught in review).
+    pub fn notify_power_button(&mut self, pressed: bool, time_msec: u32) -> bool {
+        if self.power_button_objects.is_empty() || (!pressed && !self.power_button_pressed_reported) {
+            return false;
+        }
+        let serial: u32 = SERIAL_COUNTER.next_serial().into();
+        let button_state = if pressed {
+            mudhuts_protocols::server::mudhuts_power_button_v1::ButtonState::Pressed
+        } else {
+            mudhuts_protocols::server::mudhuts_power_button_v1::ButtonState::Released
+        };
+        for object in &self.power_button_objects {
+            object.button(serial, time_msec, button_state);
+        }
+        self.power_button_pressed_reported = pressed;
+        true
     }
 
     /// Route a `TermEvent` from one of The Stack's Huts (identified by

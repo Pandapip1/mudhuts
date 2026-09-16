@@ -1,6 +1,7 @@
 pub(crate) mod capture;
 mod compositor;
 pub(crate) mod layer_shell;
+pub(crate) mod power_button;
 mod session_lock;
 pub(crate) mod shell;
 pub(crate) mod xdg_shell;

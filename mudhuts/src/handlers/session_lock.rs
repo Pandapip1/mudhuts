@@ -70,6 +70,13 @@ impl SessionLockHandler for State {
         }
         self.accepted_lock = Some(confirmation.ext_session_lock().clone());
         self.locked = true;
+        // A key already auto-repeating into the terminal (`input.rs`'s
+        // `start_terminal_repeat`) would otherwise keep injecting
+        // keystrokes behind the (correctly blanked) lock screen — its
+        // own release event goes to `process_locked_input_event` now,
+        // not the closure that would normally cancel this. See
+        // `cancel_terminal_repeat`'s own doc comment.
+        self.cancel_terminal_repeat();
         // Stale lock surfaces from some previous lock session shouldn't
         // still be showing (there shouldn't be any, since `unlock` always
         // clears this too, but staying defensive rather than assuming).

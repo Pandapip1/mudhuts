@@ -8,6 +8,8 @@ use smithay::backend::input::{
 use smithay::desktop::layer_map_for_output;
 use smithay::input::keyboard::{FilterResult, KeysymHandle, ModifiersState, keysyms};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
+use smithay::reexports::calloop::RegistrationToken;
+use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Physical, Point, Rectangle, SERIAL_COUNTER, Scale, Serial};
 use smithay::wayland::keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitorSeat;
@@ -18,6 +20,50 @@ use smithay::wayland::shell::wlr_layer::{KeyboardInteractivity, Layer as WlrLaye
 use crate::State;
 use crate::keybindings::Action;
 use crate::{chrome, docks, village_chrome};
+
+/// `KEY_POWER` (116, from `linux/input-event-codes.h`) with the fixed
+/// +8 offset every evdev-derived [`smithay::backend::input::Keycode`]
+/// carries under xkbcommon's numbering — see
+/// `smithay::backend::libinput`'s own `KeyboardKeyEvent::key_code` impl,
+/// which builds every `Keycode` as `self.key() + 8`. That's exactly the
+/// numbering `event.key_code()` already returns everywhere else in this
+/// file, so no separate conversion is needed at the one call site below
+/// that compares against this constant.
+const POWER_KEYCODE: u32 = 116 + 8;
+
+/// How long the power button has to stay held, with no
+/// `mudhuts_power_button_v1` client bound, before mudhuts' own logout
+/// fallback actually commits — see `State::start_power_button_hold_timer`'s
+/// own doc comment for why a bare press isn't enough on its own. Matches
+/// the ballpark most hardware power buttons already use for a held
+/// press to mean something (real shutdown UIs on other OSes are
+/// typically in the 1-4s range) — not config-driven: this is a safety
+/// margin against an accidental brush/bump, not a preference anyone
+/// would want to tune per-machine.
+const POWER_BUTTON_HOLD: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// The delay before mudhuts' own terminal starts auto-repeating a held
+/// key, and the interval between repeats after that — derived from
+/// `state.rs`'s `KEY_REPEAT_DELAY_MS`/`KEY_REPEAT_RATE_HZ` (the same
+/// numbers `seat.add_keyboard` configures, and that real Wayland clients
+/// are told via `wl_keyboard.repeat_info` to implement their own repeat
+/// with), so the two can't silently drift apart the way two independent
+/// hardcoded copies could. mudhuts' own terminal isn't a real Wayland
+/// client with its own repeat timer, though — nothing else in this
+/// codebase does anything with a held key beyond the one real hardware
+/// press event libinput/evdev itself ever sends (real keyboard hardware/
+/// evdev does not resend "pressed" on its own for a held key — repeat is
+/// always synthesized by whoever's listening), so without a hand-rolled
+/// timer here, holding a key (an arrow key, backspace, ...) only ever
+/// sends one keystroke no matter how long it's held — a real, reported
+/// gap. No public getter exists on
+/// `smithay::input::keyboard::KeyboardHandle` for the values already
+/// configured via `add_keyboard`, hence deriving fresh `Duration`s here
+/// rather than reading them back live.
+const TERMINAL_REPEAT_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(crate::state::KEY_REPEAT_DELAY_MS as u64);
+const TERMINAL_REPEAT_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(1000 / crate::state::KEY_REPEAT_RATE_HZ as u64);
 
 /// Mime types mudhuts advertises for every selection it sets itself
 /// (clipboard or primary) — it only ever offers plain text, so this fixed
@@ -1020,6 +1066,173 @@ impl State {
         }
     }
 
+    /// Arms (or, if one's already pending, re-arms) the power-button
+    /// hold-to-logout timer — see [`POWER_BUTTON_HOLD`]. Only ever called
+    /// when no `mudhuts_power_button_v1` client is bound (a bound client
+    /// gets the raw press/release events instead and decides for itself
+    /// whether a bare press, a hold, a double press, ... means anything —
+    /// see `mudhuts-power-button.xml`'s own doc), so this is entirely
+    /// mudhuts' own fallback's problem to solve.
+    ///
+    /// A bare, undebounced press used to call `loop_signal.stop()`
+    /// immediately — a real regression review caught: with no client
+    /// implementing this protocol yet (true for every build today), any
+    /// brief/accidental power-button actuation (bag compression, a stray
+    /// brush) instantly and ungracefully ended the whole session, no
+    /// confirmation, no chance to let go and stop it. Requiring a real
+    /// hold closes that while keeping the *design intent* of the
+    /// fallback itself (fail toward a graceful logout, not immediately
+    /// disruptive) actually true of the immediate, no-client-bound case
+    /// too, not just the "some other client is racing logind" case that
+    /// motivated the fallback's existence in the first place.
+    fn start_power_button_hold_timer(&mut self) {
+        self.cancel_power_button_hold_timer();
+        let timer = Timer::from_duration(POWER_BUTTON_HOLD);
+        match self.arm_timer(timer, "power-button hold", |_deadline, (), state| {
+            state.power_button_hold_timer = None;
+            // Re-checked here, not just at press time: a client can bind
+            // `mudhuts_power_button_v1` *while* this timer is pending
+            // (e.g. a power-menu UI that was still starting up when the
+            // press began) — without this, the timer would still fire
+            // and force a logout even though a client is now bound and
+            // presumably handling the button itself, the exact surprise-
+            // logout regression this feature exists to prevent, just
+            // triggered by a late bind instead of a bare tap (caught in
+            // review).
+            if state.power_button_objects.is_empty() {
+                tracing::info!(
+                    "power button held for {POWER_BUTTON_HOLD:?} with no mudhuts_power_button_v1 \
+                     client bound, logging out"
+                );
+                state.loop_signal.stop();
+            }
+            TimeoutAction::Drop
+        }) {
+            Some(token) => self.power_button_hold_timer = Some(token),
+            // `arm_timer` already logged why — staying panic-free means
+            // falling back to the old immediate-stop behavior rather
+            // than silently doing nothing at all if arming somehow
+            // failed.
+            None => self.loop_signal.stop(),
+        }
+    }
+
+    /// Inserts `timer` with `callback`, returning its token — or `None`,
+    /// after logging that arming the `what`-named timer failed at
+    /// `warn`, if the insert itself somehow fails (shouldn't happen —
+    /// inserting a fresh `Timer` into a live event loop has no real
+    /// failure mode short of the loop itself being gone). Shared by
+    /// [`Self::start_power_button_hold_timer`]/
+    /// [`Self::start_terminal_repeat`], which otherwise hand-rolled this
+    /// identically (caught in review) — each still owns its own success/
+    /// failure follow-up, since those genuinely differ (which field
+    /// stores the token, what happens instead if arming failed).
+    fn arm_timer(
+        &mut self,
+        timer: Timer,
+        what: &str,
+        callback: impl FnMut(std::time::Instant, &mut (), &mut State) -> TimeoutAction + 'static,
+    ) -> Option<RegistrationToken> {
+        match self.stack.loop_handle().insert_source(timer, callback) {
+            Ok(token) => Some(token),
+            Err(err) => {
+                tracing::warn!("failed to arm the {what} timer: {err}");
+                None
+            }
+        }
+    }
+
+    /// Cancels a pending power-button hold timer, if one exists — the
+    /// button was released (or a client bound in the meantime) before
+    /// [`POWER_BUTTON_HOLD`] elapsed, so there's nothing left to commit
+    /// to. A harmless no-op if none is pending.
+    fn cancel_power_button_hold_timer(&mut self) {
+        if let Some(token) = self.power_button_hold_timer.take() {
+            self.stack.loop_handle().remove(token);
+        }
+    }
+
+    /// Arms (replacing any already-pending one) the terminal auto-repeat
+    /// timer for `keycode` — see [`TERMINAL_REPEAT_DELAY`]'s own doc
+    /// comment for why this needs to exist by hand at all. `bytes` is
+    /// exactly what the initial press already encoded and wrote, and is
+    /// what every repeat resends unchanged — not re-derived from a fresh
+    /// xkb lookup each tick, since `encode`'s own `KeysymHandle` borrows
+    /// the live keymap and can't be stored past the call that produced
+    /// it. What a key encodes to essentially never changes while it's
+    /// held, so this loses nothing real in practice.
+    fn start_terminal_repeat(&mut self, keycode: u32, bytes: Vec<u8>) {
+        self.cancel_terminal_repeat();
+        self.terminal_repeat_keycode = Some(keycode);
+        // Captured now, not re-resolved as "whichever Hut is focused" at
+        // each tick — a global keybinding (`StackNext`/`TabNext`/...)
+        // can change focus to a *different* ConsoleHut mid-repeat
+        // without ever canceling it (nothing calls
+        // `cancel_terminal_repeat` from those, deliberately — see
+        // `start_terminal_repeat`'s own call site), and if that other
+        // Hut also happens to be showing its own terminal, checking only
+        // "is the terminal the active view" would pass and silently type
+        // the held key into the *wrong* Hut instead of stopping (caught
+        // in review — an earlier version did exactly this).
+        let hut_id = self.stack.focused().id;
+        let timer = Timer::from_duration(TERMINAL_REPEAT_DELAY);
+        match self.arm_timer(timer, "terminal key-repeat", move |_deadline, (), state| {
+            // Re-checked on every tick, not just when arming: stop
+            // rather than writing into the wrong place the moment any
+            // condition stops holding — this specific Hut is no longer
+            // the focused one (a Stack/Tab switch happened), the
+            // terminal isn't its active view anymore (it opened/switched
+            // to a Main Window), or the session is locked/an exclusive
+            // layer-shell surface has taken over input (a lock screen,
+            // say) — the physical key-release event that would normally
+            // cancel this goes to `process_locked_input_event`/straight
+            // to that surface instead of the closure that calls
+            // `cancel_terminal_repeat`, so without this check here too a
+            // key already repeating when the lock/exclusive surface
+            // appears would otherwise keep injecting keystrokes into the
+            // backgrounded terminal indefinitely, invisibly, even past
+            // unlock (caught in review — a real, security-relevant gap;
+            // `handlers/session_lock.rs`'s `lock()` also cancels this
+            // directly, for immediate effect rather than waiting up to
+            // one tick).
+            if state.stack.focused().id == hut_id
+                && state.focused_showing_terminal_effective()
+                && !state.locked
+                && state.exclusive_layer_surface().is_none()
+            {
+                let hut = state.stack.focused_mut();
+                hut.terminal.write_input(bytes.clone());
+                hut.mark_touched();
+                TimeoutAction::ToDuration(TERMINAL_REPEAT_INTERVAL)
+            } else {
+                state.terminal_repeat_keycode = None;
+                TimeoutAction::Drop
+            }
+        }) {
+            Some(token) => self.terminal_repeat_timer = Some(token),
+            // `arm_timer` already logged why — losing repeat for this
+            // one key press is a far smaller failure than panicking
+            // over it.
+            None => self.terminal_repeat_keycode = None,
+        }
+    }
+
+    /// Cancels the pending terminal auto-repeat timer, if any — a
+    /// harmless no-op otherwise. `pub(crate)`: also called directly from
+    /// `handlers/session_lock.rs`'s `lock()`, for immediate effect the
+    /// moment a session locks rather than waiting up to one repeat tick
+    /// for the re-check inside `start_terminal_repeat`'s own timer
+    /// callback to catch it (see that check's own doc comment for the
+    /// real bug this closes — a key already repeating when the lock/an
+    /// exclusive layer-shell surface appears otherwise kept injecting
+    /// keystrokes into the backgrounded terminal indefinitely).
+    pub(crate) fn cancel_terminal_repeat(&mut self) {
+        self.terminal_repeat_keycode = None;
+        if let Some(token) = self.terminal_repeat_timer.take() {
+            self.stack.loop_handle().remove(token);
+        }
+    }
+
     /// The only sanctioned entry point for a real input event — thin on
     /// purpose. [`Self::process_input_event_unsynced`] (private, can't be
     /// reached any other way from outside this module) does the actual
@@ -1042,6 +1255,41 @@ impl State {
     }
 
     fn process_input_event_unsynced<I: InputBackend>(&mut self, event: InputEvent<I>) {
+        // Checked before even the locked-session short-circuit just
+        // below: real hardware keeps responding to its power button
+        // regardless of screen-lock state, so this has to sit above
+        // literally everything else this function does, the same reason
+        // `self.locked` itself does. Never fed into the normal keysym
+        // pipeline below (no client sees it as an ordinary key) — only
+        // `mudhuts_power_button_v1` subscribers (`handlers/power_button.rs`)
+        // or mudhuts' own logout fallback (`State::notify_power_button`'s
+        // doc comment) ever act on it.
+        if let InputEvent::Keyboard { event: keyboard_event } = &event
+            && keyboard_event.key_code().raw() == POWER_KEYCODE
+        {
+            let time = Event::time_msec(keyboard_event);
+            let pressed = keyboard_event.state() == KeyState::Pressed;
+            let handled = self.notify_power_button(pressed, time);
+            if pressed {
+                if !handled {
+                    self.start_power_button_hold_timer();
+                }
+            } else {
+                // Released — whether or not it was ever held past the
+                // hold threshold, there's nothing left to commit to.
+                self.cancel_power_button_hold_timer();
+            }
+            // This branch returns before the shared flush at this
+            // function's end below, unlike every other arm — a bound
+            // `mudhuts_power_button_v1` client's queued `button` event
+            // (from `notify_power_button` above) otherwise waits for some
+            // unrelated event to flush the socket, which for a power
+            // button (often driving hold-to-shutdown UI) is real,
+            // user-visible latency (caught in review).
+            let _ = self.display_handle.flush_clients();
+            return;
+        }
+
         if self.locked {
             // Checked before the match below even starts, not threaded
             // into each of its arms individually — see
@@ -1117,6 +1365,21 @@ impl State {
                             data.sync_visible_main_window();
                         }
 
+                        // Releasing the terminal's own currently-
+                        // repeating key stops its repeat — checked
+                        // against the specific keycode, not "any
+                        // release", so releasing an unrelated key (e.g.
+                        // letting go of a held Shift slightly before the
+                        // arrow key it modified) doesn't spuriously
+                        // interrupt a different key's still-active
+                        // repeat. See `start_terminal_repeat`'s own doc
+                        // comment for why this needs to exist at all.
+                        if key_state == KeyState::Released
+                            && data.terminal_repeat_keycode == Some(keycode.raw())
+                        {
+                            data.cancel_terminal_repeat();
+                        }
+
                         // Global keybindings always win, regardless of
                         // whether the terminal or a client window is the
                         // active view — otherwise there'd be no way to
@@ -1148,8 +1411,21 @@ impl State {
                             let hut = data.stack.focused_mut();
                             let mode = hut.terminal.mode();
                             if let Some(bytes) = encode(&keysym, mods, mode) {
-                                hut.terminal.write_input(bytes);
+                                hut.terminal.write_input(bytes.clone());
                                 hut.mark_touched();
+                                // `start_terminal_repeat` itself cancels
+                                // whatever was repeating before arming
+                                // this one, so a genuinely different key
+                                // takes over from whatever came before it
+                                // — matching real single-active-repeat
+                                // keyboard behavior. A bare modifier
+                                // press (Shift alone, say) never reaches
+                                // here at all (`encode` returns `None`
+                                // for it), so pressing/releasing a
+                                // modifier on top of an already-held key
+                                // doesn't spuriously interrupt that key's
+                                // own repeat.
+                                data.start_terminal_repeat(keycode.raw(), bytes);
                             }
                         }
                         FilterResult::Intercept(())

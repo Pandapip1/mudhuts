@@ -250,6 +250,16 @@ impl GraphStack {
         &self.outputs
     }
 
+    /// A cheap clone of the same event-loop handle this `GraphStack` was
+    /// constructed with — `pub(crate)` so other things that need to
+    /// register their own event sources (`input.rs`'s power-button hold/
+    /// terminal-repeat timers) can reuse this one instead of `State`
+    /// keeping an independent second copy of the same handle (caught in
+    /// review — an earlier version did exactly that).
+    pub(crate) fn loop_handle(&self) -> LoopHandle<'static, State> {
+        self.loop_handle.clone()
+    }
+
     pub fn focused_output_index(&self) -> usize {
         self.focused_output
     }
