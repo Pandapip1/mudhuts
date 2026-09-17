@@ -559,6 +559,10 @@ impl Node<RenderEnv> for ConsoleNode {
         self.hut.mark_touched();
     }
 
+    fn on_remove(&mut self) {
+        self.hut.close_all_windows();
+    }
+
     fn resize_to_pixels(&mut self, _graph: &mut Graph<RenderEnv>, _self_id: NodeId, width: i32, height: i32) {
         self.hut.resize_to_pixels(width, height);
     }
@@ -653,6 +657,17 @@ impl<Env> Node<Env> for WaylandClientNode {
             return value;
         }
         PortValue::Content(vec![ContentPiece::Window { window: self.window.clone(), position: Point::from((0, 0)) }])
+    }
+
+    // Not yet reachable through any real `Graph::remove_node` call (this
+    // whole node type is still `#[allow(dead_code)]`), but adding this
+    // now — matching `ConsoleNode::on_remove` — means whichever future
+    // migration step actually wires this in doesn't have to remember to:
+    // `Node::on_remove`'s own doc comment exists specifically because an
+    // opt-in default is easy to forget for exactly this kind of
+    // Window-owning node (caught by review).
+    fn on_remove(&mut self) {
+        crate::console_hut::send_close(&self.window);
     }
 }
 
@@ -841,6 +856,7 @@ mod tests {
     struct LeafNode {
         resolved: std::rc::Rc<std::cell::Cell<bool>>,
         resized: std::rc::Rc<std::cell::Cell<(i32, i32)>>,
+        removed: std::rc::Rc<std::cell::Cell<bool>>,
     }
     const LEAF_OUTPUTS: &[OutputPort] = &[OutputPort { name: "content", kind: PortKind::Content }];
     impl<Env> Node<Env> for LeafNode {
@@ -863,11 +879,18 @@ mod tests {
         fn resize_to_pixels(&mut self, _graph: &mut Graph<Env>, _self_id: NodeId, width: i32, height: i32) {
             self.resized.set((width, height));
         }
+        fn on_remove(&mut self) {
+            self.removed.set(true);
+        }
     }
 
     fn leaf(graph: &mut Graph) -> (NodeId, std::rc::Rc<std::cell::Cell<bool>>) {
         let flag: std::rc::Rc<std::cell::Cell<bool>> = Default::default();
-        let id = graph.add_node(Box::new(LeafNode { resolved: flag.clone(), resized: Default::default() }));
+        let id = graph.add_node(Box::new(LeafNode {
+            resolved: flag.clone(),
+            resized: Default::default(),
+            removed: Default::default(),
+        }));
         (id, flag)
     }
 
@@ -875,8 +898,32 @@ mod tests {
         graph: &mut Graph,
     ) -> (NodeId, std::rc::Rc<std::cell::Cell<(i32, i32)>>) {
         let resized: std::rc::Rc<std::cell::Cell<(i32, i32)>> = Default::default();
-        let id = graph.add_node(Box::new(LeafNode { resolved: Default::default(), resized: resized.clone() }));
+        let id = graph.add_node(Box::new(LeafNode {
+            resolved: Default::default(),
+            resized: resized.clone(),
+            removed: Default::default(),
+        }));
         (id, resized)
+    }
+
+    #[test]
+    fn remove_node_calls_the_node_s_own_on_remove_hook_first() {
+        // The generic mechanism `ConsoleNode::on_remove` (closing out any
+        // tagged-in Main Windows — see `ConsoleHut::close_all_windows`'s
+        // own doc comment) relies on: every `Graph::remove_node` call
+        // must reach it, not just the ones some caller remembers to pair
+        // with a manual cleanup call.
+        let mut graph = Graph::new();
+        let removed: std::rc::Rc<std::cell::Cell<bool>> = Default::default();
+        let id = graph.add_node(Box::new(LeafNode {
+            resolved: Default::default(),
+            resized: Default::default(),
+            removed: removed.clone(),
+        }));
+
+        graph.remove_node(id);
+
+        assert!(removed.get(), "on_remove must run before the node is actually dropped");
     }
 
     #[test]

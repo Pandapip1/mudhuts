@@ -21,7 +21,7 @@ use mudhuts_term::{GlyphCache, TermEvent, Terminal};
 use mudhuts_term::palette::Rgb;
 
 use crate::gpu_term::{GpuTermRenderer, LabelRenderer};
-use crate::main_window::MainWindowEntry;
+use crate::main_window::{Alert, FloatingWindow, MainWindowEntry};
 use crate::redraw::{Redrawable, RedrawHandle, Signal};
 use crate::render::{ChangeTracker, LabelCache};
 use crate::space_element::{HutSpaceElement, synthetic_output};
@@ -582,13 +582,29 @@ impl ConsoleHut {
     /// active tab index the same way [`Self::remove_window`] does.
     /// Doesn't touch `showing_terminal`/redraw bookkeeping itself — the
     /// caller (role assignment) always re-inserts it somewhere else
-    /// immediately, so nothing user-visible actually changes.
-    pub fn take_bare_main_window(&mut self, surface: &WlSurface) -> Option<Window> {
+    /// immediately, so nothing user-visible actually changes about the
+    /// Main Window itself.
+    ///
+    /// Also returns `entry.floating_windows`/`entry.alerts` — anything the
+    /// caller (`handlers/shell.rs`'s `retag_in_stack`) had previously
+    /// tagged as belonging to *this* Main Window — rather than deciding
+    /// their fate here. Whether they should be closed (this Main Window
+    /// is becoming someone *else's* Floating Window/Alert, so it can't
+    /// carry its own nested children along — see
+    /// `close_orphaned_children`'s own doc comment) or reattached
+    /// (a redundant `SetMain`, or a retag whose target didn't resolve —
+    /// either way this Main Window is going right back to being a bare
+    /// Main Window, same as before) depends on which of those the caller
+    /// ends up doing, which isn't decided yet at this point. An earlier
+    /// version of this function always closed them here unconditionally,
+    /// which was correct for the first case but silently closed a
+    /// redundant retag's own untouched children too — caught by review.
+    pub fn take_bare_main_window(&mut self, surface: &WlSurface) -> Option<(Window, Vec<FloatingWindow>, Vec<Alert>)> {
         let idx = self.main_windows.iter().position(|e| e.matches(surface))?;
         let entry = self.main_windows.remove(idx);
         *self.active_main_window =
             crate::hut::shift_active_index_on_removal(*self.active_main_window, idx, self.main_windows.len());
-        Some(entry.window)
+        Some((entry.window, entry.floating_windows, entry.alerts))
     }
 
     /// Find a bare Main Window's entry by surface, mutably — for
@@ -640,12 +656,20 @@ impl ConsoleHut {
     /// the last tab.
     pub fn remove_window(&mut self, surface: &WlSurface) -> bool {
         if let Some(idx) = self.main_windows.iter().position(|e| e.matches(surface)) {
-            self.main_windows.remove(idx);
+            let entry = self.main_windows.remove(idx);
             *self.active_main_window =
                 crate::hut::shift_active_index_on_removal(*self.active_main_window, idx, self.main_windows.len());
             if self.main_windows.is_empty() {
                 *self.showing_terminal = true;
             }
+            // This Main Window's own Floating Windows/Alerts have no
+            // parent left now that it's actually gone (as opposed to
+            // `take_bare_main_window`'s retagging case, where the Main
+            // Window itself persists elsewhere) — see
+            // `close_orphaned_children`'s own doc comment for why
+            // closing them, not silently dropping them, is what this
+            // does.
+            close_orphaned_children(entry.floating_windows, entry.alerts);
             return true;
         }
         for entry in &mut self.main_windows {
@@ -659,6 +683,32 @@ impl ConsoleHut {
             }
         }
         false
+    }
+
+    /// This whole ConsoleHut is going away — called automatically by
+    /// `ConsoleNode::on_remove` right before `Graph::remove_node` actually
+    /// drops it (monitor unplugged, shell process exited, or Alt-Tab
+    /// discarding an untouched entry — every whole-Hut teardown path in
+    /// this codebase, present and future, goes through that one place) —
+    /// so, unlike `remove_window`/`take_bare_main_window`, every Main
+    /// Window it holds is leaving too, not just one. Sends `send_close()`
+    /// to each Main Window's own toplevel (`remove_window`/
+    /// `take_bare_main_window` never need to — there the Main Window is
+    /// either already destroyed or persisting elsewhere) and, for each
+    /// entry's own Floating Windows/Alerts, reuses `close_orphaned_children`
+    /// (see its own doc comment for why closing, not silently dropping, is
+    /// what every teardown path here does). Found missing — this
+    /// ConsoleHut's whole `main_windows` list was still just dropping via
+    /// plain `Drop` on every whole-Hut path — by a review pass after
+    /// `remove_window`/`take_bare_main_window` were fixed on their own;
+    /// wiring it through `Node::on_remove` instead of one manual call per
+    /// removal site came only after review caught *that* fix itself
+    /// missing two, then a third, of those call sites in turn.
+    pub fn close_all_windows(&mut self) {
+        for entry in self.main_windows.drain(..) {
+            send_close(&entry.window);
+            close_orphaned_children(entry.floating_windows, entry.alerts);
+        }
     }
 
     /// Meta+Right/Left within this ConsoleHut: cycle the active Main Window tab.
@@ -676,10 +726,23 @@ impl ConsoleHut {
         };
     }
 
-    /// Whether this ConsoleHut has ever received a keystroke since it was
-    /// spawned — see the `touched` field doc.
+    /// Whether this ConsoleHut is safe to silently discard as a disposable,
+    /// never-really-used placeholder — the thing `GraphStack::advance_forward`/
+    /// `advance_backward`'s Alt-Tab MRU discard rule actually needs (see
+    /// `Node::touched`'s own doc comment). Also `true` whenever this
+    /// ConsoleHut is hosting any tagged-in client Main Window
+    /// (`main_windows`), not just when its own raw terminal has ever
+    /// received a keystroke (the `touched` field, set by `mark_touched`):
+    /// `push_main_window` never calls `mark_touched` (tagging a window in
+    /// isn't "typing into the terminal"), so a Hut hosting only client
+    /// GUI windows the user genuinely interacted with — never its raw
+    /// terminal — used to look exactly like an idle, disposable scratch
+    /// console to this check, and got silently discarded (a leak before
+    /// `close_all_windows` existed, an unwanted forced close of a live
+    /// app during ordinary Alt-Tab navigation after — caught by review of
+    /// that very fix).
     pub fn touched(&self) -> bool {
-        self.touched
+        self.touched || !self.main_windows.is_empty()
     }
 
     /// Whatever [`Self::redraw`] last produced, without triggering a new
@@ -897,6 +960,44 @@ impl ConsoleHut {
     }
 }
 
+/// `ToplevelSurface::send_close` on `window`'s toplevel, if it has one —
+/// the same mechanism `input.rs`'s `Action::CloseFocused` already uses.
+/// Shared by `close_all_windows` and `close_orphaned_children` so the "ask
+/// nicely instead of just dropping" mechanism lives in exactly one place
+/// (three near-identical call sites, caught by review). `pub(crate)`, not
+/// private — `graph_nodes.rs`'s `WaylandClientNode::on_remove` needs the
+/// exact same one-liner for its own `Window`, and duplicating it there
+/// instead of reusing this was itself caught by a later review round.
+pub(crate) fn send_close(window: &Window) {
+    if let Some(toplevel) = window.toplevel() {
+        toplevel.send_close();
+    }
+}
+
+/// Asks every given Floating Window/Alert's client to close itself rather
+/// than just letting the `Vec`s — and the `Window`s in them — drop
+/// silently. Used wherever a Main Window entry stops existing in its
+/// current form (`ConsoleHut::remove_window`'s client-destroyed case,
+/// `close_all_windows`'s whole-Hut teardown, `handlers/shell.rs`'s
+/// `retag_in_stack` when a bare Main Window's own children can't come
+/// along because it's becoming someone *else's* Floating Window/Alert)
+/// with no way to carry its own tagged children along: a plain drop would
+/// leave each child's client connection alive but permanently untracked —
+/// never mapped into any `space` again, never focusable, never told to
+/// close — which is strictly worse than asking it to exit, even though a
+/// well-behaved client closing in response is not instantaneous (caught
+/// during a keyboard-focus regression review, not fixed until now).
+/// `pub(crate)`, not private — `retag_in_stack` needs to call this itself
+/// now that `take_bare_main_window` no longer decides this on its own.
+pub(crate) fn close_orphaned_children(floating_windows: Vec<FloatingWindow>, alerts: Vec<Alert>) {
+    for floating in floating_windows {
+        send_close(&floating.window);
+    }
+    for alert in alerts {
+        send_close(&alert.window);
+    }
+}
+
 impl Redrawable for ConsoleHut {
     /// The leaf case `Hut::attach_redraw_handle` recurses into — see that
     /// method's doc comment. Reaches every one of this ConsoleHut's own
@@ -919,6 +1020,36 @@ mod tests {
 
     fn new_hut() -> ConsoleHut {
         ConsoleHut::spawn(std::iter::empty(), 1.0).unwrap().0
+    }
+
+    #[test]
+    fn close_all_windows_drains_every_main_window_including_its_own_floating_children() {
+        let mut hut = new_hut();
+        let [(a, a_fth), (b, b_fth), (c, _)] = spawn_test_windows(3).try_into().ok().unwrap();
+        let b_surface = surface_of(&b);
+        hut.push_main_window(a, true, a_fth);
+        hut.push_main_window(b, false, b_fth);
+        hut.find_main_window_mut(&b_surface).unwrap().floating_windows.push(FloatingWindow::new(c));
+
+        hut.close_all_windows();
+
+        assert_eq!(hut.main_window_count(), 0, "every Main Window must be gone");
+    }
+
+    #[test]
+    fn a_tagged_in_main_window_counts_as_touched_even_with_an_untyped_terminal() {
+        // See `touched`'s own doc comment: `push_main_window` never calls
+        // `mark_touched` (tagging a window in isn't "typing into the
+        // terminal"), so without this, a Hut hosting only a live client
+        // GUI window looked exactly like an idle scratch console to
+        // `GraphStack::advance_forward`/`advance_backward`'s Alt-Tab
+        // discard rule — silently destroying it during ordinary
+        // navigation. Caught by review.
+        let mut hut = new_hut();
+        assert!(!hut.touched(), "a bare, never-typed-into terminal starts out untouched");
+        let [(a, a_fth)] = spawn_test_windows(1).try_into().ok().unwrap();
+        hut.push_main_window(a, true, a_fth);
+        assert!(hut.touched(), "a live tagged-in Main Window must never look disposable");
     }
 
     #[test]

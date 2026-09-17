@@ -967,7 +967,30 @@ impl State {
                     self.stack.preview_next()
                 };
                 if let Err(err) = result {
-                    tracing::error!("failed to advance the ConsoleHut stack: {err}");
+                    // `GraphStack::advance_forward` itself already
+                    // swallows a `spawn_and_insert` failure internally in
+                    // every branch where it's actually recoverable
+                    // (walking off the end of a healthy list, or
+                    // discarding a frontier entry while others survive) —
+                    // logging and quietly not advancing rather than
+                    // propagating. The *only* path still reaching here is
+                    // its very first `self.out().is_empty()` guard, which
+                    // means this output's `huts` list is genuinely
+                    // empty — the same broken invariant `state.rs`'s
+                    // shell-exit-respawn-failure handling treats as
+                    // fatal. `sync_visible_main_window` below indexes
+                    // into that list unconditionally, so running it here
+                    // would panic instead of the controlled shutdown a
+                    // stop-in-progress compositor should get (caught by
+                    // review, mirroring `state.rs`'s identical fix for
+                    // `GraphStack::remove_exited`'s own failure path). If
+                    // `advance_forward` ever grows a *new* internal path
+                    // that propagates `Err` without leaving `huts` empty,
+                    // this comment (and the blanket fatal treatment
+                    // below) needs revisiting.
+                    tracing::error!("failed to advance the ConsoleHut stack, exiting: {err}");
+                    self.loop_signal.stop();
+                    return;
                 }
                 if instant {
                     self.sync_visible_main_window();

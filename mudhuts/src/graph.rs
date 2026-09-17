@@ -275,6 +275,22 @@ pub trait Node<Env> {
     /// anything but a bare Console leaf.
     fn mark_touched(&mut self) {}
 
+    /// Called by [`Graph::remove_node`] right before this node is actually
+    /// dropped — the one place a node type gets to react to its own
+    /// removal, so cleanup a plain `Drop` can't express (asking a client
+    /// to close, which needs a live method call, not just a value going
+    /// out of scope) doesn't have to be remembered by every caller that
+    /// removes a node. Default no-op (most node types own nothing that
+    /// needs this). `ConsoleNode` overrides this to close out any
+    /// tagged-in Main Windows it's still holding — see
+    /// `ConsoleHut::close_all_windows`'s own doc comment. Added after
+    /// review repeatedly caught call sites (`GraphStack::remove_output`,
+    /// `advance_forward`/`advance_backward`, `remove_exited`) forgetting
+    /// to call that themselves; this makes forgetting it structurally
+    /// impossible for any future removal path instead of relying on
+    /// every caller remembering the pairing.
+    fn on_remove(&mut self) {}
+
     /// Resize every leaf reachable from this node to fill an output of
     /// `width`x`height` physical pixels — mirrors
     /// `Hut::resize_to_pixels`. Default no-op (a pure control/sink node,
@@ -410,8 +426,12 @@ impl<Env> Graph<Env> {
     /// panic on `self.nodes.remove(&id)?` inside `resolve_output`, or
     /// silently keep a supposedly-closed child alive in a `HutList`), not
     /// something calling code should have to remember to clean up by
-    /// hand at every removal site.
+    /// hand at every removal site. Calls the node's own [`Node::on_remove`]
+    /// first, for the same reason — see that method's own doc comment.
     pub fn remove_node(&mut self, id: NodeId) {
+        if let Some(node) = self.nodes.get_mut(&id) {
+            node.on_remove();
+        }
         self.nodes.remove(&id);
         self.links.retain(|(node, _), (source, _)| *node != id && *source != id);
         self.hut_refs.retain(|(node, _), target| *node != id && *target != id);

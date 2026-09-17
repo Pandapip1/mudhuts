@@ -1065,14 +1065,80 @@ impl GraphStack {
         let keep = protect == Some(*pos) || self.graph.node(id).map(Node::touched).unwrap_or(true);
         if keep {
             *pos += 1;
-        } else {
+            if *pos >= self.out().len() {
+                // Walked off the end of an otherwise healthy, non-empty
+                // list — the *routine* way this MRU stack grows during
+                // ordinary Alt-Tab use, not a rare edge case. `huts` is
+                // completely untouched by this branch (`keep` never
+                // removes anything), so a failure here can't corrupt
+                // anything — just log it and don't advance, rather than
+                // treating "no fresh scratch console available this
+                // keypress" as fatal (caught by review — an earlier
+                // version of this function's own caller in `input.rs`
+                // treated every `Err` from here as equally fatal).
+                if !self.try_spawn_and_insert() {
+                    *pos -= 1;
+                }
+            }
+        } else if self.out().len() > 1 {
+            // An untouched entry is only ever the *frontier* — the
+            // freshly-spawned tail nothing has advanced past yet; every
+            // entry before it in the MRU list is only there because a
+            // prior advance already kept it — so discarding it still
+            // needs a fresh replacement to keep "there's always a
+            // scratch console ready at the frontier" true, exactly like
+            // the `keep` branch walking off the end above. Other entries
+            // survive regardless of whether that spawn below succeeds,
+            // though, so — unlike the sole-entry case in the `else`
+            // below — it's safe to remove *before* attempting it: a
+            // failed spawn here just means "no fresh frontier ready this
+            // keypress," landing on the last surviving old entry instead,
+            // not a broken invariant (an earlier version of this branch
+            // skipped spawning here entirely whenever other entries
+            // remained, which silently walked the cursor *backward* onto
+            // a previous, already-touched entry instead of refreshing
+            // the frontier — caught by review).
             self.graph.remove_node(id);
             self.out_mut().huts.remove(*pos);
-        }
-        if *pos >= self.out().len() {
-            self.spawn_and_insert()?;
+            self.try_spawn_and_insert();
+            *pos = self.out().len() - 1;
+        } else {
+            // This is the *only* entry on this output — spawn its
+            // replacement *before* removing it, not after, so a failed
+            // spawn never leaves `huts` empty in the first place (mirrors
+            // `remove_exited`'s own "always ≥1" invariant, but by making
+            // the broken state structurally unreachable here rather than
+            // detecting it after the fact and shutting the whole
+            // compositor down — `loop_signal.stop()` only takes effect
+            // once the current dispatch batch finishes, so another
+            // already-queued event could still observe the broken state
+            // and panic before that shutdown actually happens; caught by
+            // review). A failed spawn here just keeps the old, still
+            // perfectly valid (if untouched) entry in place — exactly as
+            // if this Alt-Tab press had no effect.
+            if self.try_spawn_and_insert() {
+                self.graph.remove_node(id);
+                self.out_mut().huts.remove(*pos);
+                *pos = self.out().len() - 1;
+            }
         }
         Ok(())
+    }
+
+    /// Shared by `advance_forward`'s three branches — each needs "try to
+    /// spawn a fresh replacement Hut, and if that fails, just log it and
+    /// carry on rather than propagate" but differs in what bookkeeping
+    /// happens around the attempt; pulled out after review caught the
+    /// same log line duplicated three times. Returns whether it actually
+    /// succeeded, since each branch's own recovery differs.
+    fn try_spawn_and_insert(&mut self) -> bool {
+        match self.spawn_and_insert() {
+            Ok(_) => true,
+            Err(err) => {
+                tracing::error!("failed to spawn a replacement Hut while advancing the stack: {err}");
+                false
+            }
+        }
     }
 
     fn advance_backward(&mut self, pos: &mut usize, protect: Option<usize>) {
@@ -1413,6 +1479,28 @@ mod tests {
         stack.next().unwrap();
         assert_eq!(stack.len(), 1, "untouched ConsoleHut should be replaced, not kept alongside a new one");
         assert_ne!(stack.focused().id, original_id, "should be a fresh ConsoleHut");
+    }
+
+    #[test]
+    fn next_past_an_untouched_tail_with_earlier_touched_entries_still_refreshes_the_frontier() {
+        // Stack = [A(touched), B(untouched)], focused on B — advancing
+        // past B must land on a *fresh* replacement C, not walk the
+        // cursor backward onto A. An earlier version of this fix only
+        // spawned a replacement when the discarded entry was the *sole*
+        // entry, silently regressing this to "step backward onto the
+        // previous entry" whenever anything else survived — caught by
+        // review.
+        let mut stack = new_stack();
+        let a_id = stack.focused().id;
+        stack.focused_mut().mark_touched();
+        stack.next().unwrap(); // A(touched) kept, B spawned (untouched)
+        let b_id = stack.focused().id;
+
+        stack.next().unwrap(); // advance past B(untouched)
+
+        assert_eq!(stack.len(), 2, "A survives, B is replaced by a fresh C — not merged down to just A");
+        assert_ne!(stack.focused().id, a_id, "must not have walked backward onto A");
+        assert_ne!(stack.focused().id, b_id, "must be a genuinely fresh replacement, not B itself");
     }
 
     #[test]

@@ -783,6 +783,17 @@ impl State {
                     self.loop_signal.stop();
                     return;
                 }
+                // This id can never exist again (`ConsoleHut::id` is a
+                // fresh counter per spawn) — see `render::purge_hut_content`'s
+                // doc comment on the leak this avoids. Done once, up
+                // front, rather than once per match arm below (an earlier
+                // version duplicated this call — and its own doc comment
+                // — into the `Err` arm too, since that arm also `return`s
+                // early; caught by review): `id`'s own cleanup doesn't
+                // depend on which arm runs, and this alone never touches
+                // the possibly-broken output state the `Err` arm's own
+                // doc comment warns about.
+                crate::render::purge_hut_content(id);
                 match self.stack.remove_exited(id) {
                     // Focus can shift to a different Hut/pane here (a
                     // bare top-level removal shifts `current`, a nested
@@ -797,12 +808,38 @@ impl State {
                         self.sync_hut_space(hut_id);
                     }
                     Ok(None) => {}
-                    Err(err) => tracing::error!("failed to respawn after shell exit: {err}"),
+                    Err(err) => {
+                        // `remove_exited`'s own doc comment: this means an
+                        // output was left with a genuinely empty `huts`
+                        // list (a Hut exited and respawning a replacement
+                        // failed too — an OS-resource-exhaustion-class
+                        // failure, not a logic bug) — a state every
+                        // `_for(output_index)` accessor elsewhere in this
+                        // module assumes never happens and indexes into
+                        // unconditionally. Logging and continuing (the
+                        // original behavior here) left that landmine live
+                        // for the next redraw/input dispatch to step on as
+                        // an actual panic; a controlled shutdown, the same
+                        // "nothing sensible left to do" response the
+                        // last-ConsoleHut-closed check above already uses,
+                        // is safer than running on with an output known to
+                        // be in a state nothing else in this codebase
+                        // expects (caught during a review of the known-
+                        // issues backlog, not observed live).
+                        tracing::error!("failed to respawn after shell exit, exiting: {err}");
+                        self.loop_signal.stop();
+                        // `loop_signal.stop()` only takes effect once the
+                        // event loop finishes this dispatch batch — it
+                        // doesn't stop execution here. Falling through to
+                        // `request_redraw()` below would still touch the
+                        // very output state this branch's own doc comment
+                        // says is now in a shape nothing else in this
+                        // codebase expects; returning immediately, exactly
+                        // like the last-ConsoleHut-closed case above,
+                        // avoids that (caught by review).
+                        return;
+                    }
                 }
-                // This id can never exist again (`ConsoleHut::id` is a
-                // fresh counter per spawn) — see `render::purge_hut_content`'s
-                // doc comment on the leak this avoids.
-                crate::render::purge_hut_content(id);
                 self.request_redraw();
             }
             mudhuts_term::TermEvent::Wakeup => {

@@ -375,9 +375,16 @@ fn retag_in_stack(
         // silently backgrounding a freshly-un-floated/un-alerted window
         // instead of showing it).
         let was_bare = hut.has_bare_main_window(tagged_surface);
-        let Some(window) = hut
+        // `take_bare_main_window` also hands back whatever was tagged as
+        // belonging to *this* Main Window (its own Floating
+        // Windows/Alerts) rather than deciding their fate itself — see
+        // its own doc comment. A nested Floating Window/Alert being
+        // promoted (`take_nested_window`) never has any of its own (this
+        // codebase's tagging is only ever one level deep), so `Vec::new()`
+        // for both there is always correct, not just a placeholder.
+        let Some((window, floating_windows, alerts)) = hut
             .take_bare_main_window(tagged_surface)
-            .or_else(|| hut.take_nested_window(tagged_surface))
+            .or_else(|| hut.take_nested_window(tagged_surface).map(|window| (window, Vec::new(), Vec::new())))
         else {
             continue;
         };
@@ -447,9 +454,30 @@ fn retag_in_stack(
                 }
             },
         }
-        if let Some(window) = window {
+        // `tagged_floating_or_alert`, not branching on `window`'s own
+        // `Option` state a second time: `window` only becomes `None`
+        // exactly when this is `true` (the `Some(entry)` arm's
+        // `window.take()`), but the borrow checker can't see that
+        // correlation — moving `floating_windows`/`alerts` inside that
+        // arm and trying to use them again after the match, gated on
+        // `window` instead, doesn't compile (caught by review; this
+        // single already-existing bool sidesteps it for free).
+        if tagged_floating_or_alert {
+            crate::console_hut::close_orphaned_children(floating_windows, alerts);
+        } else if let Some(window) = window {
             let foreign_handle = mint_handle(&window);
             hut.push_main_window(window, make_active, foreign_handle);
+            // A redundant `SetMain`/`SetFloating`-with-unresolved-target
+            // retag: this Main Window is ending up bare again, exactly as
+            // it was before, so its own already-tagged children come
+            // right back with it instead of being closed for no reason
+            // (caught by review — an earlier version of this function
+            // closed them unconditionally in `take_bare_main_window`,
+            // even on this no-op-ish path).
+            if let Some(entry) = hut.find_main_window_mut(tagged_surface) {
+                entry.floating_windows = floating_windows;
+                entry.alerts = alerts;
+            }
         }
         break;
     }
@@ -514,6 +542,33 @@ mod tests {
     }
 
     #[test]
+    fn a_redundant_retag_of_an_already_bare_main_window_keeps_its_own_floating_children() {
+        // A's own already-tagged Floating Window (B) must survive a
+        // redundant `SetMain` on A itself — A is ending up bare again,
+        // exactly as it was before, so there's no reason to close
+        // anything (unlike `retagging_a_bare_main_window_with_its_own_
+        // floating_child_closes_that_child`, where A genuinely becomes
+        // someone *else's* child and can't carry B along). Caught by
+        // review: an earlier version of this fix closed B here too,
+        // even on this no-op-ish path.
+        let mut stack = new_stack();
+        let [(a, a_fth), (b, _), spare] = spawn_test_windows(3).try_into().ok().unwrap();
+        let a_surface = surface_of(&a);
+        let b_surface = surface_of(&b);
+        stack.focused_mut().push_main_window(a, true, a_fth);
+        stack.focused_mut().find_main_window_mut(&a_surface).unwrap().floating_windows.push(FloatingWindow::new(b));
+
+        let (hut_id, tagged_floating_or_alert) =
+            retag_in_stack(&mut stack, &a_surface, None, handle_source(vec![spare]));
+
+        assert_eq!(hut_id, Some(stack.focused().id));
+        assert!(!tagged_floating_or_alert);
+        let entry = stack.focused_mut().find_main_window_mut(&a_surface).unwrap();
+        assert_eq!(entry.floating_windows.len(), 1, "B must still be tagged under A");
+        assert!(entry.floating_windows[0].matches(&b_surface));
+    }
+
+    #[test]
     fn retagging_a_nested_floating_window_as_main_promotes_and_activates_it() {
         let mut stack = new_stack();
         let [(a, a_fth), (b, _), spare] = spawn_test_windows(3).try_into().ok().unwrap();
@@ -560,6 +615,40 @@ mod tests {
         assert_eq!(stack.focused().main_window_count(), 1, "only A remains as a bare Main Window");
         let entry = stack.focused_mut().find_main_window_mut(&a_surface).unwrap();
         assert_eq!(entry.floating_windows.len(), 1);
+        assert!(entry.floating_windows[0].matches(&b_surface));
+    }
+
+    #[test]
+    fn retagging_a_bare_main_window_with_its_own_floating_child_closes_that_child() {
+        // Deliberate, documented tradeoff (see
+        // `ConsoleHut::take_bare_main_window`'s own doc comment): B is
+        // only changing role here, not being destroyed, but there's no
+        // API for a caller to carry B's *own* already-tagged children
+        // (C) along to wherever B ends up — so retagging B closes them
+        // rather than leaking their client connections. Pins this down
+        // as intentional after review repeatedly flagged it as an
+        // untested-looking regression.
+        let mut stack = new_stack();
+        let [(a, a_fth), (b, b_fth), (c, _)] = spawn_test_windows(3).try_into().ok().unwrap();
+        let a_surface = surface_of(&a);
+        let b_surface = surface_of(&b);
+        let c_surface = surface_of(&c);
+        stack.focused_mut().push_main_window(a, true, a_fth);
+        stack.focused_mut().push_main_window(b, false, b_fth);
+        stack.focused_mut().find_main_window_mut(&b_surface).unwrap().floating_windows.push(FloatingWindow::new(c));
+
+        let (hut_id, tagged_floating_or_alert) = retag_in_stack(
+            &mut stack,
+            &b_surface,
+            Some((Role::Floating, a_surface.clone())),
+            handle_source(Vec::new()),
+        );
+
+        assert_eq!(hut_id, Some(stack.focused().id));
+        assert!(tagged_floating_or_alert);
+        assert!(!stack.focused().has_bare_main_window(&c_surface), "C never was a bare Main Window");
+        let entry = stack.focused_mut().find_main_window_mut(&a_surface).unwrap();
+        assert_eq!(entry.floating_windows.len(), 1, "only B itself moved under A — C didn't come along too");
         assert!(entry.floating_windows[0].matches(&b_surface));
     }
 

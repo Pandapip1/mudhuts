@@ -8,11 +8,13 @@
 //! for the full trust model.
 //!
 //! Usage: `mudhuts-authority-helper --floating TARGET_APP_ID:MAIN_APP_ID`
-//! (repeatable, `--alert` for the other role). A toplevel matching
-//! TARGET_APP_ID is tagged the moment a *currently known* toplevel matches
-//! MAIN_APP_ID — if the main window hasn't appeared yet when the target
-//! does, that target is never retried; a known, accepted limitation for
-//! this first pass (see mudhuts' `project_known_issues` memory).
+//! (repeatable, `--alert` for the other role). Every toplevel's `Done`
+//! event re-checks every still-untagged toplevel against every rule
+//! (`try_tag_all`), not just the one that just fired — a target arriving
+//! before its intended main window used to be matched only once, at its
+//! own `Done`, and never retried once the main window showed up later
+//! (a known, accepted limitation in the first pass — see mudhuts'
+//! `project_known_issues` memory — fixed here).
 
 use std::collections::HashMap;
 use std::env;
@@ -125,12 +127,32 @@ impl Dispatch<ExtForeignToplevelHandleV1, Arc<Mutex<ToplevelInfo>>> for AppState
     ) {
         use ext_foreign_toplevel_handle_v1::Event;
         match event {
-            Event::AppId { app_id } => data.lock().unwrap().app_id = app_id,
-            Event::Identifier { identifier } => data.lock().unwrap().identifier = Some(identifier),
+            // `if let Ok(...)`, not `.lock().unwrap()`: a poisoned entry
+            // here would otherwise undermine `try_tag_all`'s own
+            // skip-and-log handling of the exact same `Mutex` — every
+            // `Done` event calls that for every known toplevel, but this
+            // toplevel's *own* routine `AppId`/`Identifier` updates run
+            // far more often than that, so those would still crash the
+            // whole single-threaded helper process on the very next one
+            // (caught by review).
+            Event::AppId { app_id } => {
+                if let Ok(mut info) = data.lock() {
+                    info.app_id = app_id;
+                }
+            }
+            Event::Identifier { identifier } => {
+                if let Ok(mut info) = data.lock() {
+                    info.identifier = Some(identifier);
+                }
+            }
             Event::Done => {
                 let id = handle.id().protocol_id();
                 state.toplevels.insert(id, data.clone());
-                state.try_tag(&mut data.lock().unwrap());
+                // Not just `state.try_tag(&mut data.lock().unwrap())` —
+                // *this* toplevel might be the missing "main" half some
+                // earlier, already-`done`, still-untagged target has been
+                // waiting for (see `try_tag_all`'s own doc comment).
+                state.try_tag_all();
             }
             Event::Closed => {
                 state.toplevels.remove(&handle.id().protocol_id());
@@ -143,11 +165,49 @@ impl Dispatch<ExtForeignToplevelHandleV1, Arc<Mutex<ToplevelInfo>>> for AppState
 }
 
 impl AppState {
+    /// Re-runs [`Self::try_tag`] for every still-untagged known toplevel —
+    /// called on every toplevel's `Done`, not just a target's own, so a
+    /// target that arrived (and was checked) before its intended main
+    /// window actually appeared gets a real second chance the moment
+    /// that main window's own `Done` fires (see this module's own doc
+    /// comment). Cheap enough to just re-check everything on every
+    /// `Done`: realistic toplevel counts are small, and a toplevel that's
+    /// already tagged (or whose `app_id` doesn't match any rule's target)
+    /// costs only a `try_tag` call that returns immediately.
+    ///
+    /// Iterates `self.toplevels` directly (both this and `try_tag` only
+    /// ever take `&self` — nothing here inserts/removes entries mid-scan,
+    /// so there's no borrow-checker conflict to route around with an
+    /// upfront id snapshot, unlike an earlier version of this function).
+    fn try_tag_all(&self) {
+        for (id, entry) in &self.toplevels {
+            // `lock()`, not `try_lock()`: unlike the inner scan inside
+            // `try_tag` itself (see its own doc comment on why *that*
+            // one has to be non-blocking), nothing else in this single-
+            // threaded dispatch loop can be holding this specific
+            // entry's lock at this point — the only reentrant case
+            // `try_tag`'s own doc comment describes is scanning *while
+            // already holding this same lock*, which can't happen here
+            // since each iteration starts fresh.
+            //
+            // Skip-and-log a poisoned lock rather than `.unwrap()`ing it:
+            // this now runs against *every* known toplevel on *every*
+            // single `Done` event (not just the one that just fired), so
+            // one entry poisoned by an earlier panic would otherwise take
+            // down the whole helper process on the very next unrelated
+            // toplevel's event instead of just that one entry staying
+            // untagged (caught by review).
+            match entry.lock() {
+                Ok(mut guard) => self.try_tag(&mut guard),
+                Err(_) => eprintln!("toplevel {id}'s tracking state is poisoned, skipping"),
+            }
+        }
+    }
+
     /// If `info` (a just-`done` toplevel) matches some rule's target
     /// app_id, and a currently-known toplevel matches that rule's main
     /// app_id, tag it now. A no-op if it's already tagged, or nothing
-    /// matches yet — see this module's doc on why an unmatched target
-    /// isn't retried later.
+    /// matches yet.
     fn try_tag(&self, info: &mut MutexGuard<'_, ToplevelInfo>) {
         if info.tagged {
             return;
