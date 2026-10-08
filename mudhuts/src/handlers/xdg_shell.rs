@@ -290,12 +290,19 @@ impl XdgDialogHandler for State {
 
 /// Whether `handle_commit` should undo `new_toplevel`'s default
 /// fullscreen hint for a toplevel that's turned out to be a dialog —
-/// either signal is enough on its own (see `handle_commit`'s own comment
-/// on why both are checked). Pulled out as a pure predicate over the two
-/// inputs so this decision is directly testable without a real
-/// `ToplevelSurface`/`WlSurface`.
+/// a parent is sufficient for a non-modal dialog, while an explicit modal
+/// hint is sufficient without one. A bare non-modal hint is not: GTK emits
+/// that sequence for ordinary application windows. Pulled out as a pure
+/// predicate over the two inputs so this decision is directly testable
+/// without a real `ToplevelSurface`/`WlSurface`.
 fn should_unfullscreen_for_dialog(has_parent: bool, dialog_hint: ToplevelDialogHint) -> bool {
-    has_parent || dialog_hint != ToplevelDialogHint::Unknown
+    // GTK creates an xdg_dialog_v1 for every GtkWindow and immediately
+    // unsets modality, including ordinary application windows. Treating the
+    // resulting non-modal `Dialog` hint as a window-role declaration turns
+    // every GTK main window into a floating, client-sized surface. A parent
+    // remains the standard non-modal-dialog signal; an explicit Modal hint
+    // is sufficient on its own.
+    has_parent || dialog_hint == ToplevelDialogHint::Modal
 }
 
 /// Should be called on `WlSurface::commit`.
@@ -333,9 +340,10 @@ pub fn handle_commit(popups: &mut PopupManager, window: Option<Window>, surface:
             // hint for every toplevel unconditionally (it can't tell the
             // difference yet at that point — see this function's doc
             // comment), so undo it here now that we can actually tell.
-            // Checked in addition to, not instead of, `dialog_hint`:
-            // plenty of dialog-ish toolkits set a parent without ever
-            // touching xdg-dialog-v1.
+            // Checked alongside `dialog_hint`: plenty of dialog-ish
+            // toolkits set a parent without ever touching xdg-dialog-v1,
+            // while GTK creates a non-modal xdg-dialog object even for an
+            // ordinary unparented GtkWindow.
             if should_unfullscreen_for_dialog(toplevel.parent().is_some(), dialog_hint) {
                 toplevel.with_pending_state(|state| {
                     state.states.unset(xdg_toplevel::State::Fullscreen);
@@ -485,8 +493,12 @@ mod tests {
     }
 
     #[test]
-    fn a_dialog_hint_unfullscreens_even_without_a_parent() {
-        assert!(should_unfullscreen_for_dialog(false, ToplevelDialogHint::Dialog));
+    fn a_non_modal_dialog_hint_without_a_parent_stays_fullscreen() {
+        assert!(!should_unfullscreen_for_dialog(false, ToplevelDialogHint::Dialog));
+    }
+
+    #[test]
+    fn a_modal_dialog_hint_unfullscreens_even_without_a_parent() {
         assert!(should_unfullscreen_for_dialog(false, ToplevelDialogHint::Modal));
     }
 
